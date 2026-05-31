@@ -1,5 +1,7 @@
 # MemPalace RPG
 
+[中文 README](README.zh-CN.md)
+
 RPG-focused long-term memory kernel and MCP server adapted from [MemPalace](https://github.com/MemPalace/mempalace).
 
 This project is a focused extraction/fork of the RPG memory work built on top of MemPalace. Thanks to the upstream MemPalace author and contributors for the palace/drawer storage idea, Chroma backend integration, and the broader project-memory foundation.
