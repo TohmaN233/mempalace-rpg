@@ -96,13 +96,93 @@ relationship_state      关系状态，可选
   用途：轻量游戏可用；若宿主已有好感度/关系工具，应关闭或不作为真相源
 ```
 
-角色召回会生成 `MemoryPack`：
+## MemoryPack 是什么
 
-1. **先过滤权限**：按 `visibility`、`witness_set`、`known_by`、actor 身份判断能不能看。
-2. **再排序**：只在允许看到的记忆里按 query 相关度、近因、重要度、角色 tier 排序。
-3. **再渲染**：输出 profile、world truth、actor belief、evidence、guardrails 等 section。
+`MemoryPack` 是召回结果包，也是 GM/NPC 真正允许使用的“本轮记忆上下文”。
 
-因此，长期 NPC 只能使用 MemoryPack 里返回的信息，而不是全数据库信息。
+数据库里可能有很多东西：GM-only 真相、某个 NPC 的私密记忆、玩家不知道的旧战役历史、某个阵营听到的谣言、某个地点的公开变化。`MemoryPack` 的作用不是把数据库全部塞给模型，而是针对一个 actor 和一个 query，生成一份**权限过滤后的可用记忆包**。
+
+一句话：
+
+```text
+MemoryPack = 某个 actor 在当前问题下“可以知道、应该想起、允许用于扮演”的记忆集合。
+```
+
+例如：
+
+```text
+mcp_rpg_recall({
+  actor_id: "char_冷月_a6fc77f1",
+  actor_type: "npc",
+  query: "她是否记得旧主角在灰烬桥的承诺？"
+})
+```
+
+返回的 `MemoryPack` 才是冷月此刻能用的记忆。即使数据库里有 GM-only 伏笔，或者另一个 NPC 私下听到的秘密，只要冷月没有权限，MemoryPack 里就不会出现。
+
+### MemoryPack 生成流程
+
+1. **确定 actor**
+   - GM、player、NPC、faction 都可以是 actor。
+   - NPC 必须使用稳定 `actor_id`，否则无法判断它知道什么。
+
+2. **读取 actor 档案**
+   - 如果有 `character_profile`，先加载角色名、tier、人设、语言风格、当前目标等。
+   - tier 会影响召回预算：核心角色能带出更多记忆，路人角色更少。
+
+3. **权限过滤**
+   - 根据 `visibility` 判断：公开、队伍、见证者、角色私有、阵营私有、GM-only 等。
+   - 根据 `known_by` / `witness_set` 判断 actor 是否亲历、听说、被告知。
+   - 这一步在排序之前，防止高相关但无权限的信息泄露。
+
+4. **相关度排序**
+   - 只在 actor 有权限看到的记忆里排序。
+   - 参考 query、相关实体、地点、任务、重要度、情绪权重、时间顺序。
+
+5. **预算裁剪**
+   - 根据角色 tier 和 `max_chars` 控制 MemoryPack 长度。
+   - 防止长期战役几千条历史一次性塞爆上下文。
+
+6. **渲染为分区文本**
+   - 输出给 GM/模型使用的最终上下文。
+
+### MemoryPack 里通常包含什么
+
+| 分区 | 来源 | 作用 |
+|---|---|---|
+| `Profile` | `character_profile` | 当前 actor 的基础档案、人设、语言风格、目标 |
+| `World Truth` | `world_fact` | actor 有权限知道的世界事实 |
+| `Actor Belief` | `actor_belief` | actor 自己相信/怀疑/误解/听说的内容 |
+| `Retrieved Evidence` | `memory_item` | 与 query 最相关的可见证据片段 |
+| `Forbidden Knowledge Guard` | 系统生成 | 提醒模型不要使用 MemoryPack 外的信息 |
+
+### MemoryPack 为什么重要
+
+它是 RPG 记忆系统的安全边界：
+
+- **防 NPC 全知**：NPC 只能知道自己见过、听过或被允许知道的事。
+- **防旧主角污染新主角**：旧战役历史在库里，但新主角默认不会拿到私密记忆。
+- **防 GM 随手脑补承诺**：玩家追问“是否真的承诺过”时，应以 MemoryPack / deep recall 返回的证据为准。
+- **防传闻变事实**：谣言进入 Actor Belief，不会自动当作 World Truth。
+- **控制上下文大小**：几千楼历史不会全部进入 prompt，只召回当前 actor、当前 query 需要的部分。
+
+### 使用规则
+
+GM prompt 里应该明确写：
+
+```text
+扮演长期 NPC、阵营或旧战役相关角色前，必须调用 mcp_rpg_recall。
+角色只能使用返回 MemoryPack 中出现的信息。MemoryPack 外的信息，即使数据库或 GM 知道，也不能当作该角色已知信息。
+```
+
+如果玩家要求原话、具体见证者、细节复盘，MemoryPack 仍可能只是摘要。这时继续用：
+
+```text
+mcp_rpg_deep_recall(...)
+mcp_rpg_get_scene(...)
+```
+
+因此，长期 NPC 不是“读取数据库扮演”，而是“读取属于自己的 MemoryPack 后扮演”。
 
 ## 可调用函数 / 工具一览
 
