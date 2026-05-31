@@ -26,8 +26,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/mempalace-rpg"
-Repository = "https://github.com/your-org/mempalace-rpg"
+Homepage = "https://github.com/TohmaN233/mempalace-rpg"
+Repository = "https://github.com/TohmaN233/mempalace-rpg"
 Upstream-MemPalace = "https://github.com/MemPalace/mempalace"
 
 [project.scripts]
