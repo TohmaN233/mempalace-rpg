@@ -54,25 +54,126 @@ examples/templates/integration-checklist.md
 examples/templates/memo_setting.template.json
 ```
 
-## 记忆系统结构
+## 记忆系统具体保存什么
 
-所有长期记忆都从 scene 开始。
+所有长期记忆都从 scene 开始。scene 是证据根，event 是结构化解释，memory/fact/belief 是召回投影。
 
 ```text
-scene_record            完整场景 transcript、时间、地点、参与者、见证者
-  └─ scene_event        带 truth_status + visibility 的结构化事件
-       ├─ memory_item   可召回证据片段
-       ├─ world_fact    世界事实/观察事实
-       └─ actor_belief  角色主观记忆、传闻、误解
+scene_record            场景原始证据
+  保存：campaign_id、世界内时间、地点、参与者、见证者、完整 transcript、hash、排序
+  用途：追溯“当时到底发生了什么”；启用 --palace 时也写入 Chroma 原文库
+
+scene_event             场景中的结构化事件
+  保存：事件类型、行为者、目标、摘要、真伪状态、可见性、见证者、关联实体/任务/地点、重要度、情绪权重、payload
+  用途：把长文本变成可检索的 RPG 事实，例如承诺、秘密、背叛、传闻、战斗结果、状态变化
+
+memory_item             可召回证据片段
+  保存：从 event 投影出的短记忆、归属域、可见性、known_by、关联对象、重要度、vector_id
+  用途：普通 recall 主要检索它，提供给 GM/NPC 的 MemoryPack
+
+world_fact              世界事实
+  保存：subject、predicate、object、confidence、有效期、来源 event
+  用途：GM 或有权限角色可用的客观/观察事实
+
+actor_belief            角色主观认知
+  保存：actor、subject、predicate、object、belief_status、confidence、来源 event
+  用途：NPC 的记忆、误解、传闻、私人判断；不会自动升级成世界真相
+
+character_profile       角色档案
+  保存：角色名、tier、公开/私有身份、短人设、语言风格、目标、恐惧、阵营、home_location、memory_wing
+  用途：长期 NPC 召回前先加载基础人设，并用 tier 控制召回预算
+
+entity_registry         稳定实体注册表
+  保存：entity_id、类型、显示名、active、创建/更新时间
+  用途：保证 NPC、地点、阵营、任务、物品等都有稳定 ID
+
+entity_importance       实体重要度
+  保存：tier、剧情权重、玩家交互次数、任务关联、情绪事件、秘密关联、近期提及、importance_score
+  用途：后续可做 NPC/地点重要度提升、召回预算调整
+
+relationship_state      关系状态，可选
+  保存：trust、affection、fear、hostility、debt、公开标签、私有备注、证据 event
+  用途：轻量游戏可用；若宿主已有好感度/关系工具，应关闭或不作为真相源
 ```
 
 角色召回会生成 `MemoryPack`：
 
-1. 先按 ACL / visibility / witness 过滤。
-2. 再按相关度、近因、重要度、角色 tier、query 排序。
-3. 输出 profile、world truth、actor belief、evidence、guardrails 等 section。
+1. **先过滤权限**：按 `visibility`、`witness_set`、`known_by`、actor 身份判断能不能看。
+2. **再排序**：只在允许看到的记忆里按 query 相关度、近因、重要度、角色 tier 排序。
+3. **再渲染**：输出 profile、world truth、actor belief、evidence、guardrails 等 section。
 
 因此，长期 NPC 只能使用 MemoryPack 里返回的信息，而不是全数据库信息。
+
+## 可调用函数 / 工具一览
+
+### Python API
+
+| 函数/类 | 功能 |
+|---|---|
+| `RpgMemoryKernel(db_path, episode_adapter?, memo_settings_path?)` | 打开 RPG 记忆内核；SQLite 是主索引，adapter 可接 Palace 原文库 |
+| `kernel.init_schema()` | 初始化数据库 schema |
+| `kernel.status()` | 返回 DB 路径、memo_setting、各表计数 |
+| `kernel.upsert_entity(entity_id, entity_type, display_name?)` | 注册或更新稳定实体 |
+| `kernel.upsert_character_profile(...)` | 新建/更新长期 NPC/actor 档案 |
+| `kernel.commit_scene(...)` | 写入 scene_record，并按 events 投影 memory_item/world_fact/actor_belief |
+| `kernel.build_memory_pack(actor_id, actor_type, query, ...)` | ACL 过滤后为 GM/NPC/player 构建 MemoryPack |
+| `kernel.get_scene(scene_id, actor_id, actor_type, mode, ...)` | 按权限读取单个 scene 的摘要/片段/全文 |
+| `kernel.deep_recall(actor_id, actor_type, query, ...)` | 深度召回相关 scene 片段，用于查原话/见证者/细节 |
+| `kernel.list_memory_items(...)` | 调试：列出 memory_item |
+| `kernel.list_world_facts(...)` | 调试：列出 world_fact |
+| `kernel.list_actor_beliefs(...)` | 调试：列出 actor_belief |
+| `import_taverndb(kernel, path, ...)` | 导入特定格式的酒馆数据库 JSON，见下文限制 |
+
+### CLI 命令
+
+| 命令 | 功能 |
+|---|---|
+| `mempalace-rpg init` | 初始化 DB |
+| `mempalace-rpg status` | 查看状态和表计数 |
+| `mempalace-rpg upsert-profile <json>` | 从 JSON 写入角色档案 |
+| `mempalace-rpg commit-scene <json>` | 从 JSON 写入场景与事件 |
+| `mempalace-rpg recall --actor-id ... --query ...` | 输出 ACL 过滤后的 MemoryPack |
+| `mempalace-rpg list memories/facts/beliefs` | 调试列出记忆/事实/信念 |
+| `mempalace-rpg import-taverndb <json>` | 导入当前支持格式的酒馆数据库 JSON |
+
+所有 CLI 都可带：
+
+```bash
+--db state/rpg-memory.sqlite3
+--memo-setting memo_setting.json
+--palace state/rpg-palace
+```
+
+### MCP 工具
+
+| MCP 工具 | pi 短别名 | 功能 |
+|---|---|---|
+| `mempalace_rpg_status` | `mcp_rpg_status` | 查看服务状态、DB、表计数 |
+| `mempalace_rpg_recall` | `mcp_rpg_recall` | 普通召回，返回 ACL 过滤后的 MemoryPack |
+| `mempalace_rpg_commit_scene` | `mcp_rpg_commit_scene` | 写入一幕场景和结构化事件 |
+| `mempalace_rpg_deep_recall` | `mcp_rpg_deep_recall` | 深挖相关场景片段，用于查旧细节 |
+| `mempalace_rpg_get_scene` | `mcp_rpg_get_scene` | 按 scene_id 读取可见片段或全文 |
+| `mempalace_rpg_upsert_profile` | `mcp_rpg_upsert_profile` | 新建/更新角色档案 |
+| `mempalace_rpg_import_taverndb` | `mcp_rpg_import_taverndb` | 导入当前支持格式的酒馆数据库；大文件更推荐 CLI |
+| `mempalace_rpg_list_memories` | `mcp_rpg_list_memories` | 调试列出 memory_item |
+| `mempalace_rpg_list_world_facts` | `mcp_rpg_list_world_facts` | 调试列出 world_fact |
+| `mempalace_rpg_list_actor_beliefs` | `mcp_rpg_list_actor_beliefs` | 调试列出 actor_belief |
+
+## 写入一幕场景时发生什么
+
+`commit_scene` 的逻辑：
+
+1. 写入 `scene_record`：保存完整 transcript、参与者、见证者、地点、时间。
+2. 如果启用 `--palace`，把 transcript 写入 MemPalace/Chroma drawer，返回 `vector_id`。
+3. 逐个处理 `events`：检查 `memo_setting.json` 是否允许该事件类型。
+4. 写入 `scene_event`。
+5. 从 event 投影：
+   - `memory_item`：用于普通召回的证据片段。
+   - `world_fact`：canonical/observed/reported 等事实。
+   - `actor_belief`：见证者、行为者、目标角色的主观认知。
+6. 更新相关实体重要度。
+
+`truth_status` 决定“这是真的、观察到的、传闻、误解还是已废弃”；`visibility` 决定谁可以看到。
 
 ## 安装
 
@@ -227,7 +328,9 @@ examples/dest-poet/gm-memory-rules.md
 外部 RPG 记忆只作为长期叙事记忆层：旧战役历史、NPC 主观记忆、世界事实证据、地点/阵营变化、秘密可见性、见证者、承诺、传闻、信物来历。quest 与 item 在本包中只作为 narrative_only 使用。
 ```
 
-## TavernDB / 酒馆旧战役导入
+## 酒馆数据库导入
+
+当前导入器命令名仍叫 `import-taverndb`，但更准确地说，它支持的是**我这次使用的 SillyTavern ChatSheets 风格酒馆数据库 JSON**，不是所有酒馆数据库格式的通用导入器。
 
 ```bash
 mempalace-rpg \
@@ -237,16 +340,22 @@ mempalace-rpg \
   import-taverndb "TavernDB_data_命定之诗与黄昏之歌v4.2 ... imported.json"
 ```
 
-导入规则：
+当前已适配的表名/列名：
 
-| TavernDB 表 | 导入结果 |
-|---|---|
-| `主角信息表` | 旧主角变 legacy character，不是当前 `player` |
-| `重要角色表` | 角色档案与角色私有/见证记忆 |
-| `角色扮演指南` | 语言风格/人设提示 |
-| `纪要表` | 过去剧情 scene |
-| `约定表` | 旧约定，可按需要保留或清理 |
-| `伏笔表` | GM-only 伏笔，可按需要保留或清理 |
+| 当前支持的表 | 期望内容 | 导入结果 |
+|---|---|---|
+| `主角信息表` | 人物名称、性别/年龄、外貌、职业/身份、过往经历、性格 | 旧主角变 legacy character，不是当前 `player` |
+| `重要角色表` | 姓名、性别/年龄/等级、重要日期、关系、关键记忆、目前经历 | 角色档案与角色私有/见证记忆 |
+| `角色扮演指南` | 角色姓名、语言特征、动态对话示例、互动态度字典 | 语言风格/人设提示 |
+| `纪要表` | 编码索引、时间跨度、地点、纪要、概览、参与人员 | 过去剧情 scene |
+| `约定表` | 档案ID、约定主题、约定双方、详细内容、状态 | 旧约定；可按需要保留或清理 |
+| `伏笔表` | 档案ID、伏笔主题、详细内容、状态 | GM-only 伏笔；可按需要保留或清理 |
+
+限制：
+
+- 不保证兼容所有 SillyTavern、世界书、聊天记录、角色卡或其他扩展数据库格式。
+- 如果你的表名、列名、结构不同，需要写一个新的 importer 或先把数据转换成上述表结构。
+- 大文件迁移建议用 CLI，不建议通过 MCP 让模型传整份 JSON。
 
 适合同一世界换主角：当前新主角默认不知道旧主角私密经历，除非剧情中通过可见来源得知。
 
