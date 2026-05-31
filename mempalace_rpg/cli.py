@@ -16,6 +16,7 @@ from typing import Any
 
 from .adapter import MempalaceEpisodeAdapter, NullEpisodeAdapter
 from .kernel import DEFAULT_RPG_MEMORY_DB, RpgMemoryKernel
+from .maintenance import backup, delete_after, restore
 from .models import SceneEventInput
 from .tavern_importer import import_taverndb
 
@@ -45,6 +46,12 @@ def _kernel(args: argparse.Namespace) -> RpgMemoryKernel:
 def cmd_init(args: argparse.Namespace) -> int:
     with _kernel(args) as kernel:
         _print_json({"ok": True, "db": kernel.db_path})
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    with _kernel(args) as kernel:
+        _print_json(kernel.status())
     return 0
 
 
@@ -166,6 +173,37 @@ def cmd_import_taverndb(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    _print_json(backup(args.db, palace_path=args.palace, backup_dir=args.backup_dir))
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    _print_json(
+        restore(
+            args.db,
+            db_backup=args.db_backup,
+            palace_path=args.palace,
+            palace_backup=args.palace_backup,
+            pre_backup=not args.no_pre_backup,
+        )
+    )
+    return 0
+
+
+def cmd_delete_after(args: argparse.Namespace) -> int:
+    _print_json(
+        delete_after(
+            args.db,
+            args.cutoff,
+            palace_path=args.palace,
+            dry_run=args.dry_run,
+            backup_first=not args.no_backup,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mempalace-rpg",
@@ -188,6 +226,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="Create/open the RPG memory database.")
     init.set_defaults(func=cmd_init)
+
+    status = sub.add_parser("status", help="Show RPG memory database status and table counts.")
+    status.set_defaults(func=cmd_status)
 
     profile = sub.add_parser("upsert-profile", help="Upsert a character ProfileCard from JSON.")
     profile.add_argument("file", help="JSON file or '-' for stdin.")
@@ -248,6 +289,22 @@ def build_parser() -> argparse.ArgumentParser:
     tavern.add_argument("--scene-limit", type=int, help="Import at most N timeline rows (useful for testing).")
     tavern.add_argument("--dry-run", action="store_true", help="Parse and count without writing.")
     tavern.set_defaults(func=cmd_import_taverndb)
+
+    backup_cmd = sub.add_parser("backup", help="Copy SQLite DB and optional palace directory to a timestamped backup.")
+    backup_cmd.add_argument("--backup-dir", help="Directory for backups. Default: <db-dir>/backups.")
+    backup_cmd.set_defaults(func=cmd_backup)
+
+    restore_cmd = sub.add_parser("restore", help="Restore SQLite DB and optionally palace directory from backups.")
+    restore_cmd.add_argument("--db-backup", required=True, help="SQLite backup file to restore from.")
+    restore_cmd.add_argument("--palace-backup", help="Palace backup directory to restore from. Requires --palace target.")
+    restore_cmd.add_argument("--no-pre-backup", action="store_true", help="Do not create a safety backup before restoring.")
+    restore_cmd.set_defaults(func=cmd_restore)
+
+    delete_after_cmd = sub.add_parser("delete-after", help="Rollback by deleting all RPG memory created after a system timestamp.")
+    delete_after_cmd.add_argument("cutoff", help="System timestamp cutoff, e.g. 2026-05-30T20:29:55+00:00. Deletes rows with created_at > cutoff.")
+    delete_after_cmd.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without changing data.")
+    delete_after_cmd.add_argument("--no-backup", action="store_true", help="Do not create a safety backup before deleting.")
+    delete_after_cmd.set_defaults(func=cmd_delete_after)
 
     return parser
 

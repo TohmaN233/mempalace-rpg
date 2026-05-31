@@ -81,6 +81,26 @@ For pi integration:
 pi install npm:pi-mcp-extension
 ```
 
+## Storage locations
+
+SQLite is the authoritative RPG index. It stores scenes, events, recall items, facts, beliefs, profiles, ACL metadata, and settings-derived behavior.
+
+Default DB path:
+
+```text
+~/.mempalace/rpg_memory.sqlite3
+```
+
+Typical game package paths:
+
+```text
+state/rpg-memory.sqlite3   # structured RPG memory + ACL
+state/rpg-palace/          # optional MemPalace/Chroma raw transcript archive
+memo_setting.json          # domain conflict policy
+```
+
+If `--palace` is omitted, only SQLite is written. If `--palace` is set, full scene transcripts are also written as MemPalace drawers.
+
 ## CLI quick start
 
 ```bash
@@ -108,6 +128,30 @@ Enable raw transcript archive:
 ```bash
 mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace commit-scene scene.json
 ```
+
+## Backup, restore, and time-based rollback
+
+Simple maintenance commands are included:
+
+```bash
+# Backup SQLite and optional Palace directory
+mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace backup
+
+# Restore from backup; creates a safety backup first by default
+mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace restore \
+  --db-backup state/backups/rpg-memory.sqlite3.bak-20260530T203000Z \
+  --palace-backup state/backups/rpg-palace.bak-20260530T203000Z
+
+# Preview rollback to a system timestamp
+mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace \
+  delete-after "2026-05-30T20:29:55+00:00" --dry-run
+
+# Delete everything created after that timestamp
+mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace \
+  delete-after "2026-05-30T20:29:55+00:00"
+```
+
+`delete-after` uses system write time (`created_at`), not in-world time. It deletes matching scenes, events, memory items, facts, beliefs, relationship rows evidenced by those events, and corresponding Palace drawers. It automatically creates a backup first unless `--no-backup` is set.
 
 ## MCP tools
 

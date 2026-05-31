@@ -214,6 +214,9 @@ mcp_rpg_get_scene(...)
 | `mempalace-rpg commit-scene <json>` | 从 JSON 写入场景与事件 |
 | `mempalace-rpg recall --actor-id ... --query ...` | 输出 ACL 过滤后的 MemoryPack |
 | `mempalace-rpg list memories/facts/beliefs` | 调试列出记忆/事实/信念 |
+| `mempalace-rpg backup` | 备份 SQLite 和可选 Palace 原文库 |
+| `mempalace-rpg restore --db-backup ...` | 从备份恢复 |
+| `mempalace-rpg delete-after <cutoff>` | 删除 cutoff 之后创建的内容，按系统时间回滚 |
 | `mempalace-rpg import-taverndb <json>` | 导入当前支持格式的酒馆数据库 JSON |
 
 所有 CLI 都可带：
@@ -267,6 +270,31 @@ pip install -e /path/to/mempalace-rpg
 pi install npm:pi-mcp-extension
 ```
 
+## 存储位置
+
+`mempalace-rpg` 默认有两类存储：
+
+```text
+SQLite RPG 索引库：保存 scene/event/memory/fact/belief/profile 等结构化数据
+Palace 原文库：可选，保存完整 transcript 的 Chroma/MemPalace drawer
+```
+
+默认 SQLite 路径是：
+
+```text
+~/.mempalace/rpg_memory.sqlite3
+```
+
+实际游戏中通常显式指定，例如命定之诗：
+
+```text
+package/state/rpg-memory.sqlite3   # RPG 结构化记忆、ACL、事实、信念
+package/state/rpg-palace/          # 可选 Palace/Chroma 原文 transcript 归档
+package/memo_setting.json          # 哪些领域启用/关闭/narrative_only 的冲突策略
+```
+
+如果没有传 `--palace`，只写 SQLite；传了 `--palace`，每个 scene 的完整 transcript 还会额外写入 Palace 原文库。
+
 ## CLI 快速开始
 
 初始化/查看状态：
@@ -306,6 +334,92 @@ mempalace-rpg \
   --palace state/rpg-palace \
   commit-scene scene.json
 ```
+
+## 备份、恢复与按时间回滚
+
+当前提供三个简单维护命令：
+
+| 命令 | 功能 |
+|---|---|
+| `backup` | 复制 SQLite DB，并可同时复制 Palace 目录 |
+| `restore` | 从备份恢复 SQLite DB，并可同时恢复 Palace 目录 |
+| `delete-after` | 删除系统时间 cutoff 之后创建的 scene/event/memory/fact/belief，相当于回滚到某个时间点 |
+
+### 备份
+
+```bash
+mempalace-rpg \
+  --db state/rpg-memory.sqlite3 \
+  --palace state/rpg-palace \
+  backup
+```
+
+默认备份到：
+
+```text
+state/backups/
+```
+
+也可以指定：
+
+```bash
+mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace \
+  backup --backup-dir state/manual-backups
+```
+
+### 恢复
+
+```bash
+mempalace-rpg \
+  --db state/rpg-memory.sqlite3 \
+  --palace state/rpg-palace \
+  restore \
+  --db-backup state/backups/rpg-memory.sqlite3.bak-20260530T203000Z \
+  --palace-backup state/backups/rpg-palace.bak-20260530T203000Z
+```
+
+`restore` 默认会在覆盖前先创建一次安全备份。若确定不需要：
+
+```bash
+--no-pre-backup
+```
+
+### 按系统时间回滚
+
+先 dry-run 看会删什么：
+
+```bash
+mempalace-rpg \
+  --db state/rpg-memory.sqlite3 \
+  --palace state/rpg-palace \
+  delete-after "2026-05-30T20:29:55+00:00" \
+  --dry-run
+```
+
+确认后执行：
+
+```bash
+mempalace-rpg \
+  --db state/rpg-memory.sqlite3 \
+  --palace state/rpg-palace \
+  delete-after "2026-05-30T20:29:55+00:00"
+```
+
+它会删除 `created_at > cutoff` 的：
+
+```text
+scene_record
+scene_event
+memory_item
+world_fact
+actor_belief
+relationship_state 中以这些 event 为证据的行
+Palace 中对应的 rpg_scene_<scene_id> drawer
+```
+
+执行前默认自动 `backup`。如果只是想检查某个时间点之后有哪些内容，可以一直使用 `--dry-run`；输出里会列出最多 50 条 scene 的 `scene_id`、`created_at`、世界内时间和 transcript 摘要。
+
+注意：`delete-after` 使用的是系统写入时间 `created_at`，不是剧情内时间 `in_world_time`。这适合“撤销刚才导入/刚才游玩的内容”。如果要按剧情时间清理，需要先用 list/deep-recall/get-scene 查证后再处理。
 
 ## MCP 工具
 
