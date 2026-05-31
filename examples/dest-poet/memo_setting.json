@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "name": "命定之诗与黄昏之歌 RPG memory conflict policy",
+  "enabled": true,
+  "host_state_ownership": {
+    "current_world_time_location": "package state: /世界, tools: change_scene/rest",
+    "player_progression": "package state: /主角/等级 /累计经验值 /升级所需经验 /属性点 /生命层级, tools: resolve_combat_round/craft_item/allocate_attribute_points",
+    "player_resources": "package state: /主角/生命值 /法力值 /体力值 /状态效果 /死亡状态, tools: resolve_combat_round/rest/apply_damage_to_player",
+    "inventory_equipment_skills": "package state: /主角/背包 /装备 /技能, tools: manage_item/manage_equipment/commit_skill/generate_loot/draw_card",
+    "money_fp": "package state: /主角/金钱 /命运点数, tools: manage_money/manage_fp/manage_quest/draw_card",
+    "combat_runtime": "package state: /战斗, tools: generate_battle_npc/resolve_combat_round",
+    "quest_lifecycle": "package state: /任务列表, tools: generate_quest/manage_quest",
+    "relationships_numeric": "package state: /关系列表/*/好感度 and contracts, tools: update_affection/manage_contract",
+    "dlc_and_fate_core": "package state: /DLC /命定核心, tools: manage_dlc/set_fate_core/setup_game/get_fate_core_info",
+    "news_columns": "package state: /新闻, tools: news-writer/change_scene/patch_state structured fields"
+  },
+  "write": {
+    "enabled": true,
+    "domains": {
+      "canon": true,
+      "player": true,
+      "quest": "narrative_only",
+      "location": true,
+      "faction": true,
+      "character": true,
+      "item": "narrative_only"
+    },
+    "event_types": {
+      "state_patch": false,
+      "mechanical_state": false,
+      "inventory_state": false,
+      "equipment_state": false,
+      "skill_state": false,
+      "economy_state": false,
+      "progression_state": false,
+      "combat_state": false,
+      "dice_result": false
+    },
+    "facts": true,
+    "beliefs": true
+  },
+  "recall": {
+    "enabled": true,
+    "sections": {
+      "profile": true,
+      "current_state": false,
+      "world_truth": true,
+      "actor_belief": true,
+      "evidence": true
+    },
+    "domains": {
+      "canon": true,
+      "player": true,
+      "quest": "narrative_only",
+      "location": true,
+      "faction": true,
+      "character": true,
+      "item": "narrative_only"
+    }
+  },
+  "conflict_policy": {
+    "rule": "RPG memory stores narrative evidence and subjective knowledge only. Current numbers and mechanical state come from package tools/state.",
+    "host_owned_state_paths": [
+      "/世界",
+      "/主角/等级",
+      "/主角/累计经验值",
+      "/主角/升级所需经验",
+      "/主角/属性点",
+      "/主角/属性",
+      "/主角/生命值",
+      "/主角/生命值上限",
+      "/主角/法力值",
+      "/主角/法力值上限",
+      "/主角/体力值",
+      "/主角/体力值上限",
+      "/主角/金钱",
+      "/主角/背包",
+      "/主角/装备",
+      "/主角/技能",
+      "/主角/死亡状态",
+      "/命运点数",
+      "/命定核心",
+      "/任务列表",
+      "/关系列表/*/好感度",
+      "/战斗",
+      "/新闻",
+      "/DLC"
+    ],
+    "host_authoritative_tools": [
+      "get_status",
+      "get_player_panel",
+      "change_scene",
+      "rest",
+      "manage_money",
+      "manage_fp",
+      "manage_item",
+      "manage_equipment",
+      "commit_skill",
+      "generate_loot",
+      "draw_card",
+      "generate_battle_npc",
+      "resolve_combat_round",
+      "apply_damage_to_player",
+      "craft_item",
+      "allocate_attribute_points",
+      "generate_quest",
+      "manage_quest",
+      "update_affection",
+      "manage_contract",
+      "set_fate_core",
+      "setup_game",
+      "manage_dlc"
+    ],
+    "do_not_store_current_values_for": [
+      "level",
+      "xp",
+      "attribute_points",
+      "attributes",
+      "hp",
+      "mp",
+      "sp",
+      "money",
+      "fate_points",
+      "inventory_counts",
+      "equipment_slots",
+      "skill_stat_blocks",
+      "battle_hp",
+      "battle_turn_state",
+      "quest_active_state",
+      "affection_number",
+      "dlc_enabled_modules"
+    ],
+    "allowed_narrative_examples": [
+      "玩家曾向某 NPC 许诺",
+      "某秘密在何处被谁听见",
+      "某重要道具作为信物被交给谁",
+      "某战斗的公开结果或目击者记忆",
+      "某地点因玩家行动留下的公开变化",
+      "某阵营听说/误信/掌握了什么情报"
+    ]
+  }
+}
