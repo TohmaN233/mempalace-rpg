@@ -565,4 +565,4 @@ ruff check .
 
 ## 许可与致谢
 
-MIT，沿用上游 MemPalace 许可精神。本项目改造自 MemPalace，并在 README 中保留上游致谢。发布前请替换 `pyproject.toml` 中的占位仓库地址，并保留对 upstream MemPalace 的 credit。
+MIT，沿用上游 MemPalace 许可精神。本项目改造自 MemPalace。

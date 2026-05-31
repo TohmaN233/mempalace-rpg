@@ -269,4 +269,4 @@ ruff check .
 
 ## License and attribution
 
-MIT, following upstream MemPalace licensing. This repository is adapted from MemPalace and keeps that attribution explicit. If you publish it, replace placeholder repository URLs in `pyproject.toml` and keep upstream credit in this README.
+MIT, following upstream MemPalace licensing. This repository is adapted from MemPalace.
