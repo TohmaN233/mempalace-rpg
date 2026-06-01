@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "name": "<your game> RPG memory conflict policy",
+  "enabled": true,
+  "host_state_ownership": {
+    "current_world_time_location": "<Does your game own current time/location? If yes, name the state path/tool. If no, RPG memory may record it as a fact/history.>",
+    "player_progression": "<Level/XP/attributes owner: host tool/state or RPG memory?>",
+    "player_resources": "<HP/MP/SP/status owner?>",
+    "inventory_equipment_skills": "<Inventory/equipment/skills owner?>",
+    "money_economy": "<Money/prices/trading owner?>",
+    "combat_runtime": "<Combat turn/HP owner?>",
+    "quest_lifecycle": "<Quest accepted/completed/reward owner?>",
+    "relationships_numeric": "<Affection/trust numbers owner?>"
+  },
+  "write": {
+    "enabled": true,
+    "domains": {
+      "canon": true,
+      "player": true,
+      "character": true,
+      "location": true,
+      "faction": true,
+      "quest": "<true | narrative_only | false>",
+      "item": "<true | narrative_only | false>",
+      "mechanics": "<true | false>"
+    },
+    "event_types": {
+      "state_patch": "<true only if RPG memory is allowed to mirror state changes>",
+      "mechanical_state": "<true only if host has no authoritative mechanics engine>",
+      "inventory_state": "<true only if host has no inventory truth source>",
+      "equipment_state": "<true only if host has no equipment truth source>",
+      "skill_state": "<true only if host has no skill truth source>",
+      "economy_state": "<true only if host has no economy truth source>",
+      "progression_state": "<true only if host has no progression truth source>",
+      "combat_state": "<true only if host has no combat runtime truth source>",
+      "dice_result": true
+    },
+    "facts": true,
+    "beliefs": true
+  },
+  "recall": {
+    "enabled": true,
+    "sections": {
+      "profile": true,
+      "current_state": "<true only if RPG memory owns or mirrors current state>",
+      "world_truth": true,
+      "actor_belief": true,
+      "evidence": true
+    },
+    "domains": {
+      "canon": true,
+      "player": true,
+      "character": true,
+      "location": true,
+      "faction": true,
+      "quest": "<true | narrative_only | false>",
+      "item": "<true | narrative_only | false>",
+      "mechanics": "<true | false>"
+    }
+  },
+  "conflict_policy": {
+    "rule": "RPG memory may store any enabled domain, but it must not override a host-owned truth source.",
+    "host_owned_state_paths": [
+      "<fill with paths owned by your game, e.g. /player/hp>"
+    ],
+    "host_authoritative_tools": [
+      "<fill with tools whose results override memory, e.g. get_status>"
+    ],
+    "do_not_store_current_values_for": [
+      "<fields that memory may mention narratively but must not store as current state>"
+    ],
+    "allowed_narrative_examples": [
+      "A promise was made before witnesses.",
+      "A faction heard a rumor.",
+      "An item became important as a keepsake, without claiming current inventory count.",
+      "A battle outcome is remembered, without storing current HP."
+    ]
+  }
+}
