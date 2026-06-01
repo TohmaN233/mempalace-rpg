@@ -68,6 +68,39 @@ def test_private_witnessed_scene_is_filtered_before_recall(tmp_path):
     assert "承诺救回她弟弟" in gm_pack
 
 
+def test_memory_pack_evidence_includes_time_and_location(tmp_path):
+    kernel = RpgMemoryKernel(db_path=str(tmp_path / "rpg.sqlite3"))
+    kernel.commit_scene(
+        campaign_id="campaign",
+        scene_id="scene_time_anchor",
+        in_world_time="复兴纪元488年辉光之月01日07:12",
+        location_id="loc_ash_bridge",
+        transcript="Liora made an old promise on the ash bridge.",
+        participants=["char_liora"],
+        witnesses=["char_liora"],
+        events=[
+            SceneEventInput(
+                event_type="promise",
+                summary="Liora remembers the ash bridge promise.",
+                visibility="witnessed_only",
+                witness_set=["char_liora"],
+                related_entities=["char_liora"],
+            )
+        ],
+    )
+
+    rendered = kernel.build_memory_pack(
+        actor_id="char_liora",
+        actor_type="npc",
+        query="ash bridge promise",
+    ).render()
+
+    assert "复兴纪元488年辉光之月01日07:12" in rendered
+    assert "loc_ash_bridge" in rendered
+    assert "scene:scene_time_anchor" in rendered
+    assert "Liora remembers the ash bridge promise" in rendered
+
+
 def test_rumor_is_actor_belief_not_world_truth(tmp_path):
     kernel = RpgMemoryKernel(db_path=str(tmp_path / "rpg.sqlite3"))
     kernel.upsert_entity("char_bard", "character", "酒馆吟游诗人")

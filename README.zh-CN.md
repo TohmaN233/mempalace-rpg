@@ -153,8 +153,25 @@ mcp_rpg_recall({
 | `Profile` | `character_profile` | 当前 actor 的基础档案、人设、语言风格、目标 |
 | `World Truth` | `world_fact` | actor 有权限知道的世界事实 |
 | `Actor Belief` | `actor_belief` | actor 自己相信/怀疑/误解/听说的内容 |
-| `Retrieved Evidence` | `memory_item` | 与 query 最相关的可见证据片段 |
+| `Retrieved Evidence` | `memory_item` + `scene_record` | 与 query 最相关的可见证据片段；每条会带剧情时间、地点、scene_id、系统写入时间 |
 | `Forbidden Knowledge Guard` | 系统生成 | 提醒模型不要使用 MemoryPack 外的信息 |
+
+### MemoryPack 里的时间锚点
+
+为了避免模型把所有旧事都当作“昨天刚发生”，`Retrieved Evidence` 中的每条证据都会带时间/地点头：
+
+```text
+- [character:mem_xxx | 复兴纪元488年辉光之月01日07:12 | loc_ash_bridge | scene:scene_time_anchor | stored:2026-05-31T13:20:00+00:00] 某人记得灰烬桥上的旧承诺。
+```
+
+含义：
+
+- 第一段是**剧情内时间**，来自 `scene_record.in_world_time`。
+- 第二段是**剧情地点**，来自 `scene_record.location_id`。
+- `scene:<id>` 用于需要无损深挖时调用 `get-scene`。
+- `stored:<time>` 是系统写入时间，只用于调试、回滚、判断导入/写入先后，不等于剧情时间。
+
+GM/NPC 写回忆时应优先使用剧情内时间；只有剧情时间缺失时，才用“时间未标注”“旧战役档案”等保守说法，不要擅自改成昨天、刚才或近期。
 
 ### MemoryPack 为什么重要
 

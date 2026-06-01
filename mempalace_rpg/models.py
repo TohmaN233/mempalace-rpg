@@ -53,8 +53,18 @@ class MemoryPack:
             for item in self.evidence:
                 marker = item.get("memory_id", "memory")
                 domain = item.get("domain", "?")
+                scene = item.get("scene") if isinstance(item.get("scene"), dict) else {}
+                in_world_time = item.get("in_world_time") or scene.get("in_world_time") or "剧情时间未标注"
+                location = item.get("location_id") or scene.get("location_id") or "地点未标注"
+                created_at = item.get("created_at") or scene.get("created_at")
+                source_scene_id = item.get("source_scene_id") or scene.get("scene_id")
+                time_bits = [str(in_world_time), str(location)]
+                if source_scene_id:
+                    time_bits.append(f"scene:{source_scene_id}")
+                if created_at:
+                    time_bits.append(f"stored:{created_at}")
                 text = str(item.get("text", "")).strip()
-                lines.append(f"- [{domain}:{marker}] {text}")
+                lines.append(f"- [{domain}:{marker} | {' | '.join(time_bits)}] {text}")
         if self.forbidden_guard:
             lines.append("## Forbidden Knowledge Guard")
             lines.append(self.forbidden_guard.strip())

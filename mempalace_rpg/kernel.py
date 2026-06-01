@@ -1212,6 +1212,7 @@ class RpgMemoryKernel:
                 continue
             if not self._memory_allowed(item, actor_id, actor_type):
                 continue
+            self._attach_scene_context(item)
             item["rank_score"] = self._rank_score(
                 item,
                 query=query,
@@ -1232,6 +1233,35 @@ class RpgMemoryKernel:
             used += text_len
             packed.append(item)
         return packed
+
+    def _attach_scene_context(self, item: dict[str, Any]) -> None:
+        scene_id = item.get("source_scene_id")
+        if not scene_id:
+            return
+        row = self._conn().execute(
+            """
+            SELECT scene_id, campaign_id, in_world_time, scene_time_sort, location_id,
+                   participants_json, witnesses_json, created_at
+            FROM scene_record
+            WHERE scene_id=?
+            """,
+            (scene_id,),
+        ).fetchone()
+        if not row:
+            return
+        item["scene"] = {
+            "scene_id": row["scene_id"],
+            "campaign_id": row["campaign_id"],
+            "in_world_time": row["in_world_time"],
+            "scene_time_sort": row["scene_time_sort"],
+            "location_id": row["location_id"],
+            "participants": _loads(row["participants_json"], []),
+            "witnesses": _loads(row["witnesses_json"], []),
+            "created_at": row["created_at"],
+        }
+        item.setdefault("in_world_time", row["in_world_time"])
+        item.setdefault("location_id", row["location_id"])
+        item.setdefault("scene_time_sort", row["scene_time_sort"])
 
     def _rank_score(
         self,

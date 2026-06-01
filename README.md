@@ -67,6 +67,14 @@ Actors retrieve a `MemoryPack`:
 2. Rank allowed memories by relevance, recency, importance, actor tier, and query.
 3. Render sections: profile, world truth, actor beliefs, evidence, and guardrails.
 
+Evidence lines include time anchors from their source scene:
+
+```text
+- [character:mem_xxx | 488-01-01 07:12 | loc_ash_bridge | scene:scene_time_anchor | stored:2026-05-31T13:20:00+00:00] An old promise was made.
+```
+
+The in-world time and location help the GM/NPC avoid treating every recalled event as recent. `stored:` is system write time for debugging and rollback, not story time.
+
 This means an NPC does not become omniscient just because the database contains GM-only or other-character memories.
 
 ## Install
