@@ -217,6 +217,8 @@ mcp_rpg_get_scene(...)
 | `mempalace-rpg backup` | 备份 SQLite 和可选 Palace 原文库 |
 | `mempalace-rpg restore --db-backup ...` | 从备份恢复 |
 | `mempalace-rpg delete-after <cutoff>` | 删除 cutoff 之后创建的内容，按系统时间回滚 |
+| `mempalace-rpg delete-scenes <json>` | 精确删除指定 scene_id 列表 |
+| `mempalace-rpg sync-branch <json>` | 按 pi 当前分支 ledger 同步，支持树回溯重 roll |
 | `mempalace-rpg import-taverndb <json>` | 导入当前支持格式的酒馆数据库 JSON |
 
 所有 CLI 都可带：
@@ -420,6 +422,71 @@ Palace 中对应的 rpg_scene_<scene_id> drawer
 执行前默认自动 `backup`。如果只是想检查某个时间点之后有哪些内容，可以一直使用 `--dry-run`；输出里会列出最多 50 条 scene 的 `scene_id`、`created_at`、世界内时间和 transcript 摘要。
 
 注意：`delete-after` 使用的是系统写入时间 `created_at`，不是剧情内时间 `in_world_time`。这适合“撤销刚才导入/刚才游玩的内容”。如果要按剧情时间清理，需要先用 list/deep-recall/get-scene 查证后再处理。
+
+## pi 树回溯 / 重 roll 支持
+
+pi 的 `/tree` 可以回到旧消息节点重新生成分支；但 RPG memory 是外部 SQLite/Palace 副作用库，如果不处理，旧分支写入的场景会继续留在外部记忆里，污染新分支。
+
+推荐接入方式是 **branch ledger + sync-branch**：
+
+1. 每次自动归档 scene 成功后，extension 在 pi session 里追加一条 custom ledger entry。
+2. ledger 保存 `scene_id`、`campaign_id`、`branch_scope_id`、写入时间等。
+3. 用户 `/tree` 回到旧节点时，extension 读取当前 active branch 上的 ledger。
+4. 调用：
+
+```bash
+mempalace-rpg \
+  --db state/rpg-memory.sqlite3 \
+  --palace state/rpg-palace \
+  sync-branch keep-scenes.json \
+  --campaign-id fated-poem-dusk-song \
+  --branch-scope-id <pi-session-id>
+```
+
+`sync-branch` 会删除同一 campaign、同一 branch_scope_id 下“不在当前 branch ledger 里”的 auto-commit scene，并同步删除 SQLite 与 Palace drawer。
+
+这比 `delete-after` 更适合重 roll，因为它不是按时间粗删，而是按 pi 当前分支精确保留。
+
+### 哪些内容参与 tree reroll
+
+默认只同步自动归档的 scene：
+
+```json
+{
+  "event_type": "scene_transcript",
+  "payload": {
+    "auto_commit": true,
+    "branch_scope_id": "<pi session id>"
+  }
+}
+```
+
+以下内容默认不参与自动 tree 回滚：
+
+- 酒馆数据库导入的旧战役历史
+- 手动导入的世界设定
+- GM-only 长期档案
+- 没有 `auto_commit: true` 的手动结构化写入
+
+如果你希望某种手动写入也跟随 pi 分支回滚，应在宿主 extension 里同样为它写 ledger，并保证删除范围只覆盖当前 session/scope。
+
+### 调试
+
+先 dry-run：
+
+```bash
+mempalace-rpg --db state/rpg-memory.sqlite3 sync-branch keep-scenes.json \
+  --campaign-id fated-poem-dusk-song \
+  --branch-scope-id <pi-session-id> \
+  --dry-run
+```
+
+输出会显示会删除哪些 scene。若不确定内容，可用：
+
+```bash
+mempalace-rpg get-scene --scene-id <scene_id> --actor-id gm --actor-type gm --mode snippets
+mempalace-rpg deep-recall --actor-id gm --actor-type gm --query "关键词"
+```
 
 ## MCP 工具
 

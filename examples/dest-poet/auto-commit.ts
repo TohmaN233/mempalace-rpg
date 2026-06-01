@@ -24,6 +24,7 @@ import { getState } from "../core/state.ts";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(__dirname, "..", "..");
 
+export const RPG_MEMORY_LEDGER_ENTRY_TYPE = "mempalace-rpg-branch-ledger";
 const CAMPAIGN_ID = "fated-poem-dusk-song";
 
 const META_PATTERNS = [
@@ -174,6 +175,7 @@ function findMempalaceCli(): string | null {
   const candidates = [
     process.env.MEMPALACE_RPG_CLI,
     "mempalace-rpg",
+    join(projectRoot, "..", "mempalace-rpg", ".venv", "bin", "mempalace-rpg"),
     join(projectRoot, "..", "mempalace", ".venv", "bin", "mempalace-rpg"),
     "/home/tgy23/PI_workingspace/mempalace/.venv/bin/mempalace-rpg",
   ].filter(Boolean) as string[];
@@ -204,11 +206,11 @@ function commitPayload(payload: Record<string, unknown>) {
       "--memo-setting", join(projectRoot, "memo_setting.json"),
       "commit-scene", file,
     ], { cwd: projectRoot, stdio: "pipe" });
-    return { ok: true };
+    return { ok: true, sceneId: String(payload.scene_id || "") };
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
     // deterministic scene_id 可能在分支回放/重试时重复；这不是错误。
-    if (/UNIQUE constraint failed|IntegrityError|already exists/i.test(text)) return { ok: true, duplicate: true };
+    if (/UNIQUE constraint failed|IntegrityError|already exists/i.test(text)) return { ok: true, duplicate: true, sceneId: String(payload.scene_id || "") };
     return { ok: false, reason: text };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -219,6 +221,7 @@ export function buildAutoCommitPayload(options: {
   userText: string;
   assistantMessage: AgentMessage | undefined;
   toolResults?: ToolResultMessage[];
+  branchScopeId?: string;
 }): { skip: true; reason: string } | { skip: false; payload: Record<string, unknown> } {
   const assistantText = extractVisibleText(options.assistantMessage);
   const userText = options.userText.trim();
@@ -258,6 +261,7 @@ export function buildAutoCommitPayload(options: {
         importance: 0.2,
         payload: {
           auto_commit: true,
+          branch_scope_id: options.branchScopeId,
           extractor: "dest-poet deterministic visible-turn archiver v1",
           note: "Full visible in-world transcript is archived; structured durable events may be added separately by GM.",
         },
@@ -272,13 +276,76 @@ export function autoCommitTurnMemory(options: {
   userText: string;
   assistantMessage: AgentMessage | undefined;
   toolResults?: ToolResultMessage[];
-}): { ok: true; skipped?: boolean; reason?: string; duplicate?: boolean } | { ok: false; reason: string } {
+  branchScopeId?: string;
+}): { ok: true; skipped?: boolean; reason?: string; duplicate?: boolean; sceneId?: string; ledger?: Record<string, unknown> } | { ok: false; reason: string } {
   if (process.env.DEST_POET_AUTO_MEMO === "0" || process.env.DEST_POET_AUTO_MEMO === "false") {
     return { ok: true, skipped: true, reason: "disabled by DEST_POET_AUTO_MEMO" };
   }
   const built = buildAutoCommitPayload(options);
   if (built.skip) return { ok: true, skipped: true, reason: built.reason };
   const result = commitPayload(built.payload);
-  if (result.ok) return { ok: true, duplicate: Boolean((result as any).duplicate) };
+  if (result.ok) {
+    const sceneId = (result as any).sceneId || String((built.payload as any).scene_id || "");
+    return {
+      ok: true,
+      duplicate: Boolean((result as any).duplicate),
+      sceneId,
+      ledger: {
+        v: 1,
+        source: "auto_commit",
+        campaign_id: CAMPAIGN_ID,
+        scene_id: sceneId,
+        branch_scope_id: options.branchScopeId,
+        created_at: new Date().toISOString(),
+      },
+    };
+  }
   return { ok: false, reason: result.reason || "unknown auto memory commit failure" };
+}
+
+function ledgerSceneIdsFromBranch(entries: unknown[], branchScopeId: string): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const raw = entry as Record<string, any>;
+    if (raw.type !== "custom" || raw.customType !== RPG_MEMORY_LEDGER_ENTRY_TYPE) continue;
+    const data = raw.data as Record<string, unknown> | undefined;
+    if (!data || data.source !== "auto_commit") continue;
+    if (data.branch_scope_id && data.branch_scope_id !== branchScopeId) continue;
+    const sceneId = String(data.scene_id || "").trim();
+    if (!sceneId || seen.has(sceneId)) continue;
+    seen.add(sceneId);
+    ids.push(sceneId);
+  }
+  return ids;
+}
+
+export function syncBranchExternalMemory(options: {
+  entries: unknown[];
+  branchScopeId: string;
+}): { ok: true; deleted?: number; skipped?: boolean; reason?: string } | { ok: false; reason: string } {
+  const cli = findMempalaceCli();
+  if (!cli) return { ok: false, reason: "mempalace-rpg CLI not found" };
+  const keepSceneIds = ledgerSceneIdsFromBranch(options.entries, options.branchScopeId);
+  const dir = mkdtempSync(join(tmpdir(), "dest-poet-memo-sync-"));
+  const file = join(dir, "keep-scenes.json");
+  writeFileSync(file, JSON.stringify({ keep_scene_ids: keepSceneIds }, null, 2), "utf-8");
+  try {
+    const out = execFileSync(cli, [
+      "--db", join(projectRoot, "state", "rpg-memory.sqlite3"),
+      "--palace", join(projectRoot, "state", "rpg-palace"),
+      "--memo-setting", join(projectRoot, "memo_setting.json"),
+      "sync-branch", file,
+      "--campaign-id", CAMPAIGN_ID,
+      "--branch-scope-id", options.branchScopeId,
+    ], { cwd: projectRoot, stdio: "pipe" }).toString("utf-8");
+    const data = JSON.parse(out || "{}");
+    return { ok: true, deleted: Number(data.delete_scene_count || 0) };
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    return { ok: false, reason: text };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }

@@ -16,7 +16,7 @@ from typing import Any
 
 from .adapter import MempalaceEpisodeAdapter, NullEpisodeAdapter
 from .kernel import DEFAULT_RPG_MEMORY_DB, RpgMemoryKernel
-from .maintenance import backup, delete_after, restore
+from .maintenance import backup, delete_after, delete_scenes, restore, sync_branch
 from .models import SceneEventInput
 from .tavern_importer import import_taverndb
 
@@ -204,6 +204,46 @@ def cmd_delete_after(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scene_ids_from_args(args: argparse.Namespace) -> list[str]:
+    scene_ids = list(args.scene_id or [])
+    if args.file:
+        payload = _read_json(args.file)
+        if isinstance(payload, list):
+            scene_ids.extend(str(item) for item in payload)
+        elif isinstance(payload, dict):
+            raw = payload.get("scene_ids") or payload.get("keep_scene_ids") or []
+            scene_ids.extend(str(item) for item in raw)
+    return scene_ids
+
+
+def cmd_delete_scenes(args: argparse.Namespace) -> int:
+    _print_json(
+        delete_scenes(
+            args.db,
+            _scene_ids_from_args(args),
+            palace_path=args.palace,
+            dry_run=args.dry_run,
+            backup_first=not args.no_backup,
+        )
+    )
+    return 0
+
+
+def cmd_sync_branch(args: argparse.Namespace) -> int:
+    _print_json(
+        sync_branch(
+            args.db,
+            keep_scene_ids=_scene_ids_from_args(args),
+            campaign_id=args.campaign_id,
+            branch_scope_id=args.branch_scope_id,
+            palace_path=args.palace,
+            dry_run=args.dry_run,
+            backup_first=not args.no_backup,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mempalace-rpg",
@@ -305,6 +345,22 @@ def build_parser() -> argparse.ArgumentParser:
     delete_after_cmd.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without changing data.")
     delete_after_cmd.add_argument("--no-backup", action="store_true", help="Do not create a safety backup before deleting.")
     delete_after_cmd.set_defaults(func=cmd_delete_after)
+
+    delete_scenes_cmd = sub.add_parser("delete-scenes", help="Delete exact scene ids from SQLite and optional Palace drawers.")
+    delete_scenes_cmd.add_argument("file", nargs="?", help="JSON list of scene ids, object with scene_ids, or '-' for stdin.")
+    delete_scenes_cmd.add_argument("--scene-id", action="append", default=[], help="Scene id to delete. May be repeated.")
+    delete_scenes_cmd.add_argument("--dry-run", action="store_true")
+    delete_scenes_cmd.add_argument("--no-backup", action="store_true")
+    delete_scenes_cmd.set_defaults(func=cmd_delete_scenes)
+
+    sync_branch_cmd = sub.add_parser("sync-branch", help="Delete auto-commit scenes not present in the current pi branch ledger.")
+    sync_branch_cmd.add_argument("file", nargs="?", help="JSON list of keep scene ids, object with keep_scene_ids/scene_ids, or '-' for stdin.")
+    sync_branch_cmd.add_argument("--scene-id", action="append", default=[], help="Scene id to keep. May be repeated.")
+    sync_branch_cmd.add_argument("--campaign-id", help="Only sync auto-commit scenes from this campaign.")
+    sync_branch_cmd.add_argument("--branch-scope-id", help="Only sync scenes written by this pi session/scope id.")
+    sync_branch_cmd.add_argument("--dry-run", action="store_true")
+    sync_branch_cmd.add_argument("--no-backup", action="store_true")
+    sync_branch_cmd.set_defaults(func=cmd_sync_branch)
 
     return parser
 

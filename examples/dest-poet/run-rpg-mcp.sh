@@ -13,6 +13,7 @@ if [ -n "${MEMPALACE_RPG_MCP:-}" ]; then
 fi
 candidates+=(
   "mempalace-rpg-mcp"
+  "$PROJECT_ROOT/../mempalace-rpg/.venv/bin/mempalace-rpg-mcp"
   "$PROJECT_ROOT/../mempalace/.venv/bin/mempalace-rpg-mcp"
   "/home/tgy23/PI_workingspace/mempalace/.venv/bin/mempalace-rpg-mcp"
 )

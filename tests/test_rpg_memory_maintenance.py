@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mempalace_rpg import RpgMemoryKernel, SceneEventInput
-from mempalace_rpg.maintenance import backup, delete_after, restore
+from mempalace_rpg.maintenance import backup, delete_after, delete_scenes, restore, sync_branch
 
 
 def test_backup_restore_and_delete_after(tmp_path):
@@ -49,6 +49,53 @@ def test_backup_restore_and_delete_after(tmp_path):
 
     restore(str(db), db_backup=backup_result["db_backup"], pre_backup=False)
     assert kernel.status()["counts"]["scene_record"] == 1
+
+
+def test_delete_scenes_and_sync_branch(tmp_path):
+    db = tmp_path / "rpg.sqlite3"
+    kernel = RpgMemoryKernel(str(db))
+    keep = kernel.commit_scene(
+        scene_id="keep_auto",
+        campaign_id="c",
+        in_world_time="keep",
+        transcript="keep transcript",
+        events=[SceneEventInput(event_type="scene_transcript", summary="keep", payload={"auto_commit": True, "branch_scope_id": "s1"})],
+    )
+    drop = kernel.commit_scene(
+        scene_id="drop_auto",
+        campaign_id="c",
+        in_world_time="drop",
+        transcript="drop transcript",
+        events=[SceneEventInput(event_type="scene_transcript", summary="drop", payload={"auto_commit": True, "branch_scope_id": "s1"})],
+    )
+    manual = kernel.commit_scene(
+        scene_id="manual_scene",
+        campaign_id="c",
+        in_world_time="manual",
+        transcript="manual transcript",
+        events=[SceneEventInput(event_type="note", summary="manual")],
+    )
+
+    other = kernel.commit_scene(
+        scene_id="other_session_auto",
+        campaign_id="c",
+        in_world_time="other",
+        transcript="other transcript",
+        events=[SceneEventInput(event_type="scene_transcript", summary="other", payload={"auto_commit": True, "branch_scope_id": "s2"})],
+    )
+
+    preview = sync_branch(str(db), keep_scene_ids=[keep], campaign_id="c", branch_scope_id="s1", dry_run=True)
+    assert preview["delete_scene_count"] == 1
+    assert preview["scene_ids"] == [drop]
+
+    synced = sync_branch(str(db), keep_scene_ids=[keep], campaign_id="c", branch_scope_id="s1")
+    assert synced["scene_ids_deleted"] == [drop]
+    assert other == "other_session_auto"
+    assert kernel.status()["counts"]["scene_record"] == 3
+
+    deleted = delete_scenes(str(db), [manual])
+    assert deleted["deleted"]["scene_record"] == 1
+    assert kernel.status()["counts"]["scene_record"] == 2
 
 
 def test_cli_delete_after_dry_run(tmp_path):

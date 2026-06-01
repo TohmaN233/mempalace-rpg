@@ -153,6 +153,26 @@ mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace \
 
 `delete-after` uses system write time (`created_at`), not in-world time. It deletes matching scenes, events, memory items, facts, beliefs, relationship rows evidenced by those events, and corresponding Palace drawers. It automatically creates a backup first unless `--no-backup` is set.
 
+## pi tree reroll support
+
+pi sessions are trees. A player can use `/tree` to jump back and reroll a branch. Since RPG memory is an external side-effect store, host extensions should record a branch ledger whenever they auto-commit a scene.
+
+Recommended flow:
+
+1. Auto-commit a visible in-world turn.
+2. Append a pi custom ledger entry with `scene_id`, `campaign_id`, and `branch_scope_id`.
+3. On `session_tree`, read ledger entries on the current active branch.
+4. Call:
+
+```bash
+mempalace-rpg --db state/rpg-memory.sqlite3 --palace state/rpg-palace \
+  sync-branch keep-scenes.json \
+  --campaign-id fated-poem-dusk-song \
+  --branch-scope-id <pi-session-id>
+```
+
+`sync-branch` deletes auto-commit scenes in that campaign/scope that are not present in the current branch ledger, from both SQLite and Palace. Legacy imports and manual worldbuilding entries are not removed unless the host explicitly marks and ledgers them.
+
 ## MCP tools
 
 Run:
