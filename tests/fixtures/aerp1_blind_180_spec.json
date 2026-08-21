@@ -1,0 +1,30 @@
+{
+  "schema": "aerp1-blind-180-freeze-spec",
+  "version": 1,
+  "baseline": {
+    "commit": "8dca38c3d23c0e7c9f36fff10944bb86e71c3819",
+    "ranker_source": {
+      "path": "mempalace_rpg/kernel.py",
+      "git_blob": "b5172ca85ee84afbff62c13bf4502992ec7973f1",
+      "sha256": "7f8b702bfc1923d8a59c4569e436d43a185dcef39cab31eb7b0b8c0d3073d1d2"
+    },
+    "contract": {
+      "method": "RpgMemoryKernel._rank_score",
+      "candidate_scope": "all campaign memory projections before AERP authorization",
+      "score": "importance*3 + emotional_weight*2 + 0.1*unique_character_overlap + active_quest_bonus + location_bonus - canon_penalty",
+      "tie_break": "source projection selection uses (rank_score, memory_id); final event ranking is descending rank_score",
+      "neutral_cases": "exact_public, paraphrase, long_range_promise, temporal_location; 60 total"
+    }
+  },
+  "fixtures": {
+    "queries": {
+      "path": "aerp1_blind_180_queries.json",
+      "sha256": "3aaeb9e83fc2d9bc749c4d66f18460f34b7fd5cb7067effadefb3047dc011a3b"
+    },
+    "oracle": {
+      "path": "aerp1_blind_180_oracle.json",
+      "sha256": "02daad616c828ff270f8cc9adc53cdcc4d9e7e365bd8ac5bb5ccdd34f2a80c54"
+    }
+  },
+  "phase_contract": "The execution phase may open only this spec and the query bundle. The oracle file must remain unopened until all 360 product responses have been canonicalized."
+}

@@ -1,0 +1,921 @@
+{
+  "schema": "aerp1-blind-180-query-bundle",
+  "version": 1,
+  "cases_per_category": 15,
+  "categories": [
+    "exact_public",
+    "paraphrase",
+    "long_range_promise",
+    "temporal_location",
+    "rightful_private_witness",
+    "actor_belief",
+    "gm_wrong_actor_private",
+    "retconned_abandoned",
+    "faction_quest_outsider",
+    "belief_as_canon",
+    "cross_campaign",
+    "mixed_visibility_forbidden_span"
+  ],
+  "cases": [
+    {
+      "id": "exact_public-01",
+      "category": "exact_public",
+      "query": "exact public archive 01"
+    },
+    {
+      "id": "exact_public-02",
+      "category": "exact_public",
+      "query": "exact public archive 02"
+    },
+    {
+      "id": "exact_public-03",
+      "category": "exact_public",
+      "query": "exact public archive 03"
+    },
+    {
+      "id": "exact_public-04",
+      "category": "exact_public",
+      "query": "exact public archive 04"
+    },
+    {
+      "id": "exact_public-05",
+      "category": "exact_public",
+      "query": "exact public archive 05"
+    },
+    {
+      "id": "exact_public-06",
+      "category": "exact_public",
+      "query": "exact public archive 06"
+    },
+    {
+      "id": "exact_public-07",
+      "category": "exact_public",
+      "query": "exact public archive 07"
+    },
+    {
+      "id": "exact_public-08",
+      "category": "exact_public",
+      "query": "exact public archive 08"
+    },
+    {
+      "id": "exact_public-09",
+      "category": "exact_public",
+      "query": "exact public archive 09"
+    },
+    {
+      "id": "exact_public-10",
+      "category": "exact_public",
+      "query": "exact public archive 10"
+    },
+    {
+      "id": "exact_public-11",
+      "category": "exact_public",
+      "query": "exact public archive 11"
+    },
+    {
+      "id": "exact_public-12",
+      "category": "exact_public",
+      "query": "exact public archive 12"
+    },
+    {
+      "id": "exact_public-13",
+      "category": "exact_public",
+      "query": "exact public archive 13"
+    },
+    {
+      "id": "exact_public-14",
+      "category": "exact_public",
+      "query": "exact public archive 14"
+    },
+    {
+      "id": "exact_public-15",
+      "category": "exact_public",
+      "query": "exact public archive 15"
+    },
+    {
+      "id": "paraphrase-01",
+      "category": "paraphrase",
+      "query": "harbor clearance request 01"
+    },
+    {
+      "id": "paraphrase-02",
+      "category": "paraphrase",
+      "query": "harbor clearance request 02"
+    },
+    {
+      "id": "paraphrase-03",
+      "category": "paraphrase",
+      "query": "harbor clearance request 03"
+    },
+    {
+      "id": "paraphrase-04",
+      "category": "paraphrase",
+      "query": "harbor clearance request 04"
+    },
+    {
+      "id": "paraphrase-05",
+      "category": "paraphrase",
+      "query": "harbor clearance request 05"
+    },
+    {
+      "id": "paraphrase-06",
+      "category": "paraphrase",
+      "query": "harbor clearance request 06"
+    },
+    {
+      "id": "paraphrase-07",
+      "category": "paraphrase",
+      "query": "harbor clearance request 07"
+    },
+    {
+      "id": "paraphrase-08",
+      "category": "paraphrase",
+      "query": "harbor clearance request 08"
+    },
+    {
+      "id": "paraphrase-09",
+      "category": "paraphrase",
+      "query": "harbor clearance request 09"
+    },
+    {
+      "id": "paraphrase-10",
+      "category": "paraphrase",
+      "query": "harbor clearance request 10"
+    },
+    {
+      "id": "paraphrase-11",
+      "category": "paraphrase",
+      "query": "harbor clearance request 11"
+    },
+    {
+      "id": "paraphrase-12",
+      "category": "paraphrase",
+      "query": "harbor clearance request 12"
+    },
+    {
+      "id": "paraphrase-13",
+      "category": "paraphrase",
+      "query": "harbor clearance request 13"
+    },
+    {
+      "id": "paraphrase-14",
+      "category": "paraphrase",
+      "query": "harbor clearance request 14"
+    },
+    {
+      "id": "paraphrase-15",
+      "category": "paraphrase",
+      "query": "harbor clearance request 15"
+    },
+    {
+      "id": "long_range_promise-01",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 01"
+    },
+    {
+      "id": "long_range_promise-02",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 02"
+    },
+    {
+      "id": "long_range_promise-03",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 03"
+    },
+    {
+      "id": "long_range_promise-04",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 04"
+    },
+    {
+      "id": "long_range_promise-05",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 05"
+    },
+    {
+      "id": "long_range_promise-06",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 06"
+    },
+    {
+      "id": "long_range_promise-07",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 07"
+    },
+    {
+      "id": "long_range_promise-08",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 08"
+    },
+    {
+      "id": "long_range_promise-09",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 09"
+    },
+    {
+      "id": "long_range_promise-10",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 10"
+    },
+    {
+      "id": "long_range_promise-11",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 11"
+    },
+    {
+      "id": "long_range_promise-12",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 12"
+    },
+    {
+      "id": "long_range_promise-13",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 13"
+    },
+    {
+      "id": "long_range_promise-14",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 14"
+    },
+    {
+      "id": "long_range_promise-15",
+      "category": "long_range_promise",
+      "query": "long promise heirloom 15"
+    },
+    {
+      "id": "temporal_location-01",
+      "category": "temporal_location",
+      "query": "temporal beacon 01"
+    },
+    {
+      "id": "temporal_location-02",
+      "category": "temporal_location",
+      "query": "temporal beacon 02"
+    },
+    {
+      "id": "temporal_location-03",
+      "category": "temporal_location",
+      "query": "temporal beacon 03"
+    },
+    {
+      "id": "temporal_location-04",
+      "category": "temporal_location",
+      "query": "temporal beacon 04"
+    },
+    {
+      "id": "temporal_location-05",
+      "category": "temporal_location",
+      "query": "temporal beacon 05"
+    },
+    {
+      "id": "temporal_location-06",
+      "category": "temporal_location",
+      "query": "temporal beacon 06"
+    },
+    {
+      "id": "temporal_location-07",
+      "category": "temporal_location",
+      "query": "temporal beacon 07"
+    },
+    {
+      "id": "temporal_location-08",
+      "category": "temporal_location",
+      "query": "temporal beacon 08"
+    },
+    {
+      "id": "temporal_location-09",
+      "category": "temporal_location",
+      "query": "temporal beacon 09"
+    },
+    {
+      "id": "temporal_location-10",
+      "category": "temporal_location",
+      "query": "temporal beacon 10"
+    },
+    {
+      "id": "temporal_location-11",
+      "category": "temporal_location",
+      "query": "temporal beacon 11"
+    },
+    {
+      "id": "temporal_location-12",
+      "category": "temporal_location",
+      "query": "temporal beacon 12"
+    },
+    {
+      "id": "temporal_location-13",
+      "category": "temporal_location",
+      "query": "temporal beacon 13"
+    },
+    {
+      "id": "temporal_location-14",
+      "category": "temporal_location",
+      "query": "temporal beacon 14"
+    },
+    {
+      "id": "temporal_location-15",
+      "category": "temporal_location",
+      "query": "temporal beacon 15"
+    },
+    {
+      "id": "rightful_private_witness-01",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 01"
+    },
+    {
+      "id": "rightful_private_witness-02",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 02"
+    },
+    {
+      "id": "rightful_private_witness-03",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 03"
+    },
+    {
+      "id": "rightful_private_witness-04",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 04"
+    },
+    {
+      "id": "rightful_private_witness-05",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 05"
+    },
+    {
+      "id": "rightful_private_witness-06",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 06"
+    },
+    {
+      "id": "rightful_private_witness-07",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 07"
+    },
+    {
+      "id": "rightful_private_witness-08",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 08"
+    },
+    {
+      "id": "rightful_private_witness-09",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 09"
+    },
+    {
+      "id": "rightful_private_witness-10",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 10"
+    },
+    {
+      "id": "rightful_private_witness-11",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 11"
+    },
+    {
+      "id": "rightful_private_witness-12",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 12"
+    },
+    {
+      "id": "rightful_private_witness-13",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 13"
+    },
+    {
+      "id": "rightful_private_witness-14",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 14"
+    },
+    {
+      "id": "rightful_private_witness-15",
+      "category": "rightful_private_witness",
+      "query": "rightful private witness 15"
+    },
+    {
+      "id": "actor_belief-01",
+      "category": "actor_belief",
+      "query": "hero belief 01"
+    },
+    {
+      "id": "actor_belief-02",
+      "category": "actor_belief",
+      "query": "hero belief 02"
+    },
+    {
+      "id": "actor_belief-03",
+      "category": "actor_belief",
+      "query": "hero belief 03"
+    },
+    {
+      "id": "actor_belief-04",
+      "category": "actor_belief",
+      "query": "hero belief 04"
+    },
+    {
+      "id": "actor_belief-05",
+      "category": "actor_belief",
+      "query": "hero belief 05"
+    },
+    {
+      "id": "actor_belief-06",
+      "category": "actor_belief",
+      "query": "hero belief 06"
+    },
+    {
+      "id": "actor_belief-07",
+      "category": "actor_belief",
+      "query": "hero belief 07"
+    },
+    {
+      "id": "actor_belief-08",
+      "category": "actor_belief",
+      "query": "hero belief 08"
+    },
+    {
+      "id": "actor_belief-09",
+      "category": "actor_belief",
+      "query": "hero belief 09"
+    },
+    {
+      "id": "actor_belief-10",
+      "category": "actor_belief",
+      "query": "hero belief 10"
+    },
+    {
+      "id": "actor_belief-11",
+      "category": "actor_belief",
+      "query": "hero belief 11"
+    },
+    {
+      "id": "actor_belief-12",
+      "category": "actor_belief",
+      "query": "hero belief 12"
+    },
+    {
+      "id": "actor_belief-13",
+      "category": "actor_belief",
+      "query": "hero belief 13"
+    },
+    {
+      "id": "actor_belief-14",
+      "category": "actor_belief",
+      "query": "hero belief 14"
+    },
+    {
+      "id": "actor_belief-15",
+      "category": "actor_belief",
+      "query": "hero belief 15"
+    },
+    {
+      "id": "gm_wrong_actor_private-01",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 01"
+    },
+    {
+      "id": "gm_wrong_actor_private-02",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 02"
+    },
+    {
+      "id": "gm_wrong_actor_private-03",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 03"
+    },
+    {
+      "id": "gm_wrong_actor_private-04",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 04"
+    },
+    {
+      "id": "gm_wrong_actor_private-05",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 05"
+    },
+    {
+      "id": "gm_wrong_actor_private-06",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 06"
+    },
+    {
+      "id": "gm_wrong_actor_private-07",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 07"
+    },
+    {
+      "id": "gm_wrong_actor_private-08",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 08"
+    },
+    {
+      "id": "gm_wrong_actor_private-09",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 09"
+    },
+    {
+      "id": "gm_wrong_actor_private-10",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 10"
+    },
+    {
+      "id": "gm_wrong_actor_private-11",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 11"
+    },
+    {
+      "id": "gm_wrong_actor_private-12",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 12"
+    },
+    {
+      "id": "gm_wrong_actor_private-13",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 13"
+    },
+    {
+      "id": "gm_wrong_actor_private-14",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 14"
+    },
+    {
+      "id": "gm_wrong_actor_private-15",
+      "category": "gm_wrong_actor_private",
+      "query": "gm or private secret 15"
+    },
+    {
+      "id": "retconned_abandoned-01",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 01"
+    },
+    {
+      "id": "retconned_abandoned-02",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 02"
+    },
+    {
+      "id": "retconned_abandoned-03",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 03"
+    },
+    {
+      "id": "retconned_abandoned-04",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 04"
+    },
+    {
+      "id": "retconned_abandoned-05",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 05"
+    },
+    {
+      "id": "retconned_abandoned-06",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 06"
+    },
+    {
+      "id": "retconned_abandoned-07",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 07"
+    },
+    {
+      "id": "retconned_abandoned-08",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 08"
+    },
+    {
+      "id": "retconned_abandoned-09",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 09"
+    },
+    {
+      "id": "retconned_abandoned-10",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 10"
+    },
+    {
+      "id": "retconned_abandoned-11",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 11"
+    },
+    {
+      "id": "retconned_abandoned-12",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 12"
+    },
+    {
+      "id": "retconned_abandoned-13",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 13"
+    },
+    {
+      "id": "retconned_abandoned-14",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 14"
+    },
+    {
+      "id": "retconned_abandoned-15",
+      "category": "retconned_abandoned",
+      "query": "retired branch secret 15"
+    },
+    {
+      "id": "faction_quest_outsider-01",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 01"
+    },
+    {
+      "id": "faction_quest_outsider-02",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 02"
+    },
+    {
+      "id": "faction_quest_outsider-03",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 03"
+    },
+    {
+      "id": "faction_quest_outsider-04",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 04"
+    },
+    {
+      "id": "faction_quest_outsider-05",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 05"
+    },
+    {
+      "id": "faction_quest_outsider-06",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 06"
+    },
+    {
+      "id": "faction_quest_outsider-07",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 07"
+    },
+    {
+      "id": "faction_quest_outsider-08",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 08"
+    },
+    {
+      "id": "faction_quest_outsider-09",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 09"
+    },
+    {
+      "id": "faction_quest_outsider-10",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 10"
+    },
+    {
+      "id": "faction_quest_outsider-11",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 11"
+    },
+    {
+      "id": "faction_quest_outsider-12",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 12"
+    },
+    {
+      "id": "faction_quest_outsider-13",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 13"
+    },
+    {
+      "id": "faction_quest_outsider-14",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 14"
+    },
+    {
+      "id": "faction_quest_outsider-15",
+      "category": "faction_quest_outsider",
+      "query": "scoped outsider secret 15"
+    },
+    {
+      "id": "belief_as_canon-01",
+      "category": "belief_as_canon",
+      "query": "other actor belief 01"
+    },
+    {
+      "id": "belief_as_canon-02",
+      "category": "belief_as_canon",
+      "query": "other actor belief 02"
+    },
+    {
+      "id": "belief_as_canon-03",
+      "category": "belief_as_canon",
+      "query": "other actor belief 03"
+    },
+    {
+      "id": "belief_as_canon-04",
+      "category": "belief_as_canon",
+      "query": "other actor belief 04"
+    },
+    {
+      "id": "belief_as_canon-05",
+      "category": "belief_as_canon",
+      "query": "other actor belief 05"
+    },
+    {
+      "id": "belief_as_canon-06",
+      "category": "belief_as_canon",
+      "query": "other actor belief 06"
+    },
+    {
+      "id": "belief_as_canon-07",
+      "category": "belief_as_canon",
+      "query": "other actor belief 07"
+    },
+    {
+      "id": "belief_as_canon-08",
+      "category": "belief_as_canon",
+      "query": "other actor belief 08"
+    },
+    {
+      "id": "belief_as_canon-09",
+      "category": "belief_as_canon",
+      "query": "other actor belief 09"
+    },
+    {
+      "id": "belief_as_canon-10",
+      "category": "belief_as_canon",
+      "query": "other actor belief 10"
+    },
+    {
+      "id": "belief_as_canon-11",
+      "category": "belief_as_canon",
+      "query": "other actor belief 11"
+    },
+    {
+      "id": "belief_as_canon-12",
+      "category": "belief_as_canon",
+      "query": "other actor belief 12"
+    },
+    {
+      "id": "belief_as_canon-13",
+      "category": "belief_as_canon",
+      "query": "other actor belief 13"
+    },
+    {
+      "id": "belief_as_canon-14",
+      "category": "belief_as_canon",
+      "query": "other actor belief 14"
+    },
+    {
+      "id": "belief_as_canon-15",
+      "category": "belief_as_canon",
+      "query": "other actor belief 15"
+    },
+    {
+      "id": "cross_campaign-01",
+      "category": "cross_campaign",
+      "query": "other campaign secret 01"
+    },
+    {
+      "id": "cross_campaign-02",
+      "category": "cross_campaign",
+      "query": "other campaign secret 02"
+    },
+    {
+      "id": "cross_campaign-03",
+      "category": "cross_campaign",
+      "query": "other campaign secret 03"
+    },
+    {
+      "id": "cross_campaign-04",
+      "category": "cross_campaign",
+      "query": "other campaign secret 04"
+    },
+    {
+      "id": "cross_campaign-05",
+      "category": "cross_campaign",
+      "query": "other campaign secret 05"
+    },
+    {
+      "id": "cross_campaign-06",
+      "category": "cross_campaign",
+      "query": "other campaign secret 06"
+    },
+    {
+      "id": "cross_campaign-07",
+      "category": "cross_campaign",
+      "query": "other campaign secret 07"
+    },
+    {
+      "id": "cross_campaign-08",
+      "category": "cross_campaign",
+      "query": "other campaign secret 08"
+    },
+    {
+      "id": "cross_campaign-09",
+      "category": "cross_campaign",
+      "query": "other campaign secret 09"
+    },
+    {
+      "id": "cross_campaign-10",
+      "category": "cross_campaign",
+      "query": "other campaign secret 10"
+    },
+    {
+      "id": "cross_campaign-11",
+      "category": "cross_campaign",
+      "query": "other campaign secret 11"
+    },
+    {
+      "id": "cross_campaign-12",
+      "category": "cross_campaign",
+      "query": "other campaign secret 12"
+    },
+    {
+      "id": "cross_campaign-13",
+      "category": "cross_campaign",
+      "query": "other campaign secret 13"
+    },
+    {
+      "id": "cross_campaign-14",
+      "category": "cross_campaign",
+      "query": "other campaign secret 14"
+    },
+    {
+      "id": "cross_campaign-15",
+      "category": "cross_campaign",
+      "query": "other campaign secret 15"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-01",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 01"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-02",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 02"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-03",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 03"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-04",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 04"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-05",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 05"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-06",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 06"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-07",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 07"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-08",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 08"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-09",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 09"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-10",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 10"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-11",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 11"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-12",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 12"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-13",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 13"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-14",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 14"
+    },
+    {
+      "id": "mixed_visibility_forbidden_span-15",
+      "category": "mixed_visibility_forbidden_span",
+      "query": "mixed allowed evidence 15"
+    }
+  ]
+}

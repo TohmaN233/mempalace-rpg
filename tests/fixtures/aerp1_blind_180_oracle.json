@@ -1,0 +1,1566 @@
+{
+  "schema": "aerp1-blind-180-evaluator-oracle",
+  "version": 1,
+  "cases": [
+    {
+      "case_id": "exact_public-01",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 17,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.23981246656813146
+      }
+    },
+    {
+      "case_id": "exact_public-02",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-03",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-04",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-05",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-06",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-07",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-08",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-09",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-10",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-11",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 20,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.227670248696953
+      }
+    },
+    {
+      "case_id": "exact_public-12",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-13",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-14",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "exact_public-15",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "paraphrase-01",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-02",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-03",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-04",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-05",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-06",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-07",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-08",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-09",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-10",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-11",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-12",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-13",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-14",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "paraphrase-15",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": null,
+        "recall_at_24": 0,
+        "ndcg_at_24": 0
+      }
+    },
+    {
+      "case_id": "long_range_promise-01",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 2,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.6309297535714575
+      }
+    },
+    {
+      "case_id": "long_range_promise-02",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-03",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-04",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-05",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-06",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-07",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-08",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-09",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-10",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-11",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 5,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.38685280723454163
+      }
+    },
+    {
+      "case_id": "long_range_promise-12",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-13",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-14",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "long_range_promise-15",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 1,
+        "recall_at_24": 1,
+        "ndcg_at_24": 1
+      }
+    },
+    {
+      "case_id": "temporal_location-01",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-02",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-03",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-04",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-05",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-06",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-07",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-08",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-09",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-10",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-11",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-12",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-13",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-14",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "temporal_location-15",
+      "polarity": "positive",
+      "authorization_neutral": true,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false,
+      "b0": {
+        "gold_rank": 16,
+        "recall_at_24": 1,
+        "ndcg_at_24": 0.24465054211822604
+      }
+    },
+    {
+      "case_id": "rightful_private_witness-01",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-02",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-03",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-04",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-05",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-06",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-07",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-08",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-09",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-10",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-11",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-12",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-13",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-14",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "rightful_private_witness-15",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-01",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-02",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-03",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-04",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-05",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-06",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-07",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-08",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-09",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-10",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-11",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-12",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-13",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-14",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "actor_belief-15",
+      "polarity": "positive",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": true,
+      "expected_no_forbidden_leak": false
+    },
+    {
+      "case_id": "gm_wrong_actor_private-01",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-02",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-03",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-04",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-05",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-06",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-07",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-08",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-09",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-10",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-11",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-12",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-13",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-14",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "gm_wrong_actor_private-15",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-01",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-02",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-03",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-04",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-05",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-06",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-07",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-08",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-09",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-10",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-11",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-12",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-13",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-14",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "retconned_abandoned-15",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-01",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-02",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-03",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-04",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-05",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-06",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-07",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-08",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-09",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-10",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-11",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-12",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-13",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-14",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "faction_quest_outsider-15",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-01",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-02",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-03",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-04",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-05",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-06",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-07",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-08",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-09",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-10",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-11",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-12",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-13",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-14",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "belief_as_canon-15",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-01",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-02",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-03",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-04",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-05",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-06",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-07",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-08",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-09",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-10",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-11",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-12",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-13",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-14",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "cross_campaign-15",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-01",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-02",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-03",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-04",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-05",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-06",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-07",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-08",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-09",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-10",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-11",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-12",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-13",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-14",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    },
+    {
+      "case_id": "mixed_visibility_forbidden_span-15",
+      "polarity": "negative",
+      "authorization_neutral": false,
+      "expected_authorized_candidate": false,
+      "expected_no_forbidden_leak": true
+    }
+  ]
+}
