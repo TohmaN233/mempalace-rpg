@@ -61,10 +61,16 @@ class EvidenceAuthorizer:
             except SecurityMetadataError as exc: allowed, reason, evaluation = False, str(exc), {"metadata_integrity": False}
             candidates.append({"source_event_id": raw["event_id"], "source_scene_id": raw["scene_id"], "decision": "allow" if allowed else "deny", "reason": reason, "truth_status": raw["truth_status"], "visibility": raw["visibility"], "branch_id": raw.get("branch_id"), "branch_status": raw.get("branch_status"), "evaluation": evaluation})
             if allowed and raw["event_id"] not in seen: seen.add(raw["event_id"]); events.append(event)
-        events = events[:budget]
+        # Authorization produces the complete ACL-approved candidate universe.
+        # The product ranker applies its own hit/character budget after this
+        # boundary; truncating here by recency would make an older authorized
+        # event impossible to rank or use as deep evidence.  Keep ``budget``
+        # for the direct span materialization below, where it remains a
+        # response-size guard for this low-level API.
+        direct_events = events[:budget]
         spans = []
         seen_spans = set()
-        for event in events:
+        for event in direct_events:
             span = event.get("source_span")
             if not isinstance(span, str) or not span or span in seen_spans:
                 continue

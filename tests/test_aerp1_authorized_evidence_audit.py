@@ -174,6 +174,54 @@ def test_aerp1_authorized_evidence_direct_spans_are_budgeted_unique_and_traced(t
     assert decision.trace["returned_spans"] == [{"source_event_id": span["source_event_id"], "source_scene_id": span["source_scene_id"], "length": len(span["text"]), "truncated": False}]
 
 
+def test_aerp1_authorized_candidate_universe_survives_direct_span_budget(tmp_path):
+    kernel = RpgMemoryKernel(db_path=str(tmp_path / "candidate-universe.sqlite3"))
+    kernel.commit_scene(
+        campaign_id="C1",
+        scene_id="older",
+        in_world_time="older",
+        transcript="OLDER GOLD SPAN",
+        events=[SceneEventInput(
+            event_type="evidence", summary="older gold", branch_id="main", branch_status="active",
+            truth_status="canonical", visibility="public_world", source_span="OLDER GOLD SPAN", importance=10,
+        )],
+    )
+    kernel.commit_scene(
+        campaign_id="C1",
+        scene_id="newer",
+        in_world_time="newer",
+        transcript="RECENT NOISE SPAN",
+        events=[SceneEventInput(
+            event_type="evidence", summary="recent noise", branch_id="main", branch_status="active",
+            truth_status="canonical", visibility="public_world", source_span="RECENT NOISE SPAN", importance=0,
+        )],
+    )
+    ids = {
+        row["scene_id"]: row["event_id"]
+        for row in kernel._conn().execute("SELECT scene_id, event_id FROM scene_event")
+    }
+
+    decision = kernel.authorized_evidence(
+        campaign_id="C1",
+        actor_id="hero",
+        actor_type="npc",
+        query="older gold",
+        budget=1,
+    )
+
+    assert set(decision.trace["authorized_candidate_ids"]) == set(ids.values())
+    assert {event["source_event_id"] for event in decision.events} == set(ids.values())
+    assert len(decision.spans) == 1
+
+    deep = kernel.deep_recall(
+        campaign_id="C1",
+        actor_id="hero",
+        actor_type="npc",
+        query="older gold",
+    )
+    assert deep["scene_evidence"][0]["authorized_spans"][0]["text"] == "OLDER GOLD SPAN"
+
+
 def test_aerp1_overlap_policy_includes_branch_before_external_call(tmp_path):
     adapter = RecordingEpisodeAdapter()
     kernel = RpgMemoryKernel(db_path=str(tmp_path / "overlap.sqlite3"), episode_adapter=adapter)
