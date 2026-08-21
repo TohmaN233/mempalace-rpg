@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 
 def run_cli(*args):
     return subprocess.run(
@@ -43,7 +45,10 @@ def test_cli_commit_scene_and_recall_are_external_processes(tmp_path):
                 "events": [
                     {
                         "event_type": "promise",
+                        "branch_id": "main",
+                        "branch_status": "active",
                         "summary": "玩家向 Liora 承诺救回她弟弟。",
+                        "source_span": "玩家向 Liora 承诺救回她弟弟。",
                         "actor_id": "player",
                         "target_id": "char_liora",
                         "truth_status": "canonical",
@@ -72,8 +77,10 @@ def test_cli_commit_scene_and_recall_are_external_processes(tmp_path):
     recall = run_cli(
         "--db",
         str(db),
-        "recall",
-        "--actor-id",
+            "recall",
+            "--campaign-id",
+            "camp_demo",
+            "--actor-id",
         "char_liora",
         "--actor-type",
         "npc",
@@ -88,6 +95,8 @@ def test_cli_commit_scene_and_recall_are_external_processes(tmp_path):
         "--db",
         str(db),
         "recall",
+        "--campaign-id",
+        "camp_demo",
         "--actor-id",
         "char_guard",
         "--actor-type",
@@ -96,3 +105,39 @@ def test_cli_commit_scene_and_recall_are_external_processes(tmp_path):
         "承诺",
     )
     assert "承诺救回她弟弟" not in blocked.stdout
+
+
+def test_cli_deep_spans_and_restricted_product_surfaces(tmp_path):
+    db = tmp_path / "rpg.sqlite3"
+    payload = {"campaign_id": "c", "in_world_time": "early", "transcript": "EXACT SPAN", "events": [{"event_type": "promise", "summary": "a promise", "branch_id": "main", "branch_status": "active", "truth_status": "canonical", "visibility": "public_world", "source_span": "EXACT SPAN"}]}
+    source = tmp_path / "scene.json"; source.write_text(json.dumps(payload), encoding="utf-8")
+    run_cli("--db", str(db), "commit-scene", str(source))
+    deep = run_cli("--db", str(db), "deep-recall", "--campaign-id", "c", "--actor-id", "gm", "--actor-type", "gm", "--query", "promise")
+    assert "event:" in deep.stdout and "EXACT SPAN" in deep.stdout
+
+
+def test_cli_rejects_malformed_scene_list_and_party_only_import_before_writes(tmp_path):
+    db = tmp_path / "rpg.sqlite3"
+    scene = tmp_path / "bad-scene.json"
+    scene.write_text(json.dumps({"campaign_id": "C1", "in_world_time": "now", "transcript": "SAFE", "witnesses": "hero", "events": []}), encoding="utf-8")
+    bad_scene = subprocess.run([sys.executable, "-m", "mempalace_rpg.cli", "--db", str(db), "commit-scene", str(scene)], text=True, capture_output=True)
+    assert bad_scene.returncode != 0 and not db.exists()
+    source = tmp_path / "empty-tavern.json"
+    source.write_text("{}", encoding="utf-8")
+    bad_import = subprocess.run([sys.executable, "-m", "mempalace_rpg.cli", "--db", str(db), "import-taverndb", str(source), "--default-visibility", "party_only"], text=True, capture_output=True)
+    assert bad_import.returncode != 0 and not db.exists()
+    full = subprocess.run([sys.executable, "-m", "mempalace_rpg.cli", "--db", str(db), "get-scene", "--campaign-id", "c", "--scene-id", "scene_missing", "--actor-id", "gm", "--mode", "full"], text=True, capture_output=True)
+    assert full.returncode == 2 and "invalid choice" in full.stderr
+    for kind in ("facts", "beliefs", "memories"):
+        raw_list = subprocess.run([sys.executable, "-m", "mempalace_rpg.cli", "--db", str(db), "list", kind], text=True, capture_output=True)
+        assert raw_list.returncode != 0 and "Raw evidence listing is local-admin-only and is not exposed through the CLI" in raw_list.stderr
+
+
+@pytest.mark.parametrize("field", ["active_quest_ids", "participants", "witnesses"])
+def test_cli_explicit_null_optional_scene_lists_fail_before_database_creation(tmp_path, field):
+    db = tmp_path / "rpg.sqlite3"
+    source = tmp_path / f"null-{field}.json"
+    source.write_text(json.dumps({"campaign_id": "C1", "in_world_time": "now", "transcript": "SAFE", field: None, "events": []}), encoding="utf-8")
+    result = subprocess.run([sys.executable, "-m", "mempalace_rpg.cli", "--db", str(db), "commit-scene", str(source)], text=True, capture_output=True)
+    assert result.returncode != 0
+    assert not db.exists()

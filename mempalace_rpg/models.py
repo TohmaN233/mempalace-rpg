@@ -17,15 +17,20 @@ class SceneEventInput:
 
     event_type: str
     summary: str
+    branch_id: str
+    branch_status: str
     actor_id: str | None = None
     target_id: str | None = None
-    truth_status: str = "canonical"
-    visibility: str = "public_world"
+    truth_status: str | None = None
+    visibility: str | None = None
     witness_set: list[str] = field(default_factory=list)
     related_entities: list[str] = field(default_factory=list)
     related_quests: list[str] = field(default_factory=list)
     related_locations: list[str] = field(default_factory=list)
     source_span: str | None = None
+    access_owner_id: str | None = None
+    access_scope_id: str | None = None
+    belief_owner_id: str | None = None
     emotional_weight: float = 0.0
     importance: float = 0.0
     payload: dict[str, Any] = field(default_factory=dict)
@@ -40,6 +45,7 @@ class MemoryPack:
     sections: list[tuple[str, str]]
     evidence: list[dict[str, Any]]
     forbidden_guard: str
+    policy_trace: dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         lines: list[str] = []

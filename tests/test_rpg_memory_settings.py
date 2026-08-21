@@ -32,11 +32,15 @@ def test_memo_settings_can_disable_conflicting_domain_projection(tmp_path):
             SceneEventInput(
                 event_type="item_transfer",
                 summary="玩家把银坠交给 Liora 作为信物。",
+                branch_id="main",
+                branch_status="active",
+                truth_status="canonical",
                 actor_id="player",
                 target_id="char_liora",
                 visibility="witnessed_only",
                 witness_set=["player", "char_liora"],
                 related_entities=["player", "char_liora", "item_silver_pendant"],
+                source_span="玩家把银坠交给 Liora。",
                 importance=0.8,
             )
         ],
@@ -56,23 +60,32 @@ def test_memo_settings_can_disable_mechanical_event_types(tmp_path):
     kernel.commit_scene(
         campaign_id="camp_demo",
         in_world_time="星辉历8日",
-        transcript="系统状态更新。",
+        transcript="系统状态更新。玩家答应明天去港口。",
         participants=["player"],
         witnesses=["player"],
         events=[
             SceneEventInput(
                 event_type="state_patch",
                 summary="玩家等级从 1 变为 2。",
+                branch_id="main",
+                branch_status="active",
+                truth_status="canonical",
                 actor_id="player",
                 visibility="gm_only",
                 related_entities=["player"],
+                source_span="系统状态更新。",
             ),
             SceneEventInput(
                 event_type="promise",
                 summary="玩家答应明天去港口。",
+                branch_id="main",
+                branch_status="active",
+                truth_status="canonical",
                 actor_id="player",
                 visibility="party_only",
+                access_scope_id="party_main",
                 related_entities=["player"],
+                source_span="玩家答应明天去港口。",
             ),
         ],
     )
@@ -97,7 +110,7 @@ def test_memo_settings_can_disable_recall_sections_that_host_owns(tmp_path):
         witnesses=["player"],
     )
 
-    rendered = kernel.build_memory_pack(actor_id="gm", actor_type="gm", query="现在在哪").render()
+    rendered = kernel.build_memory_pack(campaign_id="camp_demo", actor_id="gm", actor_type="gm", query="现在在哪").render()
     assert "## Current State" not in rendered
     assert "loc_silverport" not in rendered
 

@@ -18,7 +18,7 @@ def test_backup_restore_and_delete_after(tmp_path):
         transcript="old transcript",
         participants=["npc_a"],
         witnesses=["npc_a"],
-        events=[SceneEventInput(event_type="old", summary="old event", visibility="witnessed_only")],
+        events=[SceneEventInput(event_type="old", summary="old event", branch_id="main", branch_status="active", truth_status="canonical", visibility="witnessed_only", source_span="old transcript")],
     )
     backup_result = backup(str(db))
     assert Path(backup_result["db_backup"]).exists()
@@ -31,7 +31,7 @@ def test_backup_restore_and_delete_after(tmp_path):
         transcript="new transcript",
         participants=["npc_a"],
         witnesses=["npc_a"],
-        events=[SceneEventInput(event_type="new", summary="new event", visibility="witnessed_only")],
+        events=[SceneEventInput(event_type="new", summary="new event", branch_id="main", branch_status="active", truth_status="canonical", visibility="witnessed_only", source_span="new transcript")],
     )
     assert old_scene == "old_scene"
     assert new_scene == "new_scene"
@@ -43,7 +43,7 @@ def test_backup_restore_and_delete_after(tmp_path):
     deleted = delete_after(str(db), cutoff)
     assert deleted["deleted"]["scene_record"] == 1
     assert kernel.status()["counts"]["scene_record"] == 1
-    pack = kernel.build_memory_pack(actor_id="gm", actor_type="gm", query="new old").render()
+    pack = kernel.build_memory_pack(campaign_id="c", actor_id="gm", actor_type="gm", query="new old").render()
     assert "old event" in pack
     assert "new event" not in pack
 
@@ -59,21 +59,21 @@ def test_delete_scenes_and_sync_branch(tmp_path):
         campaign_id="c",
         in_world_time="keep",
         transcript="keep transcript",
-        events=[SceneEventInput(event_type="scene_transcript", summary="keep", payload={"auto_commit": True, "branch_scope_id": "s1"})],
+        events=[SceneEventInput(event_type="scene_transcript", summary="keep", branch_id="main", branch_status="active", truth_status="canonical", visibility="gm_only", source_span="keep transcript", payload={"auto_commit": True, "branch_scope_id": "s1"})],
     )
     drop = kernel.commit_scene(
         scene_id="drop_auto",
         campaign_id="c",
         in_world_time="drop",
         transcript="drop transcript",
-        events=[SceneEventInput(event_type="scene_transcript", summary="drop", payload={"auto_commit": True, "branch_scope_id": "s1"})],
+        events=[SceneEventInput(event_type="scene_transcript", summary="drop", branch_id="main", branch_status="active", truth_status="canonical", visibility="gm_only", source_span="drop transcript", payload={"auto_commit": True, "branch_scope_id": "s1"})],
     )
     manual = kernel.commit_scene(
         scene_id="manual_scene",
         campaign_id="c",
         in_world_time="manual",
         transcript="manual transcript",
-        events=[SceneEventInput(event_type="note", summary="manual")],
+        events=[SceneEventInput(event_type="note", summary="manual", branch_id="main", branch_status="active", truth_status="canonical", visibility="gm_only", source_span="manual transcript")],
     )
 
     other = kernel.commit_scene(
@@ -81,7 +81,7 @@ def test_delete_scenes_and_sync_branch(tmp_path):
         campaign_id="c",
         in_world_time="other",
         transcript="other transcript",
-        events=[SceneEventInput(event_type="scene_transcript", summary="other", payload={"auto_commit": True, "branch_scope_id": "s2"})],
+        events=[SceneEventInput(event_type="scene_transcript", summary="other", branch_id="main", branch_status="active", truth_status="canonical", visibility="gm_only", source_span="other transcript", payload={"auto_commit": True, "branch_scope_id": "s2"})],
     )
 
     preview = sync_branch(str(db), keep_scene_ids=[keep], campaign_id="c", branch_scope_id="s1", dry_run=True)
@@ -105,7 +105,7 @@ def test_cli_delete_after_dry_run(tmp_path):
         "campaign_id": "c",
         "in_world_time": "now",
         "transcript": "hello",
-        "events": [{"event_type": "note", "summary": "hello", "visibility": "public_world"}],
+        "events": [{"event_type": "note", "summary": "hello", "branch_id": "main", "branch_status": "active", "truth_status": "canonical", "visibility": "public_world", "source_span": "hello"}],
     }
     scene_file = tmp_path / "scene.json"
     scene_file.write_text(json.dumps(payload), encoding="utf-8")

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapter import MempalaceEpisodeAdapter, NullEpisodeAdapter
-from .kernel import DEFAULT_RPG_MEMORY_DB, RpgMemoryKernel
+from .kernel import DEFAULT_RPG_MEMORY_DB, RpgMemoryKernel, _strict_string_list
 from .maintenance import backup, delete_after, delete_scenes, restore, sync_branch
 from .models import SceneEventInput
 from .tavern_importer import import_taverndb
@@ -65,7 +65,23 @@ def cmd_upsert_profile(args: argparse.Namespace) -> int:
 
 def cmd_commit_scene(args: argparse.Namespace) -> int:
     payload = _read_json(args.file)
-    events = [SceneEventInput(**event) for event in payload.pop("events", [])]
+    raw_events = payload.pop("events", [])
+    if raw_events is None:
+        raw_events = []
+    if not isinstance(raw_events, list):
+        raise ValueError("events must be a list of SceneEventInput objects or dicts")
+    # Python callers may use None as an omitted optional list. JSON callers must
+    # omit the key instead: an explicit null is malformed input, not omission.
+    for name in ("active_quest_ids", "participants", "witnesses"):
+        if name in payload:
+            _strict_string_list(payload[name], name)
+    events = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            raise ValueError("events must contain only SceneEventInput objects or dicts")
+        event = RpgMemoryKernel._normalize_event_lists(SceneEventInput(**raw))
+        RpgMemoryKernel._validate_scene_event_security(event)
+        events.append(event)
     with _kernel(args) as kernel:
         scene_id = kernel.commit_scene(events=events, **payload)
         _print_json({"ok": True, "scene_id": scene_id})
@@ -75,6 +91,7 @@ def cmd_commit_scene(args: argparse.Namespace) -> int:
 def cmd_recall(args: argparse.Namespace) -> int:
     with _kernel(args) as kernel:
         pack = kernel.build_memory_pack(
+            campaign_id=args.campaign_id,
             actor_id=args.actor_id,
             actor_type=args.actor_type,
             query=args.query,
@@ -92,6 +109,7 @@ def cmd_recall(args: argparse.Namespace) -> int:
                     "sections": pack.sections,
                     "evidence": pack.evidence,
                     "forbidden_guard": pack.forbidden_guard,
+                    "policy_trace": pack.policy_trace,
                 }
             )
         else:
@@ -102,6 +120,7 @@ def cmd_recall(args: argparse.Namespace) -> int:
 def cmd_get_scene(args: argparse.Namespace) -> int:
     with _kernel(args) as kernel:
         result = kernel.get_scene_transcript(
+            campaign_id=args.campaign_id,
             scene_id=args.scene_id,
             actor_id=args.actor_id,
             actor_type=args.actor_type,
@@ -126,6 +145,7 @@ def cmd_get_scene(args: argparse.Namespace) -> int:
 def cmd_deep_recall(args: argparse.Namespace) -> int:
     with _kernel(args) as kernel:
         result = kernel.deep_recall(
+            campaign_id=args.campaign_id,
             actor_id=args.actor_id,
             actor_type=args.actor_type,
             query=args.query,
@@ -141,24 +161,19 @@ def cmd_deep_recall(args: argparse.Namespace) -> int:
         if not args.json and result.get("scene_evidence"):
             print("\n## Verbatim Scene Evidence")
             for scene in result["scene_evidence"]:
-                if scene.get("transcript_excerpt"):
-                    print(f"\n### {scene.get('scene_id')}")
-                    print(scene["transcript_excerpt"])
+                for span in scene.get("authorized_spans", []):
+                    print(f"\n### {scene.get('scene_id')} event:{span['source_event_id']}")
+                    print(span["text"])
     return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    with _kernel(args) as kernel:
-        if args.kind == "facts":
-            _print_json(kernel.list_world_facts(subject_id=args.subject_id))
-        elif args.kind == "beliefs":
-            _print_json(kernel.list_actor_beliefs(actor_id=args.actor_id, subject_id=args.subject_id))
-        else:
-            _print_json(kernel.list_memory_items(domain=args.domain, owner_scope=args.owner_scope))
-    return 0
+    raise PermissionError("Raw evidence listing is local-admin-only and is not exposed through the CLI")
 
 
 def cmd_import_taverndb(args: argparse.Namespace) -> int:
+    if args.default_visibility not in {"witnessed_only", "gm_only", "public_world"}:
+        raise ValueError("default_visibility must be witnessed_only, gm_only, or public_world")
     with _kernel(args) as kernel:
         _print_json(
             import_taverndb(
@@ -279,6 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     commit.set_defaults(func=cmd_commit_scene)
 
     recall = sub.add_parser("recall", help="Build an ACL-filtered MemoryPack for an actor.")
+    recall.add_argument("--campaign-id", required=True)
     recall.add_argument("--actor-id", required=True)
     recall.add_argument("--actor-type", default="npc", choices=["gm", "npc", "companion", "narrator", "faction_agent", "player"])
     recall.add_argument("--query", required=True)
@@ -291,16 +307,18 @@ def build_parser() -> argparse.ArgumentParser:
     recall.set_defaults(func=cmd_recall)
 
     get_scene = sub.add_parser("get-scene", help="Fetch an ACL-checked verbatim scene transcript or exact snippets.")
+    get_scene.add_argument("--campaign-id", required=True)
     get_scene.add_argument("--scene-id", required=True)
     get_scene.add_argument("--actor-id", required=True)
     get_scene.add_argument("--actor-type", default="npc", choices=["gm", "npc", "companion", "narrator", "faction_agent", "player"])
     get_scene.add_argument("--query")
-    get_scene.add_argument("--mode", default="snippets", choices=["snippets", "full"])
+    get_scene.add_argument("--mode", default="snippets", choices=["snippets"])
     get_scene.add_argument("--max-chars", type=int, default=4000)
     get_scene.add_argument("--json", action="store_true")
     get_scene.set_defaults(func=cmd_get_scene)
 
     deep = sub.add_parser("deep-recall", help="Normal MemoryPack plus ACL-checked verbatim snippets for top source scenes.")
+    deep.add_argument("--campaign-id", required=True)
     deep.add_argument("--actor-id", required=True)
     deep.add_argument("--actor-type", default="npc", choices=["gm", "npc", "companion", "narrator", "faction_agent", "player"])
     deep.add_argument("--query", required=True)
@@ -325,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     tavern = sub.add_parser("import-taverndb", help="Import SillyTavern ChatSheets/TavernDB JSON as legacy past-campaign memory.")
     tavern.add_argument("file", help="TavernDB JSON file.")
     tavern.add_argument("--campaign-id", help="Legacy campaign id. Default derived from filename.")
-    tavern.add_argument("--default-visibility", default="witnessed_only", choices=["witnessed_only", "gm_only", "public_world", "party_only"], help="Visibility for imported timeline/promise memories. Default: witnessed_only.")
+    tavern.add_argument("--default-visibility", default="witnessed_only", choices=["witnessed_only", "gm_only", "public_world"], help="Visibility for imported timeline/promise memories. Default: witnessed_only.")
     tavern.add_argument("--scene-limit", type=int, help="Import at most N timeline rows (useful for testing).")
     tavern.add_argument("--dry-run", action="store_true", help="Parse and count without writing.")
     tavern.set_defaults(func=cmd_import_taverndb)

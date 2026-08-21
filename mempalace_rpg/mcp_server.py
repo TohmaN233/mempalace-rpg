@@ -157,6 +157,7 @@ def tool_commit_scene(
 
 def tool_recall(
     *,
+    campaign_id: str,
     actor_id: str,
     query: str,
     actor_type: str = "npc",
@@ -168,6 +169,7 @@ def tool_recall(
 ) -> dict[str, Any]:
     with _kernel() as kernel:
         pack = kernel.build_memory_pack(
+            campaign_id=campaign_id,
             actor_id=actor_id,
             actor_type=actor_type,
             query=query,
@@ -185,11 +187,13 @@ def tool_recall(
             "sections": pack.sections,
             "evidence": pack.evidence,
             "forbidden_guard": pack.forbidden_guard,
+            "policy_trace": pack.policy_trace,
         }
 
 
 def tool_get_scene(
     *,
+    campaign_id: str,
     scene_id: str,
     actor_id: str,
     actor_type: str = "npc",
@@ -199,6 +203,7 @@ def tool_get_scene(
 ) -> dict[str, Any]:
     with _kernel() as kernel:
         return kernel.get_scene_transcript(
+            campaign_id=campaign_id,
             scene_id=scene_id,
             actor_id=actor_id,
             actor_type=actor_type,
@@ -210,6 +215,7 @@ def tool_get_scene(
 
 def tool_deep_recall(
     *,
+    campaign_id: str,
     actor_id: str,
     query: str,
     actor_type: str = "npc",
@@ -223,6 +229,7 @@ def tool_deep_recall(
 ) -> dict[str, Any]:
     with _kernel() as kernel:
         return kernel.deep_recall(
+            campaign_id=campaign_id,
             actor_id=actor_id,
             actor_type=actor_type,
             query=query,
@@ -241,15 +248,11 @@ def tool_list_memories(
     domain: str | None = None,
     owner_scope: str | None = None,
 ) -> dict[str, Any]:
-    with _kernel() as kernel:
-        memories = kernel.list_memory_items(domain=domain, owner_scope=owner_scope)
-        return {"success": True, "count": len(memories), "memories": memories}
+    raise PermissionError("Raw evidence listing is local-admin-only and is not exposed through MCP")
 
 
 def tool_list_world_facts(*, subject_id: str | None = None) -> dict[str, Any]:
-    with _kernel() as kernel:
-        facts = kernel.list_world_facts(subject_id=subject_id)
-        return {"success": True, "count": len(facts), "facts": facts}
+    raise PermissionError("Raw evidence listing is local-admin-only and is not exposed through MCP")
 
 
 def tool_list_actor_beliefs(
@@ -257,9 +260,7 @@ def tool_list_actor_beliefs(
     actor_id: str | None = None,
     subject_id: str | None = None,
 ) -> dict[str, Any]:
-    with _kernel() as kernel:
-        beliefs = kernel.list_actor_beliefs(actor_id=actor_id, subject_id=subject_id)
-        return {"success": True, "count": len(beliefs), "beliefs": beliefs}
+    raise PermissionError("Raw evidence listing is local-admin-only and is not exposed through MCP")
 
 
 def tool_import_taverndb(
@@ -328,34 +329,39 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "campaign_id": {"type": "string"},
+                "campaign_id": {"type": "string", "non_blank": True},
                 "in_world_time": {"type": "string"},
                 "transcript": {"type": "string"},
                 "location_id": {"type": "string"},
-                "active_quest_ids": {"type": "array", "items": {"type": "string"}},
-                "participants": {"type": "array", "items": {"type": "string"}},
-                "witnesses": {"type": "array", "items": {"type": "string"}},
+                "active_quest_ids": {"type": "array", "items": {"type": "string", "non_blank": True}},
+                "participants": {"type": "array", "items": {"type": "string", "non_blank": True}},
+                "witnesses": {"type": "array", "items": {"type": "string", "non_blank": True}},
                 "events": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "event_type": {"type": "string"},
-                            "summary": {"type": "string"},
+                            "event_type": {"type": "string", "non_blank": True},
+                            "summary": {"type": "string", "non_blank": True},
                             "actor_id": {"type": "string"},
                             "target_id": {"type": "string"},
                             "truth_status": {"type": "string"},
                             "visibility": {"type": "string"},
-                            "witness_set": {"type": "array", "items": {"type": "string"}},
-                            "related_entities": {"type": "array", "items": {"type": "string"}},
-                            "related_quests": {"type": "array", "items": {"type": "string"}},
-                            "related_locations": {"type": "array", "items": {"type": "string"}},
-                            "source_span": {"type": "string"},
+                            "witness_set": {"type": "array", "items": {"type": "string", "non_blank": True}},
+                            "related_entities": {"type": "array", "items": {"type": "string", "non_blank": True}},
+                            "related_quests": {"type": "array", "items": {"type": "string", "non_blank": True}},
+                            "related_locations": {"type": "array", "items": {"type": "string", "non_blank": True}},
+                            "source_span": {"type": "string", "non_blank": True},
+                            "access_owner_id": {"type": "string", "non_blank": True},
+                            "access_scope_id": {"type": "string", "non_blank": True},
+                            "belief_owner_id": {"type": "string", "non_blank": True},
+                            "branch_id": {"type": "string", "non_blank": True},
+                            "branch_status": {"type": "string", "enum": ["active", "retconned", "abandoned"]},
                             "emotional_weight": {"type": "number"},
                             "importance": {"type": "number"},
                             "payload": {"type": "object"},
                         },
-                        "required": ["event_type", "summary"],
+                        "required": ["event_type", "summary", "truth_status", "visibility", "branch_id", "branch_status", "source_span"],
                     },
                 },
                 "scene_id": {"type": "string"},
@@ -369,6 +375,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "campaign_id": {"type": "string"},
                 "actor_id": {"type": "string"},
                 "actor_type": {
                     "type": "string",
@@ -381,7 +388,7 @@ TOOLS = {
                 "in_world_time": {"type": "string"},
                 "max_chars": {"type": "integer"},
             },
-            "required": ["actor_id", "query"],
+            "required": ["campaign_id", "actor_id", "query"],
         },
         "handler": tool_recall,
     },
@@ -390,6 +397,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "campaign_id": {"type": "string"},
                 "scene_id": {"type": "string"},
                 "actor_id": {"type": "string"},
                 "actor_type": {
@@ -397,10 +405,10 @@ TOOLS = {
                     "enum": ["gm", "npc", "companion", "narrator", "faction_agent", "player"],
                 },
                 "query": {"type": "string"},
-                "mode": {"type": "string", "enum": ["snippets", "full"]},
+                "mode": {"type": "string", "enum": ["snippets"]},
                 "max_chars": {"type": "integer"},
             },
-            "required": ["scene_id", "actor_id"],
+            "required": ["campaign_id", "scene_id", "actor_id"],
         },
         "handler": tool_get_scene,
     },
@@ -409,6 +417,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "campaign_id": {"type": "string"},
                 "actor_id": {"type": "string"},
                 "actor_type": {
                     "type": "string",
@@ -423,12 +432,12 @@ TOOLS = {
                 "per_scene_chars": {"type": "integer"},
                 "scene_limit": {"type": "integer"},
             },
-            "required": ["actor_id", "query"],
+            "required": ["campaign_id", "actor_id", "query"],
         },
         "handler": tool_deep_recall,
     },
     "mempalace_rpg_list_memories": {
-        "description": "Debug/list memory projections by domain and owner scope.",
+        "description": "Disabled MCP surface. Raw evidence listing is local-admin-only and always denied over MCP.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -439,7 +448,7 @@ TOOLS = {
         "handler": tool_list_memories,
     },
     "mempalace_rpg_list_world_facts": {
-        "description": "Debug/list canonical world facts. Rumors should not appear here.",
+        "description": "Disabled MCP surface. Raw evidence listing is local-admin-only and always denied over MCP.",
         "input_schema": {
             "type": "object",
             "properties": {"subject_id": {"type": "string"}},
@@ -447,7 +456,7 @@ TOOLS = {
         "handler": tool_list_world_facts,
     },
     "mempalace_rpg_list_actor_beliefs": {
-        "description": "Debug/list actor beliefs, including rumors and subjective knowledge.",
+        "description": "Disabled MCP surface. Raw evidence listing is local-admin-only and always denied over MCP.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -464,7 +473,7 @@ TOOLS = {
             "properties": {
                 "file_path": {"type": "string", "description": "Path to TavernDB JSON export."},
                 "campaign_id": {"type": "string", "description": "Optional legacy campaign id."},
-                "default_visibility": {"type": "string", "description": "witnessed_only|gm_only|public_world|party_only. Default witnessed_only."},
+                "default_visibility": {"type": "string", "enum": ["witnessed_only", "gm_only", "public_world"], "description": "witnessed_only|gm_only|public_world. Default witnessed_only."},
                 "scene_limit": {"type": "integer", "description": "Optional max timeline rows to import."},
                 "dry_run": {"type": "boolean", "description": "Parse/count without writing."},
             },
@@ -511,41 +520,53 @@ def _internal_tool_error(req_id: Any, tool_name: str, exc: BaseException) -> dic
 
 
 def _validate_and_prepare_args(tool_name: str, tool_args: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    if not isinstance(tool_args, dict):
-        return None, {"code": -32602, "message": f"Arguments for tool {tool_name} must be an object"}
-
     schema = TOOLS[tool_name]["input_schema"]
-    schema_props = schema.get("properties", {})
-    unknown = [k for k in tool_args if k not in schema_props]
-    if unknown:
-        quoted = ", ".join(f"'{k}'" for k in unknown)
-        word = "parameter" if len(unknown) == 1 else "parameters"
-        return None, {
-            "code": -32602,
-            "message": f"Unknown {word} {quoted} for tool {tool_name}",
-        }
+    error = _schema_validation_error(tool_args, schema, "")
+    if error:
+        return None, {"code": -32602, "message": error}
+    return dict(tool_args), None
 
-    required = schema.get("required", [])
-    missing = [k for k in required if k not in tool_args]
-    if missing:
-        quoted = ", ".join(f"'{k}'" for k in missing)
-        word = "parameter" if len(missing) == 1 else "parameters"
-        return None, {
-            "code": -32602,
-            "message": f"Missing required {word} {quoted} for tool {tool_name}",
-        }
 
-    prepared = {k: v for k, v in tool_args.items() if k in schema_props}
-    for key, value in list(prepared.items()):
-        declared = schema_props.get(key, {}).get("type")
-        try:
-            if declared == "integer" and not isinstance(value, int):
-                prepared[key] = int(value)
-            elif declared == "number" and not isinstance(value, (int, float)):
-                prepared[key] = float(value)
-        except (TypeError, ValueError):
-            return None, {"code": -32602, "message": f"Invalid value for parameter '{key}'"}
-    return prepared, None
+def _schema_validation_error(value: Any, schema: dict[str, Any], path: str) -> str | None:
+    expected = schema.get("type")
+    label = path or "arguments"
+    type_ok = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+    }
+    if expected and not type_ok.get(expected, True):
+        return f"Invalid value for parameter '{label}': expected {expected}"
+    if schema.get("non_blank") and (not isinstance(value, str) or not value.strip()):
+        return f"Invalid value for parameter '{label}': must be non-blank"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"Invalid value for parameter '{label}'"
+    if expected == "object":
+        properties = schema.get("properties", {})
+        closed = "properties" in schema or schema.get("additionalProperties") is False
+        if closed:
+            unknown = [key for key in value if key not in properties]
+            if unknown:
+                prefix = "Unknown parameter" if not path else "Unknown field"
+                return f"{prefix} '{unknown[0]}'" + (f" at {path}" if path else "")
+        missing = [key for key in schema.get("required", []) if key not in value]
+        if missing:
+            return f"Missing required parameter '{missing[0]}'" + (f" at {path}" if path else "")
+        if "properties" in schema:
+            for key, item in value.items():
+                nested = _schema_validation_error(item, properties[key], f"{path}.{key}" if path else key)
+                if nested:
+                    return nested
+    if expected == "array":
+        item_schema = schema.get("items", {})
+        for index, item in enumerate(value):
+            nested = _schema_validation_error(item, item_schema, f"{path}[{index}]")
+            if nested:
+                return nested
+    return None
 
 
 def handle_request(request: Any) -> dict[str, Any] | None:
@@ -607,7 +628,7 @@ def handle_request(request: Any) -> dict[str, Any] | None:
             }
         tool_args, validation_error = _validate_and_prepare_args(
             tool_name,
-            params.get("arguments") or {},
+            params["arguments"] if "arguments" in params else {},
         )
         if validation_error is not None:
             return {"jsonrpc": "2.0", "id": req_id, "error": validation_error}

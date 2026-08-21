@@ -63,7 +63,7 @@ scene_record            full scene transcript, time, place, participants, witnes
 
 Actors retrieve a `MemoryPack`:
 
-1. Apply ACL/visibility/witness filtering.
+1. Require a `campaign_id`, then apply the AERP-1 authorization decision to source events.
 2. Rank allowed memories by relevance, recency, importance, actor tier, and query.
 3. Render sections: profile, world truth, actor beliefs, evidence, and guardrails.
 
@@ -76,6 +76,19 @@ Evidence lines include time anchors from their source scene:
 The in-world time and location help the GM/NPC avoid treating every recalled event as recent. `stored:` is system write time for debugging and rollback, not story time.
 
 This means an NPC does not become omniscient just because the database contains GM-only or other-character memories.
+
+### Authorized evidence boundary (AERP-1)
+
+`RpgMemoryKernel.authorized_evidence(...)` is the single policy boundary used by
+ordinary recall, deep recall, and scene transcript access. It constrains candidates
+to the requested campaign before ranking, deduplicates by `source_event_id`, and
+returns a complete policy trace. Retconned/abandoned material is never returned;
+beliefs are visible only to their explicit `belief_owner_id`; and private faction,
+quest, or party evidence needs an explicit campaign-scoped membership.
+
+Scene access returns only authorized `source_span` evidence, never a full transcript
+merely because an actor participated in a mixed-visibility scene. Callers must pass
+`--campaign-id` to `recall`, `deep-recall`, and `get-scene`.
 
 ## Install
 
@@ -126,6 +139,7 @@ Recall for an actor:
 
 ```bash
 mempalace-rpg --db state/rpg-memory.sqlite3 --memo-setting memo_setting.json recall \
+  --campaign-id campaign_current \
   --actor-id char_liora \
   --actor-type npc \
   --query "What promises does Liora know about?"
@@ -286,6 +300,30 @@ mempalace-rpg \
 The old protagonist is imported as a legacy character. The new current player does not automatically know private old history.
 
 ## Development
+
+### AERP-1 offline authorization audit
+
+Every scene event must name a non-empty `branch_id` and a `branch_status` of
+`active`, `retconned`, or `abandoned`. Canonical, observed, reported, rumor,
+uncertain, and belief events use `active`; retired truth uses its matching
+retired branch status. Legacy rows with NULL branch data deliberately fail
+closed. TavernDB imports use the deterministic `legacy:<campaign_id>` branch.
+Before any entity creation, drawer call, or SQLite write, `campaign_id`, event
+type, summary, branch ID, and exact unique `source_span` must be non-empty.
+ACL metadata must have the one shape allowed by visibility; beliefs require the
+same non-empty actor and belief owner.
+
+Run the frozen 24-case / 48-call audit without any network or model calls:
+
+```bash
+python tests/run_aerp1_audit.py --output /outside/repo/aerp1-audit.json
+```
+
+The JSON includes a manifest SHA-256, full product policy telemetry, selected
+event IDs, and delivered authorized spans. Policy traces are trusted audit
+telemetry: denied candidate IDs may appear there, but never in selected evidence,
+rendered product text, or returned spans. Keep generated reports outside the
+repository.
 
 ```bash
 python -m venv .venv

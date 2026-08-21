@@ -146,6 +146,8 @@ def import_taverndb(  # noqa: C901 - one import pipeline keeps row counters and 
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Import TavernDB ChatSheets JSON into the RPG memory kernel."""
+    if default_visibility not in {"witnessed_only", "gm_only", "public_world"}:
+        raise ValueError("default_visibility must be witnessed_only, gm_only, or public_world")
 
     source_path = str(Path(path).expanduser())
     with open(source_path, encoding="utf-8") as f:
@@ -179,6 +181,9 @@ def import_taverndb(  # noqa: C901 - one import pipeline keeps row counters and 
         "protagonists": 0,
         "skipped_existing_scenes": 0,
     }
+    # Stable per-campaign provenance for imported history. Importers never
+    # infer an active branch at the kernel boundary.
+    legacy_branch_id = f"legacy:{campaign_id}"
 
     def char_id(name: str) -> str:
         clean = _clean_name(name)
@@ -230,9 +235,12 @@ def import_taverndb(  # noqa: C901 - one import pipeline keeps row counters and 
                         SceneEventInput(
                             event_type="legacy_protagonist_profile",
                             summary=persona,
+                            branch_id=legacy_branch_id,
+                            branch_status="active",
                             target_id=cid,
                             truth_status="canonical",
                             visibility="gm_only",
+                            source_span=persona,
                             related_entities=[cid],
                             importance=0.8,
                         )
@@ -283,11 +291,15 @@ def import_taverndb(  # noqa: C901 - one import pipeline keeps row counters and 
                 SceneEventInput(
                     event_type="legacy_character_profile",
                     summary=f"{name} 的旧战役档案：{persona}",
+                    branch_id=legacy_branch_id,
+                    branch_status="active",
                     target_id=cid,
                     truth_status="canonical",
                     visibility="character_private",
+                    access_owner_id=cid,
                     witness_set=[cid],
                     related_entities=[cid],
+                    source_span=persona,
                     importance=0.75,
                     emotional_weight=0.3,
                 )
@@ -351,6 +363,8 @@ def import_taverndb(  # noqa: C901 - one import pipeline keeps row counters and 
                 SceneEventInput(
                     event_type="legacy_past_plot",
                     summary=str(row.get("概览") or row.get("纪要") or code),
+                    branch_id=legacy_branch_id,
+                    branch_status="active",
                     truth_status="canonical",
                     visibility=default_visibility,
                     witness_set=participants,
@@ -401,6 +415,8 @@ def import_taverndb(  # noqa: C901 - one import pipeline keeps row counters and 
                 SceneEventInput(
                     event_type="promise",
                     summary=f"旧战役约定：{row.get('约定主题') or ''}。{row.get('详细内容') or ''}",
+                    branch_id=legacy_branch_id,
+                    branch_status="active",
                     truth_status="canonical",
                     visibility=default_visibility,
                     witness_set=participants,
@@ -447,6 +463,8 @@ def import_taverndb(  # noqa: C901 - one import pipeline keeps row counters and 
                 SceneEventInput(
                     event_type="legacy_foreshadowing",
                     summary=f"旧战役伏笔：{row.get('伏笔主题') or ''}。{row.get('详细内容') or ''}",
+                    branch_id=legacy_branch_id,
+                    branch_status="active",
                     truth_status="canonical",
                     visibility="gm_only",
                     source_span=archive_id,

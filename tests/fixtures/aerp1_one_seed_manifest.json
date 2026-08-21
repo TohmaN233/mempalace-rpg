@@ -1,0 +1,30 @@
+{
+  "schema": "aerp1-one-seed-manifest",
+  "version": 1,
+  "cases": [
+    {"id":"exact-public-1","category":"exact_public","polarity":"positive","invariants":["exact_phrase"]},
+    {"id":"exact-public-2","category":"exact_public","polarity":"positive","invariants":["exact_phrase"]},
+    {"id":"paraphrase-1","category":"paraphrase","polarity":"positive","invariants":["no_lexical_overlap"]},
+    {"id":"paraphrase-2","category":"paraphrase","polarity":"positive","invariants":["no_lexical_overlap"]},
+    {"id":"promise-1","category":"long_range_promise","polarity":"positive","invariants":["early_before_later"]},
+    {"id":"promise-2","category":"long_range_promise","polarity":"positive","invariants":["early_before_later"]},
+    {"id":"temporal-1","category":"temporal_location","polarity":"positive","invariants":["requested_location_rank"]},
+    {"id":"temporal-2","category":"temporal_location","polarity":"positive","invariants":["requested_location_rank"]},
+    {"id":"private-1","category":"rightful_private_witness","polarity":"positive","invariants":["private_owner"]},
+    {"id":"witness-1","category":"rightful_private_witness","polarity":"positive","invariants":["witness_match"]},
+    {"id":"belief-owner-1","category":"actor_belief","polarity":"positive","invariants":["rightful_belief"]},
+    {"id":"belief-owner-2","category":"actor_belief","polarity":"positive","invariants":["rightful_belief"]},
+    {"id":"cross-campaign-1","category":"cross_campaign","polarity":"negative","invariants":["campaign_constrained"]},
+    {"id":"cross-campaign-2","category":"cross_campaign","polarity":"negative","invariants":["campaign_constrained"]},
+    {"id":"gm-only-1","category":"gm_wrong_actor_private","polarity":"negative","invariants":["gm_only_denied"]},
+    {"id":"private-other-1","category":"gm_wrong_actor_private","polarity":"negative","invariants":["private_owner_denied"]},
+    {"id":"retconned-1","category":"retconned_abandoned","polarity":"negative","invariants":["retired_truth_denied"]},
+    {"id":"abandoned-1","category":"retconned_abandoned","polarity":"negative","invariants":["retired_truth_denied"]},
+    {"id":"faction-outsider-1","category":"faction_quest_outsider","polarity":"negative","invariants":["typed_membership"]},
+    {"id":"quest-outsider-1","category":"faction_quest_outsider","polarity":"negative","invariants":["typed_membership"]},
+    {"id":"belief-other-1","category":"belief_as_canon","polarity":"negative","invariants":["belief_owner_denied"]},
+    {"id":"belief-other-2","category":"belief_as_canon","polarity":"negative","invariants":["belief_owner_denied"]},
+    {"id":"mixed-span-1","category":"mixed_visibility_forbidden_span","polarity":"negative","invariants":["forbidden_span_absent"]},
+    {"id":"mixed-span-2","category":"mixed_visibility_forbidden_span","polarity":"negative","invariants":["forbidden_span_absent"]}
+  ]
+}

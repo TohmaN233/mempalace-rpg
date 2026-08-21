@@ -15,11 +15,19 @@ import os
 import re
 import sqlite3
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from .adapter import EpisodeAdapter, NullEpisodeAdapter
+from .authorization import (
+    CANONICAL_TRUTH_STATUSES,
+    EvidenceAuthorizer,
+    VALID_BRANCH_STATUSES,
+    VALID_TRUTH_STATUSES,
+    VALID_VISIBILITIES,
+)
 from .budget import budget_for_tier
 from .models import MemoryPack, SceneEventInput
 from .settings import (
@@ -37,26 +45,6 @@ from .settings import (
 
 DEFAULT_RPG_MEMORY_DB = os.path.expanduser("~/.mempalace/rpg_memory.sqlite3")
 
-VALID_VISIBILITIES = {
-    "public_world",
-    "party_only",
-    "witnessed_only",
-    "character_private",
-    "faction_private",
-    "quest_participants",
-    "gm_only",
-    "rumor_public",
-    "retconned",
-}
-VALID_TRUTH_STATUSES = {
-    "canonical",
-    "observed",
-    "reported",
-    "rumor",
-    "belief",
-    "retconned",
-    "uncertain",
-}
 VALID_ENTITY_TYPES = {
     "player",
     "character",
@@ -141,6 +129,11 @@ CREATE TABLE IF NOT EXISTS scene_event (
     related_quests_json TEXT NOT NULL,
     related_locations_json TEXT NOT NULL,
     source_span TEXT,
+    access_owner_id TEXT,
+    access_scope_id TEXT,
+    belief_owner_id TEXT,
+    branch_id TEXT,
+    branch_status TEXT,
     emotional_weight REAL NOT NULL DEFAULT 0.0,
     importance REAL NOT NULL DEFAULT 0.0,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -209,6 +202,17 @@ CREATE TABLE IF NOT EXISTS relationship_state (
     PRIMARY KEY (subject_id, object_id)
 );
 
+CREATE TABLE IF NOT EXISTS actor_membership (
+    campaign_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_id, actor_id, scope_id, scope_kind)
+);
+
 CREATE INDEX IF NOT EXISTS idx_scene_record_campaign_sort
     ON scene_record(campaign_id, scene_time_sort);
 CREATE INDEX IF NOT EXISTS idx_scene_event_scene ON scene_event(scene_id);
@@ -245,6 +249,24 @@ def _uniq(values: Iterable[str | None]) -> list[str]:
         if text and text not in seen:
             seen[text] = None
     return list(seen.keys())
+
+
+def _strict_string_list(value: Any, name: str, *, allow_none: bool = False) -> list[str]:
+    """Accept only explicit list[str] provenance inputs; normalize/dedupe order."""
+    if value is None and allow_none:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a list of non-empty strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{name} must be a list of non-empty strings")
+        text = item.strip()
+        if text not in seen:
+            seen.add(text)
+            normalized.append(text)
+    return normalized
 
 
 def _id(prefix: str) -> str:
@@ -318,6 +340,16 @@ class RpgMemoryKernel:
     def _init_db(self) -> None:
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        membership_columns = {row["name"] for row in conn.execute("PRAGMA table_info(actor_membership)")}
+        if "scope_kind" not in membership_columns:
+            conn.execute("DROP INDEX IF EXISTS idx_actor_membership_lookup")
+            conn.execute("ALTER TABLE actor_membership RENAME TO actor_membership_legacy")
+            conn.execute("CREATE TABLE actor_membership (campaign_id TEXT NOT NULL, actor_id TEXT NOT NULL, scope_id TEXT NOT NULL, scope_kind TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (campaign_id, actor_id, scope_id, scope_kind))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_membership_lookup ON actor_membership(campaign_id, actor_id, scope_id, scope_kind, active)")
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(scene_event)")}
+        for name in ("access_owner_id", "access_scope_id", "belief_owner_id", "branch_id", "branch_status"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE scene_event ADD COLUMN {name} TEXT")
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -359,6 +391,30 @@ class RpgMemoryKernel:
         if row:
             return
         self.upsert_entity(entity_id, _infer_entity_type(entity_id), display_name or entity_id)
+
+    def upsert_actor_membership(
+        self,
+        *,
+        campaign_id: str,
+        actor_id: str,
+        scope_id: str,
+        scope_kind: str,
+        active: bool = True,
+    ) -> None:
+        """Record campaign-scoped membership used by private evidence policy."""
+        if not campaign_id or not actor_id or not scope_id or scope_kind not in {"faction", "quest", "party"}:
+            raise ValueError("campaign_id, actor_id, scope_id, and valid scope_kind are required for membership")
+        now = _utcnow()
+        with self._conn():
+            self._conn().execute(
+                """
+                INSERT INTO actor_membership (campaign_id, actor_id, scope_id, scope_kind, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, actor_id, scope_id, scope_kind) DO UPDATE SET
+                    active=excluded.active, updated_at=excluded.updated_at
+                """,
+                (campaign_id, actor_id, scope_id, scope_kind, 1 if active else 0, now, now),
+            )
 
     def upsert_character_profile(
         self,
@@ -472,15 +528,40 @@ class RpgMemoryKernel:
         events: list[SceneEventInput | dict[str, Any]] | None = None,
         scene_id: str | None = None,
     ) -> str:
-        active_quest_ids = _uniq(active_quest_ids or [])
-        participants = _uniq(participants or [])
-        witnesses = _uniq(witnesses or [])
+        if not isinstance(campaign_id, str) or not campaign_id.strip():
+            raise ValueError("campaign_id must be a non-empty string for scene evidence")
+        active_quest_ids = _strict_string_list(active_quest_ids, "active_quest_ids", allow_none=True)
+        participants = _strict_string_list(participants, "participants", allow_none=True)
+        witnesses = _strict_string_list(witnesses, "witnesses", allow_none=True)
+        if events is not None and not isinstance(events, list):
+            raise ValueError("events must be a list of SceneEventInput objects or dicts")
+        event_inputs = [self._normalize_event_lists(self._coerce_event(raw)) for raw in (events or [])]
+        located_spans: list[tuple[int, int, tuple[Any, ...]]] = []
+        for event in event_inputs:
+            self._validate_scene_event_security(event)
+            if event.source_span:
+                starts = [match.start() for match in re.finditer(re.escape(event.source_span), transcript)]
+                if len(starts) != 1:
+                    raise ValueError("source_span must occur exactly once in the supplied scene transcript")
+                start, end = starts[0], starts[0] + len(event.source_span)
+                policy = (event.truth_status, event.visibility, event.access_owner_id, event.access_scope_id, event.belief_owner_id, event.branch_id, event.branch_status)
+                for prior_start, prior_end, prior_policy in located_spans:
+                    if start < prior_end and prior_start < end and policy != prior_policy:
+                        raise ValueError("overlapping source spans require identical security policy")
+                located_spans.append((start, end, policy))
         scene_id = scene_id or _id("scene")
         now = _utcnow()
         transcript_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
 
         for entity_id in [location_id, *active_quest_ids, *participants, *witnesses]:
             self._ensure_entity(entity_id)
+        for event in event_inputs:
+            for entity_id in [event.actor_id, event.target_id, *event.related_entities, event.access_owner_id, event.access_scope_id, event.belief_owner_id]:
+                self._ensure_entity(entity_id)
+            for quest_id in event.related_quests:
+                self._ensure_entity(quest_id)
+            for loc_id in event.related_locations:
+                self._ensure_entity(loc_id)
 
         conn = self._conn()
         current_sort = conn.execute(
@@ -488,6 +569,24 @@ class RpgMemoryKernel:
             (campaign_id,),
         ).fetchone()[0]
         scene_time_sort = int(current_sort) + 1
+
+        drawer_id = f"rpg_scene_{scene_id}"
+        wing = "wing_campaign_canon"
+        room = f"location_{location_id}" if location_id else "campaign"
+        vector_id = self.episode_adapter.add_scene_drawer(
+            text=transcript,
+            wing=wing,
+            room=room,
+            drawer_id=drawer_id,
+            metadata={
+                "scene_id": scene_id,
+                "campaign_id": campaign_id,
+                "location_id": location_id,
+                "in_world_time": in_world_time,
+                "scene_time_sort": scene_time_sort,
+                "filed_at": now,
+            },
+        )
 
         with conn:
             conn.execute(
@@ -512,46 +611,66 @@ class RpgMemoryKernel:
                     now,
                 ),
             )
-
-        drawer_id = f"rpg_scene_{scene_id}"
-        wing = "wing_campaign_canon"
-        room = f"location_{location_id}" if location_id else "campaign"
-        vector_id = self.episode_adapter.add_scene_drawer(
-            text=transcript,
-            wing=wing,
-            room=room,
-            drawer_id=drawer_id,
-            metadata={
-                "scene_id": scene_id,
-                "campaign_id": campaign_id,
-                "location_id": location_id,
-                "in_world_time": in_world_time,
-                "scene_time_sort": scene_time_sort,
-                "filed_at": now,
-            },
-        )
-
-        if write_enabled(self.memo_settings):
-            for raw_event in events or []:
-                event = self._coerce_event(raw_event)
-                self._commit_event(
-                    scene_id=scene_id,
-                    campaign_id=campaign_id,
-                    location_id=location_id,
-                    active_quest_ids=active_quest_ids,
-                    participants=participants,
-                    witnesses=witnesses,
-                    event=event,
-                    vector_id=vector_id,
-                    created_at=now,
-                )
+            if write_enabled(self.memo_settings):
+                for event in event_inputs:
+                    self._commit_event(
+                        scene_id=scene_id,
+                        campaign_id=campaign_id,
+                        location_id=location_id,
+                        active_quest_ids=active_quest_ids,
+                        participants=participants,
+                        witnesses=witnesses,
+                        event=event,
+                        vector_id=vector_id,
+                        created_at=now,
+                    )
 
         return scene_id
 
     def _coerce_event(self, raw: SceneEventInput | dict[str, Any]) -> SceneEventInput:
         if isinstance(raw, SceneEventInput):
             return raw
+        if not isinstance(raw, dict):
+            raise ValueError("events must contain only SceneEventInput objects or dicts")
         return SceneEventInput(**raw)
+
+    @staticmethod
+    def _normalize_event_lists(event: SceneEventInput) -> SceneEventInput:
+        return replace(
+            event,
+            witness_set=_strict_string_list(event.witness_set, "event.witness_set"),
+            related_entities=_strict_string_list(event.related_entities, "event.related_entities"),
+            related_quests=_strict_string_list(event.related_quests, "event.related_quests"),
+            related_locations=_strict_string_list(event.related_locations, "event.related_locations"),
+        )
+
+    @staticmethod
+    def _validate_scene_event_security(event: SceneEventInput) -> None:
+        for name in ("event_type", "summary", "branch_id", "source_span"):
+            value = getattr(event, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string for scene evidence")
+        if event.truth_status not in VALID_TRUTH_STATUSES or event.visibility not in VALID_VISIBILITIES:
+            raise ValueError("truth_status and visibility must be explicit and valid for scene evidence")
+        if event.branch_status not in VALID_BRANCH_STATUSES:
+            raise ValueError("branch_status must be explicit and valid for scene evidence")
+        required_branch_status = "active" if event.truth_status in CANONICAL_TRUTH_STATUSES | {"belief"} else event.truth_status
+        if event.branch_status != required_branch_status:
+            raise ValueError("branch_status must match truth_status for scene evidence")
+        owner, scope, belief_owner = event.access_owner_id, event.access_scope_id, event.belief_owner_id
+        if event.visibility == "character_private":
+            if not isinstance(owner, str) or not owner.strip() or scope is not None:
+                raise ValueError("character_private requires access_owner_id and forbids access_scope_id")
+        elif event.visibility in {"faction_private", "quest_participants", "party_only"}:
+            if not isinstance(scope, str) or not scope.strip() or owner is not None:
+                raise ValueError("scoped private visibility requires access_scope_id and forbids access_owner_id")
+        elif owner is not None or scope is not None:
+            raise ValueError("visibility forbids access_owner_id and access_scope_id")
+        if event.truth_status == "belief":
+            if not isinstance(belief_owner, str) or not belief_owner.strip() or event.actor_id != belief_owner:
+                raise ValueError("belief requires belief_owner_id equal to actor_id")
+        elif belief_owner is not None:
+            raise ValueError("non-belief truth forbids belief_owner_id")
 
     def _commit_event(
         self,
@@ -570,8 +689,15 @@ class RpgMemoryKernel:
             return ""
 
         event_id = _id("event")
-        truth_status = event.truth_status if event.truth_status in VALID_TRUTH_STATUSES else "uncertain"
-        visibility = event.visibility if event.visibility in VALID_VISIBILITIES else "gm_only"
+        self._validate_scene_event_security(event)
+        truth_status = event.truth_status
+        visibility = event.visibility
+        if event.source_span is not None:
+            transcript_row = self._conn().execute(
+                "SELECT transcript FROM scene_record WHERE scene_id=?", (scene_id,)
+            ).fetchone()
+            if not transcript_row or event.source_span not in str(transcript_row["transcript"]):
+                raise ValueError("source_span must be an exact substring of the source scene transcript")
         related_entities = _uniq([event.actor_id, event.target_id, *event.related_entities])
         related_quests = _uniq([*active_quest_ids, *event.related_quests])
         related_locations = _uniq([location_id, *event.related_locations])
@@ -586,15 +712,15 @@ class RpgMemoryKernel:
             self._ensure_entity(loc_id)
 
         conn = self._conn()
-        with conn:
-            conn.execute(
+        conn.execute(
                 """
                 INSERT INTO scene_event (
                     event_id, scene_id, event_type, actor_id, target_id, summary,
                     truth_status, visibility, witness_set_json, related_entities_json,
                     related_quests_json, related_locations_json, source_span,
+                    access_owner_id, access_scope_id, belief_owner_id, branch_id, branch_status,
                     emotional_weight, importance, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -610,12 +736,17 @@ class RpgMemoryKernel:
                     _json(related_quests),
                     _json(related_locations),
                     event.source_span,
+                    event.access_owner_id,
+                    event.access_scope_id,
+                    event.belief_owner_id,
+                    event.branch_id,
+                    event.branch_status,
                     float(event.emotional_weight),
                     float(event.importance),
                     _json(event.payload),
                     created_at,
                 ),
-            )
+        )
 
         self._project_memory_items(
             campaign_id=campaign_id,
@@ -669,8 +800,7 @@ class RpgMemoryKernel:
         created_at: str,
     ) -> str:
         memory_id = _id("mem")
-        with self._conn():
-            self._conn().execute(
+        self._conn().execute(
                 """
                 INSERT INTO memory_item (
                     memory_id, owner_scope, domain, source_scene_id, source_event_id,
@@ -697,7 +827,7 @@ class RpgMemoryKernel:
                     vector_id,
                     created_at,
                 ),
-            )
+        )
         return memory_id
 
     def _project_memory_items(
@@ -716,7 +846,7 @@ class RpgMemoryKernel:
         vector_id: str | None,
         created_at: str,
     ) -> None:
-        if truth_status == "retconned" or visibility == "retconned":
+        if truth_status in {"retconned", "abandoned"} or visibility == "retconned":
             memory_type = "index_note"
         elif truth_status == "rumor":
             memory_type = "rumor"
@@ -785,8 +915,7 @@ class RpgMemoryKernel:
         }
         conn = self._conn()
         if truth_status == "canonical" and fact_write_enabled(self.memo_settings):
-            with conn:
-                conn.execute(
+            conn.execute(
                     """
                     INSERT INTO world_fact (
                         fact_id, subject_id, predicate, object_json, confidence,
@@ -802,7 +931,7 @@ class RpgMemoryKernel:
                         event_id,
                         created_at,
                     ),
-                )
+            )
 
         if not belief_write_enabled(self.memo_settings):
             return
@@ -816,8 +945,7 @@ class RpgMemoryKernel:
                 continue
             if actor_id.startswith("quest_") or actor_id.startswith("loc_") or actor_id.startswith("item_"):
                 continue
-            with conn:
-                conn.execute(
+            conn.execute(
                     """
                     INSERT INTO actor_belief (
                         belief_id, actor_id, subject_id, predicate, object_json,
@@ -835,7 +963,7 @@ class RpgMemoryKernel:
                         event_id,
                         created_at,
                     ),
-                )
+            )
 
     def _belief_status(self, truth_status: str) -> tuple[str, float]:
         if truth_status == "rumor":
@@ -844,7 +972,7 @@ class RpgMemoryKernel:
             return "suspected", 0.55
         if truth_status == "uncertain":
             return "doubted", 0.35
-        if truth_status == "retconned":
+        if truth_status in {"retconned", "abandoned"}:
             return "discredited", 0.1
         return "believed", 0.8 if truth_status == "observed" else 1.0
 
@@ -862,8 +990,7 @@ class RpgMemoryKernel:
         for entity_id in related_entities:
             self._ensure_entity(entity_id)
             tier = "recurring" if self._entity_type(entity_id) == "character" else "ambient"
-            with self._conn():
-                self._conn().execute(
+            self._conn().execute(
                     """
                     INSERT INTO entity_importance (
                         entity_id, current_tier, quest_link_count, emotional_event_count,
@@ -888,15 +1015,38 @@ class RpgMemoryKernel:
                         1 if secret else 0,
                         float(importance) + float(emotional_weight),
                     ),
-                )
+            )
 
     # ------------------------------------------------------------------
     # Queries / pack building
     # ------------------------------------------------------------------
 
+    def authorized_evidence(
+        self,
+        *,
+        campaign_id: str,
+        actor_id: str,
+        actor_type: str,
+        query: str,
+        budget: int,
+        active_quest_ids: list[str] | None = None,
+        scene_id: str | None = None,
+    ):
+        """Return the single AERP-1 decision used by all evidence read paths."""
+        return EvidenceAuthorizer(self._conn()).authorize(
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            query=query,
+            budget=budget,
+            active_quest_ids=_uniq(active_quest_ids or []),
+            scene_id=scene_id,
+        )
+
     def build_memory_pack(
         self,
         *,
+        campaign_id: str,
         actor_id: str,
         actor_type: str,
         query: str,
@@ -905,6 +1055,7 @@ class RpgMemoryKernel:
         active_quest_ids: list[str] | None = None,
         in_world_time: str | None = None,
         max_chars: int | None = None,
+        _authorization_decision: Any | None = None,
     ) -> MemoryPack:
         profile = self._profile(actor_id)
         tier = profile["tier"] if profile else ("core" if actor_type == "gm" else "recurring")
@@ -916,31 +1067,51 @@ class RpgMemoryKernel:
             sections.append(("L0 ProfileCard", self._render_profile(profile, budget.l0_chars)))
 
         if recall_section_enabled(self.memo_settings, "current_state"):
-            state_text = self._render_current_state(scene_id=scene_id, location_id=location_id)
+            state_text = self._render_current_state(
+                campaign_id=campaign_id, scene_id=scene_id, location_id=location_id
+            )
             if state_text:
                 sections.append(("Current State", state_text))
 
         if recall_section_enabled(self.memo_settings, "world_truth"):
-            facts = self._allowed_world_facts(actor_id=actor_id, actor_type=actor_type, as_of=in_world_time)
+            facts = self._allowed_world_facts(
+                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type, as_of=in_world_time
+            )
             if facts:
                 sections.append(("WorldTruth allowed to actor", self._render_fact_lines(facts, budget.l1_chars)))
 
         if recall_section_enabled(self.memo_settings, "actor_belief"):
-            beliefs = self.list_actor_beliefs(actor_id=actor_id)
+            beliefs = self._allowed_actor_beliefs(
+                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type
+            )
             if beliefs:
                 sections.append(("ActorBelief", self._render_belief_lines(beliefs, budget.l1_chars)))
 
         evidence = []
         if recall_enabled(self.memo_settings) and recall_section_enabled(self.memo_settings, "evidence"):
+            decision = _authorization_decision or self.authorized_evidence(
+                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type,
+                query=query, active_quest_ids=active_quest_ids or [], budget=1000,
+            )
             evidence = self._retrieve_memory_items(
+                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type, query=query,
+                active_quest_ids=active_quest_ids or [], location_id=location_id,
+                hit_limit=budget.hit_limit, max_chars=max_chars,
+                authorized_event_ids=set(decision.trace["authorized_candidate_ids"]),
+            )
+            decision.trace["selected_evidence_ids"] = [item["source_event_id"] for item in evidence]
+        else:
+            decision = self.authorized_evidence(
+                campaign_id=campaign_id,
                 actor_id=actor_id,
                 actor_type=actor_type,
                 query=query,
                 active_quest_ids=active_quest_ids or [],
-                location_id=location_id,
-                hit_limit=budget.hit_limit,
-                max_chars=max_chars,
+                budget=1000,
             )
+        # Ordinary recall does not expose verbatim spans; its product trace must
+        # describe that surface rather than the direct authorization interface.
+        decision.trace["returned_spans"] = []
         guard = (
             "Recall was ACL-filtered before ranking. Do not reveal gm_only, "
             "private, unwitnessed, or retconned knowledge unless it appears above."
@@ -951,6 +1122,7 @@ class RpgMemoryKernel:
             sections=sections,
             evidence=evidence,
             forbidden_guard=guard,
+            policy_trace=decision.trace,
         )
 
     def _render_profile(self, profile: dict[str, Any], max_chars: int) -> str:
@@ -967,18 +1139,22 @@ class RpgMemoryKernel:
             parts.append(f"核心恐惧：{profile['core_fear']}")
         return _clamp("\n".join(parts), max_chars)
 
-    def _render_current_state(self, *, scene_id: str | None, location_id: str | None) -> str:
+    def _render_current_state(
+        self, *, campaign_id: str, scene_id: str | None, location_id: str | None
+    ) -> str:
         if scene_id:
             row = self._conn().execute(
-                "SELECT in_world_time, location_id FROM scene_record WHERE scene_id=?",
-                (scene_id,),
+                "SELECT in_world_time, location_id FROM scene_record WHERE scene_id=? AND campaign_id=?",
+                (scene_id, campaign_id),
             ).fetchone()
             if row:
                 return f"时间：{row['in_world_time']}\n地点：{row['location_id'] or '未指定'}"
         if location_id:
             return f"地点：{location_id}"
         row = self._conn().execute(
-            "SELECT in_world_time, location_id FROM scene_record ORDER BY scene_time_sort DESC LIMIT 1"
+            "SELECT in_world_time, location_id FROM scene_record WHERE campaign_id=? "
+            "ORDER BY scene_time_sort DESC LIMIT 1",
+            (campaign_id,),
         ).fetchone()
         if row:
             return f"时间：{row['in_world_time']}\n地点：{row['location_id'] or '未指定'}"
@@ -987,24 +1163,48 @@ class RpgMemoryKernel:
     def _allowed_world_facts(
         self,
         *,
+        campaign_id: str,
         actor_id: str,
         actor_type: str,
         as_of: str | None = None,
     ) -> list[dict[str, Any]]:
-        rows = self._conn().execute(
-            "SELECT * FROM world_fact ORDER BY created_at DESC LIMIT 100"
-        ).fetchall()
+        decision = self.authorized_evidence(
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            query="",
+            budget=1000,
+        )
+        allowed_event_ids = set(decision.trace["authorized_candidate_ids"])
+        rows = self._conn().execute("SELECT * FROM world_fact ORDER BY created_at DESC LIMIT 100").fetchall()
         facts: list[dict[str, Any]] = []
         for row in rows:
             data = dict(row)
             if as_of and not self._valid_as_of(data.get("valid_from"), data.get("valid_to"), as_of):
                 continue
             source_event_id = data.get("source_event_id")
-            if source_event_id and not self._event_allowed(source_event_id, actor_id, actor_type):
+            if source_event_id not in allowed_event_ids:
                 continue
             data["object"] = _loads(data.pop("object_json"), {})
             facts.append(data)
         return facts
+
+    def _allowed_actor_beliefs(
+        self, *, campaign_id: str, actor_id: str, actor_type: str
+    ) -> list[dict[str, Any]]:
+        decision = self.authorized_evidence(
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            query="",
+            budget=1000,
+        )
+        allowed_event_ids = set(decision.trace["authorized_candidate_ids"])
+        return [
+            belief
+            for belief in self.list_actor_beliefs(actor_id=actor_id)
+            if belief.get("source_event_id") in allowed_event_ids
+        ]
 
     def _render_fact_lines(self, facts: list[dict[str, Any]], max_chars: int) -> str:
         lines = [f"- {f['subject_id']} {f['predicate']}: {f['object'].get('summary', '')}" for f in facts]
@@ -1017,9 +1217,39 @@ class RpgMemoryKernel:
         ]
         return _clamp("\n".join(lines), max_chars)
 
+    def _pack_authorized_events(
+        self, events: list[dict[str, Any]], *, max_chars: int
+    ) -> list[dict[str, Any]]:
+        packed: list[dict[str, Any]] = []
+        used = 0
+        for event in events:
+            text = str(event["summary"])
+            if packed and used + len(text) > max_chars:
+                break
+            packed.append(
+                {
+                    "memory_id": event["source_event_id"],
+                    "source_event_id": event["source_event_id"],
+                    "source_scene_id": event["source_scene_id"],
+                    "domain": "evidence",
+                    "memory_type": "belief" if event["truth_status"] == "belief" else "summary",
+                    "text": text,
+                    "truth_status": event["truth_status"],
+                    "visibility": event["visibility"],
+                    "in_world_time": event["in_world_time"],
+                    "location_id": event["location_id"],
+                    "scene_time_sort": event["scene_time_sort"],
+                    "created_at": event["created_at"],
+                    "rank_score": event["rank_score"],
+                }
+            )
+            used += len(text)
+        return packed
+
     def get_scene_transcript(
         self,
         *,
+        campaign_id: str,
         scene_id: str,
         actor_id: str,
         actor_type: str = "npc",
@@ -1027,82 +1257,60 @@ class RpgMemoryKernel:
         mode: str = "snippets",
         max_chars: int | None = 4000,
     ) -> dict[str, Any]:
-        """Return ACL-safe verbatim scene text or exact snippets.
-
-        Full transcript access is intentionally stricter than event/memory
-        access: non-GM actors may read verbatim scene text only if they were
-        listed as scene participants or witnesses.  Actors who can see one
-        projected event but were not present receive the allowed event summaries
-        as evidence, not the whole transcript.
-        """
+        """Return only verbatim spans descended from authorized event seeds."""
+        if mode != "snippets":
+            raise ValueError("only mode='snippets' is supported for authorized scene evidence")
 
         row = self._conn().execute(
-            "SELECT * FROM scene_record WHERE scene_id=?",
-            (scene_id,),
+            "SELECT * FROM scene_record WHERE scene_id=? AND campaign_id=?",
+            (scene_id, campaign_id),
         ).fetchone()
         if not row:
             return {"success": False, "error": "scene_not_found", "scene_id": scene_id}
 
         scene = dict(row)
-        participants = _loads(scene.pop("participants_json"), [])
-        witnesses = _loads(scene.pop("witnesses_json"), [])
-        active_quest_ids = _loads(scene.pop("active_quest_ids_json"), [])
-        present = set(_uniq([*participants, *witnesses]))
-        full_allowed = actor_type == "gm" or actor_id == "gm" or actor_id in present
-
-        event_rows = self._conn().execute(
-            "SELECT * FROM scene_event WHERE scene_id=? ORDER BY created_at, event_id",
-            (scene_id,),
-        ).fetchall()
-        allowed_events: list[dict[str, Any]] = []
-        for event_row in event_rows:
-            event = dict(event_row)
-            if not self._event_allowed(str(event["event_id"]), actor_id, actor_type):
-                continue
-            event["witness_set"] = _loads(event.pop("witness_set_json"), [])
-            event["related_entities"] = _loads(event.pop("related_entities_json"), [])
-            event["related_quests"] = _loads(event.pop("related_quests_json"), [])
-            event["related_locations"] = _loads(event.pop("related_locations_json"), [])
-            event["payload"] = _loads(event.pop("payload_json"), {})
-            allowed_events.append(event)
-
-        if not full_allowed and not allowed_events:
-            return {
-                "success": False,
-                "error": "forbidden",
-                "scene_id": scene_id,
-                "forbidden_guard": "Actor is neither GM nor a scene participant/witness, and no scene event is ACL-visible.",
-            }
-
-        transcript = str(scene.get("transcript") or "")
+        active_quest_ids = _loads(scene["active_quest_ids_json"], [])
+        decision = self.authorized_evidence(
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            query=query or "",
+            budget=1000,
+            active_quest_ids=active_quest_ids,
+            scene_id=scene_id,
+        )
+        spans = [{"source_event_id": event["source_event_id"], "source_scene_id": event["source_scene_id"], "text": event["source_span"]} for event in decision.events if event.get("source_span")]
         response: dict[str, Any] = {
             "success": True,
             "scene_id": scene_id,
-            "campaign_id": scene.get("campaign_id"),
-            "in_world_time": scene.get("in_world_time"),
-            "location_id": scene.get("location_id"),
+            "campaign_id": campaign_id,
+            "in_world_time": scene["in_world_time"],
+            "location_id": scene["location_id"],
             "active_quest_ids": active_quest_ids,
-            "participants": participants,
-            "witnesses": witnesses,
-            "transcript_hash": scene.get("transcript_hash"),
-            "full_transcript_allowed": full_allowed,
-            "allowed_events": allowed_events,
-            "forbidden_guard": "Verbatim transcript access was ACL-checked before return; do not reveal unavailable text.",
+            "transcript_hash": scene["transcript_hash"],
+            "mode": mode,
+            "authorized_spans": spans,
+            "policy_trace": decision.trace,
+            "forbidden_guard": "Only spans descended from authorized event seeds are returned; scene participation alone grants no transcript access.",
         }
-
-        if full_allowed:
-            if mode == "full":
-                response["transcript"] = _clamp(transcript, max_chars or len(transcript))
-                response["truncated"] = bool(max_chars and len(transcript) > max_chars)
-            else:
-                snippets = self._scene_snippets(transcript=transcript, query=query or "", max_chars=max_chars or 4000)
-                response["snippets"] = snippets
-                response["transcript_excerpt"] = "\n[…]\n".join(snippet["text"] for snippet in snippets)
+        if max_chars is not None:
+            used = 0
+            limited: list[dict[str, Any]] = []
+            for span in spans:
+                remaining = max_chars - used
+                if remaining <= 0:
+                    break
+                raw = str(span["text"]); text = raw[:remaining]
+                limited.append({**span, "text": text, "truncated": len(text) < len(raw)})
+                used += len(text)
+            response["authorized_spans"] = limited
+        response["policy_trace"]["returned_spans"] = [{"source_event_id": span["source_event_id"], "source_scene_id": span["source_scene_id"], "length": len(span["text"]), "truncated": bool(span.get("truncated"))} for span in response["authorized_spans"]]
         return response
 
     def deep_recall(
         self,
         *,
+        campaign_id: str,
         actor_id: str,
         actor_type: str,
         query: str,
@@ -1116,7 +1324,19 @@ class RpgMemoryKernel:
     ) -> dict[str, Any]:
         """Build a normal MemoryPack, then fetch verbatim snippets for top evidence scenes."""
 
+        profile = self._profile(actor_id)
+        tier = profile["tier"] if profile else ("core" if actor_type == "gm" else "recurring")
+        budget = budget_for_tier(tier)
+        decision = self.authorized_evidence(
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            query=query,
+            active_quest_ids=active_quest_ids or [],
+            budget=1000,
+        )
         pack = self.build_memory_pack(
+            campaign_id=campaign_id,
             actor_id=actor_id,
             actor_type=actor_type,
             query=query,
@@ -1125,18 +1345,33 @@ class RpgMemoryKernel:
             active_quest_ids=active_quest_ids or [],
             in_world_time=in_world_time,
             max_chars=max_chars,
+            _authorization_decision=decision,
         )
-        scene_ids = _uniq([str(item.get("source_scene_id") or "") for item in pack.evidence])[: max(0, scene_limit)]
+        events_by_id = {str(event["source_event_id"]): event for event in decision.events}
+        spans_by_scene: dict[str, list[dict[str, Any]]] = {}
+        # Pack evidence has B0 order. Preserve it through scene selection rather
+        # than iterating authorization's recency order.
+        for item in pack.evidence:
+            event = events_by_id.get(str(item.get("source_event_id")))
+            if not event or not event.get("source_span"):
+                continue
+            span = {"source_event_id": event["source_event_id"], "source_scene_id": event["source_scene_id"], "text": event["source_span"]}
+            spans_by_scene.setdefault(str(span["source_scene_id"]), []).append(span)
         scene_evidence = [
-            self.get_scene_transcript(
-                scene_id=sid,
-                actor_id=actor_id,
-                actor_type=actor_type,
-                query=query,
-                mode="snippets",
-                max_chars=per_scene_chars,
-            )
-            for sid in scene_ids
+            {
+                "success": True,
+                "scene_id": sid,
+                "campaign_id": campaign_id,
+                "authorized_spans": self._limit_spans(spans, per_scene_chars),
+                "forbidden_guard": "Spans reuse the same authorized evidence decision as ordinary recall.",
+            }
+            for sid, spans in list(spans_by_scene.items())[: max(0, scene_limit)]
+        ]
+        delivered_spans = [span for scene in scene_evidence for span in scene["authorized_spans"]]
+        pack.policy_trace["returned_spans"] = [
+            {"source_event_id": span["source_event_id"], "source_scene_id": span["source_scene_id"],
+             "length": len(span["text"]), "truncated": bool(span.get("truncated"))}
+            for span in delivered_spans
         ]
         return {
             "success": True,
@@ -1146,8 +1381,22 @@ class RpgMemoryKernel:
             "sections": pack.sections,
             "evidence": pack.evidence,
             "scene_evidence": scene_evidence,
+            "policy_trace": pack.policy_trace,
             "forbidden_guard": pack.forbidden_guard + " Verbatim scene snippets were also ACL-checked.",
         }
+
+    def _limit_spans(self, spans: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
+        used = 0
+        limited: list[dict[str, Any]] = []
+        for span in spans:
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            raw = str(span["text"])
+            text = raw[:remaining]
+            limited.append({**span, "text": text, "truncated": len(text) < len(raw)})
+            used += len(text)
+        return limited
 
     def _scene_snippets(self, *, transcript: str, query: str, max_chars: int) -> list[dict[str, Any]]:
         if not transcript:
@@ -1194,6 +1443,7 @@ class RpgMemoryKernel:
     def _retrieve_memory_items(
         self,
         *,
+        campaign_id: str,
         actor_id: str,
         actor_type: str,
         query: str,
@@ -1201,16 +1451,19 @@ class RpgMemoryKernel:
         location_id: str | None,
         hit_limit: int,
         max_chars: int,
+        authorized_event_ids: set[str],
     ) -> list[dict[str, Any]]:
         rows = self._conn().execute(
-            "SELECT * FROM memory_item ORDER BY created_at DESC LIMIT 1000"
+            "SELECT mi.* FROM memory_item mi JOIN scene_record sr ON sr.scene_id=mi.source_scene_id "
+            "WHERE sr.campaign_id=? ORDER BY mi.created_at DESC", (campaign_id,)
         ).fetchall()
-        allowed: list[dict[str, Any]] = []
+        best_by_event: dict[str, dict[str, Any]] = {}
         for row in rows:
             item = self._memory_item_from_row(row)
-            if not domain_recall_enabled(self.memo_settings, str(item.get("domain"))):
+            source_event_id = str(item.get("source_event_id") or "")
+            if not source_event_id or source_event_id not in authorized_event_ids:
                 continue
-            if not self._memory_allowed(item, actor_id, actor_type):
+            if not domain_recall_enabled(self.memo_settings, str(item.get("domain"))):
                 continue
             self._attach_scene_context(item)
             item["rank_score"] = self._rank_score(
@@ -1219,7 +1472,10 @@ class RpgMemoryKernel:
                 active_quest_ids=active_quest_ids,
                 location_id=location_id,
             )
-            allowed.append(item)
+            prior = best_by_event.get(source_event_id)
+            if prior is None or (item["rank_score"], str(item.get("memory_id"))) > (prior["rank_score"], str(prior.get("memory_id"))):
+                best_by_event[source_event_id] = item
+        allowed = list(best_by_event.values())
         allowed.sort(key=lambda item: item["rank_score"], reverse=True)
 
         packed: list[dict[str, Any]] = []
@@ -1283,59 +1539,6 @@ class RpgMemoryKernel:
         if item.get("domain") == "canon":
             score -= 0.05
         return score
-
-    def _memory_allowed(self, item: dict[str, Any], actor_id: str, actor_type: str) -> bool:
-        return self._visibility_allowed(
-            actor_id=actor_id,
-            actor_type=actor_type,
-            visibility=item.get("visibility"),
-            known_by=item.get("known_by") or [],
-            owner_scope=item.get("owner_scope"),
-        )
-
-    def _event_allowed(self, event_id: str, actor_id: str, actor_type: str) -> bool:
-        row = self._conn().execute(
-            "SELECT visibility, witness_set_json, actor_id, target_id FROM scene_event WHERE event_id=?",
-            (event_id,),
-        ).fetchone()
-        if not row:
-            return actor_type == "gm" or actor_id == "gm"
-        known_by = _uniq([*_loads(row["witness_set_json"], []), row["actor_id"], row["target_id"]])
-        return self._visibility_allowed(
-            actor_id=actor_id,
-            actor_type=actor_type,
-            visibility=row["visibility"],
-            known_by=known_by,
-            owner_scope=row["target_id"],
-        )
-
-    def _visibility_allowed(
-        self,
-        *,
-        actor_id: str,
-        actor_type: str,
-        visibility: str | None,
-        known_by: list[str],
-        owner_scope: str | None = None,
-    ) -> bool:
-        visibility = visibility or "gm_only"
-        if actor_type == "gm" or actor_id == "gm":
-            return True
-        if visibility == "retconned":
-            return False
-        if visibility in {"public_world", "rumor_public"}:
-            return True
-        if visibility == "gm_only":
-            return False
-        if actor_id in known_by:
-            return True
-        if visibility == "party_only":
-            return actor_id == "player" or actor_type in {"player", "companion"}
-        if visibility == "quest_participants":
-            return actor_id == "player" or actor_type in {"player", "companion"}
-        if visibility == "character_private":
-            return owner_scope == actor_id
-        return False
 
     def _valid_as_of(self, valid_from: str | None, valid_to: str | None, as_of: str) -> bool:
         if valid_from and valid_from > as_of:

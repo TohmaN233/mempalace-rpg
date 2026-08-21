@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mempalace_rpg import RpgMemoryKernel
 from mempalace_rpg.adapter import RecordingEpisodeAdapter
 from mempalace_rpg.tavern_importer import import_taverndb
@@ -62,16 +64,19 @@ def test_import_taverndb_writes_legacy_characters_and_past_plot(tmp_path):
     assert result["counts"]["promises"] == 1
     assert len(adapter.drawers) >= 1
     assert any("旧主角与 Liora" in drawer.text for drawer in adapter.drawers)
+    imported_events = kernel._conn().execute("SELECT source_span, visibility, access_owner_id FROM scene_event").fetchall()
+    assert imported_events and all(row["source_span"] for row in imported_events)
+    assert all(row["access_owner_id"] for row in imported_events if row["visibility"] == "character_private")
 
-    gm_pack = kernel.build_memory_pack(actor_id="gm", actor_type="gm", query="救援承诺").render()
+    gm_pack = kernel.build_memory_pack(campaign_id="legacy_campaign", actor_id="gm", actor_type="gm", query="救援承诺").render()
     assert "旧主角向 Liora 作出救援承诺" in gm_pack
     assert "旧主角答应救出 Liora 的弟弟" in gm_pack
 
     liora_id = result["entities"]["characters"]["Liora"]
-    liora_pack = kernel.build_memory_pack(actor_id=liora_id, actor_type="npc", query="旧主角承诺").render()
+    liora_pack = kernel.build_memory_pack(campaign_id="legacy_campaign", actor_id=liora_id, actor_type="npc", query="旧主角承诺").render()
     assert "救援承诺" in liora_pack
 
-    new_player_pack = kernel.build_memory_pack(actor_id="player", actor_type="player", query="救援承诺").render()
+    new_player_pack = kernel.build_memory_pack(campaign_id="legacy_campaign", actor_id="player", actor_type="player", query="救援承诺").render()
     assert "救援承诺" not in new_player_pack
 
 
@@ -85,3 +90,13 @@ def test_import_taverndb_is_idempotent_for_deterministic_scene_ids(tmp_path):
     assert first["counts"]["scenes"] == 1
     assert second["counts"]["skipped_existing_scenes"] >= 1
     assert kernel.status()["counts"]["scene_record"] == first["counts"]["scene_records_total"]
+
+
+@pytest.mark.parametrize("visibility", ["party_only", "unknown"])
+def test_import_taverndb_rejects_unsupported_default_visibility_before_writes(tmp_path, visibility):
+    path = write_taverndb(tmp_path)
+    kernel = RpgMemoryKernel(db_path=str(tmp_path / "rpg.sqlite3"))
+    with pytest.raises(ValueError, match="default_visibility"):
+        import_taverndb(kernel, str(path), campaign_id="legacy_campaign", default_visibility=visibility)
+    counts = kernel.status()["counts"]
+    assert counts["character_profile"] == counts["scene_record"] == counts["scene_event"] == 0

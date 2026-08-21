@@ -31,6 +31,8 @@ def test_private_witnessed_scene_is_filtered_before_recall(tmp_path):
             SceneEventInput(
                 event_type="promise",
                 summary="玩家在灰烬桥向 Liora 承诺救回她弟弟。",
+                branch_id="main",
+                branch_status="active",
                 actor_id="player",
                 target_id="char_liora",
                 truth_status="canonical",
@@ -38,6 +40,7 @@ def test_private_witnessed_scene_is_filtered_before_recall(tmp_path):
                 witness_set=["char_liora"],
                 related_entities=["player", "char_liora"],
                 related_quests=["quest_rescue_brother"],
+                source_span="我会救回你弟弟。",
                 emotional_weight=0.8,
                 importance=0.9,
             )
@@ -45,18 +48,21 @@ def test_private_witnessed_scene_is_filtered_before_recall(tmp_path):
     )
 
     liora_pack = kernel.build_memory_pack(
+        campaign_id="camp_demo",
         actor_id="char_liora",
         actor_type="npc",
         query="玩家承诺过什么？",
         active_quest_ids=["quest_rescue_brother"],
     ).render()
     guard_pack = kernel.build_memory_pack(
+        campaign_id="camp_demo",
         actor_id="char_guard",
         actor_type="npc",
         query="玩家承诺过什么？",
         active_quest_ids=["quest_rescue_brother"],
     ).render()
     gm_pack = kernel.build_memory_pack(
+        campaign_id="camp_demo",
         actor_id="gm",
         actor_type="gm",
         query="玩家承诺过什么？",
@@ -82,14 +88,19 @@ def test_memory_pack_evidence_includes_time_and_location(tmp_path):
             SceneEventInput(
                 event_type="promise",
                 summary="Liora remembers the ash bridge promise.",
+                branch_id="main",
+                branch_status="active",
+                truth_status="canonical",
                 visibility="witnessed_only",
                 witness_set=["char_liora"],
                 related_entities=["char_liora"],
+                source_span="Liora made an old promise on the ash bridge.",
             )
         ],
     )
 
     rendered = kernel.build_memory_pack(
+        campaign_id="campaign",
         actor_id="char_liora",
         actor_type="npc",
         query="ash bridge promise",
@@ -117,12 +128,15 @@ def test_rumor_is_actor_belief_not_world_truth(tmp_path):
             SceneEventInput(
                 event_type="rumor",
                 summary="酒馆传闻称黑塔王子已经死在北境。",
+                branch_id="main",
+                branch_status="active",
                 actor_id="char_bard",
                 target_id="char_prince",
                 truth_status="rumor",
                 visibility="rumor_public",
                 witness_set=["player", "char_bard"],
                 related_entities=["char_bard", "char_prince"],
+                source_span="黑塔王子已经死在北境。",
                 importance=0.6,
             )
         ],
@@ -149,6 +163,8 @@ def test_scene_event_projects_to_domain_memories_with_evidence(tmp_path):
             SceneEventInput(
                 event_type="item_transfer",
                 summary="玩家把银坠交给 Liora 作为救援承诺的信物。",
+                branch_id="main",
+                branch_status="active",
                 actor_id="player",
                 target_id="char_liora",
                 truth_status="canonical",
@@ -157,6 +173,7 @@ def test_scene_event_projects_to_domain_memories_with_evidence(tmp_path):
                 related_entities=["player", "char_liora", "item_silver_pendant"],
                 related_quests=["quest_rescue_brother"],
                 related_locations=["loc_ash_bridge"],
+                source_span="玩家把银坠交给 Liora 作为信物。",
                 importance=0.7,
             )
         ],
