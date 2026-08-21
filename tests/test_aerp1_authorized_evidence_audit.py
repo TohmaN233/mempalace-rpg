@@ -1,10 +1,12 @@
 """AERP-1 branch and frozen offline audit contract tests."""
 from __future__ import annotations
 
-import pytest
+import json
 import sqlite3
 import subprocess
 import sys
+
+import pytest
 
 from mempalace_rpg import RpgMemoryKernel, SceneEventInput
 from mempalace_rpg.adapter import RecordingEpisodeAdapter
@@ -251,6 +253,55 @@ def test_aerp1_deep_default_scene_limit_keeps_b0_top_ranked_older_span(tmp_path)
     deep = kernel.deep_recall(campaign_id="C1", actor_id="hero", actor_type="npc", query="target")
     assert deep["evidence"][0]["text"] == "target"
     assert deep["scene_evidence"][0]["authorized_spans"][0]["text"] == "OLD TOP SPAN"
+
+
+def test_aerp1_get_scene_transcript_mixed_visibility_returns_only_allowed_exact_span(tmp_path):
+    allowed = "ALLOWED_EXACT_SPAN"
+    forbidden = "FORBIDDEN_PRIVATE_SPAN"
+    transcript = f"UNMARKED_PREFIX [{allowed}] UNMARKED_MIDDLE [{forbidden}] UNMARKED_SUFFIX"
+    kernel = RpgMemoryKernel(db_path=str(tmp_path / "mixed-visibility.sqlite3"))
+    kernel.commit_scene(
+        campaign_id="C1",
+        scene_id="mixed",
+        in_world_time="now",
+        transcript=transcript,
+        events=[
+            _event(span=allowed, visibility="public_world"),
+            _event(span=forbidden, visibility="character_private", access_owner_id="other"),
+        ],
+    )
+
+    response = kernel.get_scene_transcript(
+        campaign_id="C1",
+        scene_id="mixed",
+        actor_id="hero",
+        actor_type="npc",
+        query="allowed",
+        mode="snippets",
+    )
+    serialized = json.dumps(response, ensure_ascii=False, sort_keys=True)
+
+    assert response["success"] is True
+    assert "transcript" not in response
+    assert "transcript_excerpt" not in response
+    assert [span["text"] for span in response["authorized_spans"]] == [allowed]
+    assert forbidden not in serialized
+    assert transcript not in serialized
+    assert "UNMARKED_PREFIX" not in serialized
+    assert "UNMARKED_MIDDLE" not in serialized
+    assert "UNMARKED_SUFFIX" not in serialized
+
+    candidates = response["policy_trace"]["candidates"]
+    denied = [candidate for candidate in candidates if candidate["reason"] == "private_owner_required"]
+    allowed_candidates = [candidate for candidate in candidates if candidate["reason"] == "public_visibility"]
+    assert len(denied) == len(allowed_candidates) == 1
+    returned = response["policy_trace"]["returned_spans"]
+    assert len(returned) == 1 and returned[0]["length"] == len(allowed)
+    assert {span["source_event_id"] for span in returned} == {
+        allowed_candidates[0]["source_event_id"]
+    }
+    assert response["policy_trace"]["query"] == "allowed"
+    assert forbidden not in response["policy_trace"]["query"]
 
 
 def test_aerp1_runner_repeats_despite_stale_legacy_temp_name(tmp_path):

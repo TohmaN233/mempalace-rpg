@@ -306,7 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("--json", action="store_true", help="Emit structured JSON instead of rendered prompt text.")
     recall.set_defaults(func=cmd_recall)
 
-    get_scene = sub.add_parser("get-scene", help="Fetch an ACL-checked verbatim scene transcript or exact snippets.")
+    get_scene = sub.add_parser("get-scene", help="Fetch ACL-checked exact scene snippets only; never the full scene transcript.")
     get_scene.add_argument("--campaign-id", required=True)
     get_scene.add_argument("--scene-id", required=True)
     get_scene.add_argument("--actor-id", required=True)

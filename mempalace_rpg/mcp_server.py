@@ -393,7 +393,7 @@ TOOLS = {
         "handler": tool_recall,
     },
     "mempalace_rpg_get_scene": {
-        "description": "Fetch an ACL-checked verbatim scene transcript or exact snippets by scene_id. Use only after normal recall evidence points to a scene and exact wording matters.",
+        "description": "Fetch ACL-checked exact scene snippets only by scene_id; never returns the original scene transcript. Use only after normal recall evidence points to a scene and exact wording matters.",
         "input_schema": {
             "type": "object",
             "properties": {
