@@ -44,7 +44,7 @@ def _load_harness(target_root: Path):
 def _failure_report(message: str, state: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "schema": "aerp1-performance-30k-report",
-        "version": 1,
+        "version": 2,
         "runtime": state or {},
         "metrics": {},
         "aggregate": {"verdict": "FAIL", "gate_errors": [message]},
@@ -63,6 +63,9 @@ def main() -> int:
     args = parser.parse_args()
     output = Path(args.output).resolve()
     target_root = Path(args.target_root).resolve()
+    if output == target_root or target_root in output.parents:
+        print("refusing to write a performance artifact inside the measured Git worktree", file=sys.stderr)
+        return 2
     harness = _load_harness(target_root)
 
     if args.worker_output:
@@ -113,7 +116,7 @@ def main() -> int:
                 report["baseline_gate"]["artifact_sha256"] = b0_report_sha256
             final_state = harness.git_state(target_root)
             report["runtime_after"] = final_state
-            if final_state != state:
+            if not harness._same_git_state(state, final_state):
                 report["aggregate"]["gate_errors"].append("git_state_changed_during_measurement")
                 report["aggregate"]["verdict"] = "FAIL"
     except Exception as exc:

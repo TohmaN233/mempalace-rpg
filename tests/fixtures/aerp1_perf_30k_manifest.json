@@ -28,6 +28,25 @@
       "character_private": 1,
       "gm_only": 1
     },
+    "expected_scene_event_visibility_counts": {
+      "public_world": 18000,
+      "rumor_public": 3000,
+      "witnessed_only": 3000,
+      "character_private": 3000,
+      "gm_only": 3000
+    },
+    "expected_memory_item_visibility_counts": {
+      "public_world": 54000,
+      "rumor_public": 9000,
+      "witnessed_only": 9000,
+      "character_private": 9000,
+      "gm_only": 9000
+    },
+    "security_expectations": {
+      "witnessed_actor_matches": 3000,
+      "current_character_private_owner_matches": 3000,
+      "b0_access_owner_column": false
+    },
     "event_id_policy": "runner patches kernel._id with a deterministic prefix+counter before seeding",
     "clock_policy": "runner patches kernel._utcnow with a deterministic UTC sequence before seeding",
     "adapter": {
@@ -126,6 +145,10 @@
     "measured_iterations": 100,
     "process_repeats": 3,
     "sample_order": "lexicographic query id within each path; cycle deterministically",
+    "aggregation": {
+      "path_percentile_gate": "compute each repeat independently, then gate on the worst repeat",
+      "authorization_neutral_b0_ratio": "current worst-repeat ordinary-neutral p95 divided by the median of the three B0 repeat p95 values"
+    },
     "timer": "time.perf_counter_ns",
     "timed_boundary": "kernel API call plus canonical JSON serialization",
     "serialization": {
@@ -135,7 +158,7 @@
       "separators": [",", ":"],
       "size_unit": "UTF-8 bytes"
     },
-    "rss_boundary": "process RSS immediately before first warmup through immediately after measured samples",
+    "rss_boundary": "sampled process RSS immediately before first warmup and after every warmup/measured API call; this is sampled growth, not an intra-call peak-working-set claim",
     "commit_probe": {
       "events_per_scene": 10,
       "warmup_iterations": 2,
