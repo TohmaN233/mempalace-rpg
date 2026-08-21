@@ -16,12 +16,12 @@ import os
 import re
 import sqlite3
 import uuid
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .adapter import EpisodeAdapter, NullEpisodeAdapter
+from .adapter import DrawerCompensationError, EpisodeAdapter, NullEpisodeAdapter
 from .authorization import (
     AuthorizedEvidence,
     CANONICAL_TRUTH_STATUSES,
@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS scene_record (
     witnesses_json TEXT NOT NULL,
     transcript TEXT NOT NULL,
     transcript_hash TEXT NOT NULL,
+    request_fingerprint TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -365,6 +366,9 @@ class RpgMemoryKernel:
         for name in ("access_owner_id", "access_scope_id", "belief_owner_id", "branch_id", "branch_status"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE scene_event ADD COLUMN {name} TEXT")
+        scene_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scene_record)")}
+        if "request_fingerprint" not in scene_columns:
+            conn.execute("ALTER TABLE scene_record ADD COLUMN request_fingerprint TEXT")
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -399,13 +403,15 @@ class RpgMemoryKernel:
     def _ensure_entity(self, entity_id: str | None, display_name: str | None = None) -> None:
         if not entity_id:
             return
-        row = self._conn().execute(
-            "SELECT entity_id FROM entity_registry WHERE entity_id=?",
-            (entity_id,),
-        ).fetchone()
-        if row:
-            return
-        self.upsert_entity(entity_id, _infer_entity_type(entity_id), display_name or entity_id)
+        now = _utcnow()
+        self._conn().execute(
+            """
+            INSERT INTO entity_registry (entity_id, entity_type, display_name, active, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            ON CONFLICT(entity_id) DO NOTHING
+            """,
+            (entity_id, _infer_entity_type(entity_id), display_name or entity_id, now, now),
+        )
 
     def upsert_actor_membership(
         self,
@@ -530,6 +536,71 @@ class RpgMemoryKernel:
     # Scene commit
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _scene_request_fingerprint(
+        *,
+        campaign_id: str,
+        in_world_time: str,
+        transcript: str,
+        location_id: str | None,
+        active_quest_ids: list[str],
+        participants: list[str],
+        witnesses: list[str],
+        events: list[SceneEventInput],
+    ) -> str:
+        canonical_request = {
+            "version": 1,
+            "campaign_id": campaign_id,
+            "in_world_time": in_world_time,
+            "transcript": transcript,
+            "location_id": location_id,
+            "active_quest_ids": active_quest_ids,
+            "participants": participants,
+            "witnesses": witnesses,
+            "events": [asdict(event) for event in events],
+        }
+        return hashlib.sha256(_json(canonical_request).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _check_scene_idempotency(
+        conn: sqlite3.Connection,
+        *,
+        scene_id: str,
+        request_fingerprint: str,
+    ) -> bool:
+        row = conn.execute(
+            "SELECT request_fingerprint FROM scene_record WHERE scene_id=?",
+            (scene_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        stored_fingerprint = row["request_fingerprint"]
+        if stored_fingerprint == request_fingerprint:
+            return True
+        raise ValueError(
+            f"scene_id {scene_id!r} is already committed with a different request fingerprint; "
+            f"stored={stored_fingerprint or '<missing>'}, received={request_fingerprint}"
+        )
+
+    def _scene_commit_checkpoint(self, stage: str) -> None:
+        """Internal failure-injection seam; production commits leave it inert."""
+
+    @staticmethod
+    def _commit_scene_sqlite(conn: sqlite3.Connection) -> None:
+        """Commit the scene transaction through an injectable boundary."""
+
+        conn.commit()
+
+    def _delete_failed_scene_drawer(self, *, drawer_id: str, original_error: Exception) -> None:
+        try:
+            self.episode_adapter.delete_scene_drawer(drawer_id=drawer_id)
+        except Exception as cleanup_error:
+            raise DrawerCompensationError(
+                drawer_id=drawer_id,
+                original_error=original_error,
+                cleanup_error=cleanup_error,
+            ) from original_error
+
     def commit_scene(
         self,
         *,
@@ -545,6 +616,7 @@ class RpgMemoryKernel:
     ) -> str:
         if not isinstance(campaign_id, str) or not campaign_id.strip():
             raise ValueError("campaign_id must be a non-empty string for scene evidence")
+        campaign_id = campaign_id.strip()
         active_quest_ids = _strict_string_list(active_quest_ids, "active_quest_ids", allow_none=True)
         participants = _strict_string_list(participants, "participants", allow_none=True)
         witnesses = _strict_string_list(witnesses, "witnesses", allow_none=True)
@@ -565,52 +637,88 @@ class RpgMemoryKernel:
                         raise ValueError("overlapping source spans require identical security policy")
                 located_spans.append((start, end, policy))
         scene_id = scene_id or _id("scene")
+        if not isinstance(scene_id, str) or not scene_id.strip():
+            raise ValueError("scene_id must be a non-empty string")
+        scene_id = scene_id.strip()
         now = _utcnow()
         transcript_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-
-        for entity_id in [location_id, *active_quest_ids, *participants, *witnesses]:
-            self._ensure_entity(entity_id)
-        for event in event_inputs:
-            for entity_id in [event.actor_id, event.target_id, *event.related_entities, event.access_owner_id, event.access_scope_id, event.belief_owner_id]:
-                self._ensure_entity(entity_id)
-            for quest_id in event.related_quests:
-                self._ensure_entity(quest_id)
-            for loc_id in event.related_locations:
-                self._ensure_entity(loc_id)
-
+        request_fingerprint = self._scene_request_fingerprint(
+            campaign_id=campaign_id,
+            in_world_time=in_world_time,
+            transcript=transcript,
+            location_id=location_id,
+            active_quest_ids=active_quest_ids,
+            participants=participants,
+            witnesses=witnesses,
+            events=event_inputs,
+        )
         conn = self._conn()
-        current_sort = conn.execute(
-            "SELECT COALESCE(MAX(scene_time_sort), 0) FROM scene_record WHERE campaign_id=?",
-            (campaign_id,),
-        ).fetchone()[0]
-        scene_time_sort = int(current_sort) + 1
-
+        if self._check_scene_idempotency(
+            conn,
+            scene_id=scene_id,
+            request_fingerprint=request_fingerprint,
+        ):
+            return scene_id
         drawer_id = f"rpg_scene_{scene_id}"
         wing = "wing_campaign_canon"
         room = f"location_{location_id}" if location_id else "campaign"
-        vector_id = self.episode_adapter.add_scene_drawer(
-            text=transcript,
-            wing=wing,
-            room=room,
-            drawer_id=drawer_id,
-            metadata={
-                "scene_id": scene_id,
-                "campaign_id": campaign_id,
-                "location_id": location_id,
-                "in_world_time": in_world_time,
-                "scene_time_sort": scene_time_sort,
-                "filed_at": now,
-            },
-        )
+        drawer_attempted = False
 
-        with conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if self._check_scene_idempotency(
+                conn,
+                scene_id=scene_id,
+                request_fingerprint=request_fingerprint,
+            ):
+                conn.rollback()
+                return scene_id
+
+            current_sort = conn.execute(
+                "SELECT COALESCE(MAX(scene_time_sort), 0) FROM scene_record WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchone()[0]
+            scene_time_sort = int(current_sort) + 1
+
+            drawer_attempted = True
+            vector_id = self.episode_adapter.add_scene_drawer(
+                text=transcript,
+                wing=wing,
+                room=room,
+                drawer_id=drawer_id,
+                metadata={
+                    "scene_id": scene_id,
+                    "campaign_id": campaign_id,
+                    "location_id": location_id,
+                    "in_world_time": in_world_time,
+                    "scene_time_sort": scene_time_sort,
+                    "filed_at": now,
+                    "request_fingerprint": request_fingerprint,
+                },
+            )
+            if vector_id != drawer_id:
+                raise RuntimeError(
+                    f"episode adapter returned non-deterministic drawer id {vector_id!r}; "
+                    f"expected {drawer_id!r}"
+                )
+
+            for entity_id in [location_id, *active_quest_ids, *participants, *witnesses]:
+                self._ensure_entity(entity_id)
+            for event in event_inputs:
+                for entity_id in [event.actor_id, event.target_id, *event.related_entities, event.access_owner_id, event.access_scope_id, event.belief_owner_id]:
+                    self._ensure_entity(entity_id)
+                for quest_id in event.related_quests:
+                    self._ensure_entity(quest_id)
+                for loc_id in event.related_locations:
+                    self._ensure_entity(loc_id)
+
             conn.execute(
                 """
                 INSERT INTO scene_record (
                     scene_id, campaign_id, in_world_time, scene_time_sort, location_id,
                     active_quest_ids_json, participants_json, witnesses_json,
-                    transcript, transcript_hash, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transcript, transcript_hash, request_fingerprint, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     scene_id,
@@ -623,9 +731,11 @@ class RpgMemoryKernel:
                     _json(witnesses),
                     transcript,
                     transcript_hash,
+                    request_fingerprint,
                     now,
                 ),
             )
+            self._scene_commit_checkpoint("scene_insert")
             if write_enabled(self.memo_settings):
                 for event in event_inputs:
                     self._commit_event(
@@ -639,7 +749,23 @@ class RpgMemoryKernel:
                         vector_id=vector_id,
                         created_at=now,
                     )
+            self._commit_scene_sqlite(conn)
+        except Exception as original_error:
+            if conn.in_transaction:
+                conn.rollback()
+            committed = self._check_scene_idempotency(
+                conn,
+                scene_id=scene_id,
+                request_fingerprint=request_fingerprint,
+            )
+            if not committed and drawer_attempted:
+                self._delete_failed_scene_drawer(
+                    drawer_id=drawer_id,
+                    original_error=original_error,
+                )
+            raise
 
+        self._scene_commit_checkpoint("after_sqlite_commit")
         return scene_id
 
     def _coerce_event(self, raw: SceneEventInput | dict[str, Any]) -> SceneEventInput:
@@ -762,6 +888,7 @@ class RpgMemoryKernel:
                     created_at,
                 ),
         )
+        self._scene_commit_checkpoint("event_insert")
 
         self._project_memory_items(
             campaign_id=campaign_id,
@@ -843,6 +970,7 @@ class RpgMemoryKernel:
                     created_at,
                 ),
         )
+        self._scene_commit_checkpoint("projection_insert")
         return memory_id
 
     def _project_memory_items(

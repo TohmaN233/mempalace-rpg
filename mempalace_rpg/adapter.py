@@ -24,7 +24,12 @@ class DrawerWrite:
 
 
 class EpisodeAdapter(Protocol):
-    """Write verbatim episode drawers to an external memory backend."""
+    """Write and compensate verbatim episode drawers.
+
+    ``drawer_id`` is supplied by the kernel and is deterministic for a scene.
+    Implementations must therefore treat ``add_scene_drawer`` as an upsert and
+    ``delete_scene_drawer`` as an idempotent delete.
+    """
 
     def add_scene_drawer(
         self,
@@ -36,6 +41,29 @@ class EpisodeAdapter(Protocol):
         metadata: dict,
     ) -> str:
         """Persist a scene drawer and return its backend vector/drawer id."""
+
+    def delete_scene_drawer(self, *, drawer_id: str) -> None:
+        """Delete a scene drawer; deleting an absent drawer must be harmless."""
+
+
+class DrawerCompensationError(RuntimeError):
+    """A scene write failed and its compensating drawer delete also failed."""
+
+    def __init__(
+        self,
+        *,
+        drawer_id: str,
+        original_error: Exception,
+        cleanup_error: Exception,
+    ) -> None:
+        self.drawer_id = drawer_id
+        self.original_error = original_error
+        self.cleanup_error = cleanup_error
+        super().__init__(
+            f"scene drawer compensation failed for {drawer_id!r}; "
+            f"original={type(original_error).__name__}: {original_error}; "
+            f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
+        )
 
 
 class NullEpisodeAdapter:
@@ -51,6 +79,9 @@ class NullEpisodeAdapter:
         metadata: dict,
     ) -> str:
         return drawer_id
+
+    def delete_scene_drawer(self, *, drawer_id: str) -> None:
+        return None
 
 
 class RecordingEpisodeAdapter:
@@ -68,16 +99,23 @@ class RecordingEpisodeAdapter:
         drawer_id: str,
         metadata: dict,
     ) -> str:
-        self.drawers.append(
-            DrawerWrite(
-                text=text,
-                wing=wing,
-                room=room,
-                drawer_id=drawer_id,
-                metadata=dict(metadata),
-            )
+        write = DrawerWrite(
+            text=text,
+            wing=wing,
+            room=room,
+            drawer_id=drawer_id,
+            metadata=dict(metadata),
         )
+        for index, existing in enumerate(self.drawers):
+            if existing.drawer_id == drawer_id:
+                self.drawers[index] = write
+                break
+        else:
+            self.drawers.append(write)
         return drawer_id
+
+    def delete_scene_drawer(self, *, drawer_id: str) -> None:
+        self.drawers[:] = [drawer for drawer in self.drawers if drawer.drawer_id != drawer_id]
 
 
 class MempalaceEpisodeAdapter:
@@ -122,3 +160,13 @@ class MempalaceEpisodeAdapter:
         }
         col.upsert(documents=[text], ids=[drawer_id], metadatas=[drawer_meta])
         return drawer_id
+
+    def delete_scene_drawer(self, *, drawer_id: str) -> None:
+        from mempalace.palace import get_collection
+
+        col = get_collection(
+            self.palace_path,
+            collection_name=self.collection_name,
+            create=True,
+        )
+        col.delete(ids=[drawer_id])

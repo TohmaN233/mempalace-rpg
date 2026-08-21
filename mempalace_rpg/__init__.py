@@ -4,7 +4,12 @@ The public API is intentionally host-agnostic.  Game packages can treat this as
 an external service/library and keep their own state engines untouched.
 """
 
-from .adapter import MempalaceEpisodeAdapter, NullEpisodeAdapter, RecordingEpisodeAdapter
+from .adapter import (
+    DrawerCompensationError,
+    MempalaceEpisodeAdapter,
+    NullEpisodeAdapter,
+    RecordingEpisodeAdapter,
+)
 from .budget import RecallBudget, budget_for_tier
 from .kernel import RpgMemoryKernel
 from .models import MemoryPack, SceneEventInput
@@ -13,6 +18,7 @@ from .tavern_importer import import_taverndb
 
 __all__ = [
     "DEFAULT_MEMO_SETTINGS",
+    "DrawerCompensationError",
     "MemoryPack",
     "MempalaceEpisodeAdapter",
     "NullEpisodeAdapter",
