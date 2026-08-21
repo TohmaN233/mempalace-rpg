@@ -10,6 +10,7 @@ ACL-first recall, and tiered runtime budgets.
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from typing import Any, Iterable
 
 from .adapter import EpisodeAdapter, NullEpisodeAdapter
 from .authorization import (
+    AuthorizedEvidence,
     CANONICAL_TRUTH_STATUSES,
     EvidenceAuthorizer,
     VALID_BRANCH_STATUSES,
@@ -316,6 +318,9 @@ class RpgMemoryKernel:
             memo_settings,
         )
         self._connection: sqlite3.Connection | None = None
+        self._read_cache_revision: tuple[int, int] | None = None
+        self._authorization_cache: dict[tuple[str, str, str, str | None], dict[str, Any]] = {}
+        self._projection_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._init_db()
 
     def close(self) -> None:
@@ -336,6 +341,16 @@ class RpgMemoryKernel:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys=ON")
         return self._connection
+
+    def _refresh_read_caches(self) -> None:
+        """Invalidate derived read state after local or external SQLite writes."""
+        conn = self._conn()
+        revision = (conn.total_changes, int(conn.execute("PRAGMA data_version").fetchone()[0]))
+        if revision == self._read_cache_revision:
+            return
+        self._authorization_cache.clear()
+        self._projection_cache.clear()
+        self._read_cache_revision = revision
 
     def _init_db(self) -> None:
         conn = self._conn()
@@ -1031,9 +1046,20 @@ class RpgMemoryKernel:
         budget: int,
         active_quest_ids: list[str] | None = None,
         scene_id: str | None = None,
+        _compact_product_trace: bool = False,
     ):
         """Return the single AERP-1 decision used by all evidence read paths."""
-        return EvidenceAuthorizer(self._conn()).authorize(
+        authorizer = EvidenceAuthorizer(self._conn())
+        if _compact_product_trace:
+            self._refresh_read_caches()
+            cache_key = (campaign_id, actor_id, actor_type, scene_id)
+            cached_trace = self._authorization_cache.get(cache_key)
+            if cached_trace is not None:
+                trace = copy.deepcopy(cached_trace)
+                trace["query"] = query
+                trace["active_quest_ids"] = _uniq(active_quest_ids or [])
+                return AuthorizedEvidence([], [], trace)
+        decision = authorizer.authorize(
             campaign_id=campaign_id,
             actor_id=actor_id,
             actor_type=actor_type,
@@ -1041,7 +1067,13 @@ class RpgMemoryKernel:
             budget=budget,
             active_quest_ids=_uniq(active_quest_ids or []),
             scene_id=scene_id,
+            compact_product_trace=_compact_product_trace,
         )
+        if _compact_product_trace:
+            # Product code mutates selected IDs and detailed rows later, so the
+            # cache owns an isolated base trace.
+            self._authorization_cache[cache_key] = copy.deepcopy(decision.trace)
+        return decision
 
     def build_memory_pack(
         self,
@@ -1062,6 +1094,19 @@ class RpgMemoryKernel:
         budget = budget_for_tier(tier)
         max_chars = max_chars or budget.l2_chars
 
+        # All evidence-derived projections share one decision.  Apart from
+        # eliminating repeated 30k scans, this makes facts, beliefs, ranking and
+        # the final trace observably descend from the same ACL boundary.
+        decision = _authorization_decision or self.authorized_evidence(
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            query=query,
+            active_quest_ids=active_quest_ids or [],
+            budget=1000,
+            _compact_product_trace=True,
+        )
+
         sections: list[tuple[str, str]] = []
         if profile and recall_section_enabled(self.memo_settings, "profile"):
             sections.append(("L0 ProfileCard", self._render_profile(profile, budget.l0_chars)))
@@ -1075,24 +1120,22 @@ class RpgMemoryKernel:
 
         if recall_section_enabled(self.memo_settings, "world_truth"):
             facts = self._allowed_world_facts(
-                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type, as_of=in_world_time
+                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type, as_of=in_world_time,
+                _authorization_decision=decision,
             )
             if facts:
                 sections.append(("WorldTruth allowed to actor", self._render_fact_lines(facts, budget.l1_chars)))
 
         if recall_section_enabled(self.memo_settings, "actor_belief"):
             beliefs = self._allowed_actor_beliefs(
-                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type
+                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type,
+                _authorization_decision=decision,
             )
             if beliefs:
                 sections.append(("ActorBelief", self._render_belief_lines(beliefs, budget.l1_chars)))
 
         evidence = []
         if recall_enabled(self.memo_settings) and recall_section_enabled(self.memo_settings, "evidence"):
-            decision = _authorization_decision or self.authorized_evidence(
-                campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type,
-                query=query, active_quest_ids=active_quest_ids or [], budget=1000,
-            )
             evidence = self._retrieve_memory_items(
                 campaign_id=campaign_id, actor_id=actor_id, actor_type=actor_type, query=query,
                 active_quest_ids=active_quest_ids or [], location_id=location_id,
@@ -1100,15 +1143,12 @@ class RpgMemoryKernel:
                 authorized_event_ids=set(decision.trace["authorized_candidate_ids"]),
             )
             decision.trace["selected_evidence_ids"] = [item["source_event_id"] for item in evidence]
-        else:
-            decision = self.authorized_evidence(
-                campaign_id=campaign_id,
-                actor_id=actor_id,
-                actor_type=actor_type,
-                query=query,
-                active_quest_ids=active_quest_ids or [],
-                budget=1000,
-            )
+        self._complete_product_trace(
+            decision,
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+        )
         # Ordinary recall does not expose verbatim spans; its product trace must
         # describe that surface rather than the direct authorization interface.
         decision.trace["returned_spans"] = []
@@ -1167,8 +1207,9 @@ class RpgMemoryKernel:
         actor_id: str,
         actor_type: str,
         as_of: str | None = None,
+        _authorization_decision: Any | None = None,
     ) -> list[dict[str, Any]]:
-        decision = self.authorized_evidence(
+        decision = _authorization_decision or self.authorized_evidence(
             campaign_id=campaign_id,
             actor_id=actor_id,
             actor_type=actor_type,
@@ -1190,9 +1231,9 @@ class RpgMemoryKernel:
         return facts
 
     def _allowed_actor_beliefs(
-        self, *, campaign_id: str, actor_id: str, actor_type: str
+        self, *, campaign_id: str, actor_id: str, actor_type: str, _authorization_decision: Any | None = None,
     ) -> list[dict[str, Any]]:
-        decision = self.authorized_evidence(
+        decision = _authorization_decision or self.authorized_evidence(
             campaign_id=campaign_id,
             actor_id=actor_id,
             actor_type=actor_type,
@@ -1334,6 +1375,7 @@ class RpgMemoryKernel:
             query=query,
             active_quest_ids=active_quest_ids or [],
             budget=1000,
+            _compact_product_trace=True,
         )
         pack = self.build_memory_pack(
             campaign_id=campaign_id,
@@ -1347,7 +1389,12 @@ class RpgMemoryKernel:
             max_chars=max_chars,
             _authorization_decision=decision,
         )
-        events_by_id = {str(event["source_event_id"]): event for event in decision.events}
+        selected_ids = [str(item["source_event_id"]) for item in pack.evidence]
+        events_by_id = self._selected_authorized_events(
+            campaign_id=campaign_id,
+            selected_event_ids=selected_ids,
+            authorized_event_ids=set(decision.trace["authorized_candidate_ids"]),
+        )
         spans_by_scene: dict[str, list[dict[str, Any]]] = {}
         # Pack evidence has B0 order. Preserve it through scene selection rather
         # than iterating authorization's recency order.
@@ -1453,42 +1500,151 @@ class RpgMemoryKernel:
         max_chars: int,
         authorized_event_ids: set[str],
     ) -> list[dict[str, Any]]:
-        rows = self._conn().execute(
-            "SELECT mi.* FROM memory_item mi JOIN scene_record sr ON sr.scene_id=mi.source_scene_id "
-            "WHERE sr.campaign_id=? ORDER BY mi.created_at DESC", (campaign_id,)
-        ).fetchall()
-        best_by_event: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            item = self._memory_item_from_row(row)
+        rows = self._projection_candidates(campaign_id)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for item in rows:
             source_event_id = str(item.get("source_event_id") or "")
             if not source_event_id or source_event_id not in authorized_event_ids:
                 continue
-            if not domain_recall_enabled(self.memo_settings, str(item.get("domain"))):
-                continue
-            self._attach_scene_context(item)
-            item["rank_score"] = self._rank_score(
+            scored.append((self._rank_score(
                 item,
                 query=query,
                 active_quest_ids=active_quest_ids,
                 location_id=location_id,
-            )
-            prior = best_by_event.get(source_event_id)
-            if prior is None or (item["rank_score"], str(item.get("memory_id"))) > (prior["rank_score"], str(prior.get("memory_id"))):
-                best_by_event[source_event_id] = item
-        allowed = list(best_by_event.values())
-        allowed.sort(key=lambda item: item["rank_score"], reverse=True)
+            ), item))
+        # Python's stable sort preserves the historical created-at/event order
+        # for equal scores.
+        scored.sort(key=lambda pair: pair[0], reverse=True)
 
         packed: list[dict[str, Any]] = []
         used = 0
-        for item in allowed:
+        for rank_score, cached_item in scored:
             if len(packed) >= hit_limit:
                 break
-            text_len = len(str(item.get("text", "")))
+            text_len = len(str(cached_item.get("text", "")))
             if packed and used + text_len > max_chars:
                 break
             used += text_len
-            packed.append(item)
+            item = dict(cached_item)
+            item["rank_score"] = rank_score
+            self._attach_joined_scene_context(item)
+            packed.append(self._memory_item_from_row(item))
         return packed
+
+    def _projection_candidates(self, campaign_id: str) -> list[dict[str, Any]]:
+        """Cache one rank-equivalent enabled projection per source event."""
+        self._refresh_read_caches()
+        settings_digest = hashlib.sha256(_json(self.memo_settings).encode("utf-8")).hexdigest()
+        cache_key = (campaign_id, settings_digest)
+        cached = self._projection_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        rows = self._conn().execute(
+            "SELECT mi.*, sr.campaign_id AS scene_campaign_id, sr.in_world_time AS scene_in_world_time, "
+            "sr.scene_time_sort AS scene_time_sort, sr.location_id AS scene_location_id, "
+            "sr.participants_json AS scene_participants_json, sr.witnesses_json AS scene_witnesses_json, "
+            "sr.created_at AS scene_created_at FROM memory_item mi JOIN scene_record sr ON sr.scene_id=mi.source_scene_id "
+            "WHERE sr.campaign_id=? ORDER BY mi.created_at DESC", (campaign_id,)
+        ).fetchall()
+        best_by_event: dict[str, dict[str, Any]] = {}
+        rank_fields_by_event: dict[str, tuple[Any, ...]] = {}
+        for row in rows:
+            item = dict(row)
+            source_event_id = str(item.get("source_event_id") or "")
+            if not source_event_id:
+                continue
+            if not domain_recall_enabled(self.memo_settings, str(item.get("domain"))):
+                continue
+            rank_fields = (
+                item.get("text"), item.get("importance"), item.get("emotional_weight"),
+                item.get("related_quests_json"), item.get("related_locations_json"),
+                item.get("source_scene_id"), item.get("created_at"),
+            )
+            prior_fields = rank_fields_by_event.setdefault(source_event_id, rank_fields)
+            if prior_fields != rank_fields:
+                raise ValueError("memory projections for one source event diverged in rank fields")
+            item["related_quests"] = _loads(item["related_quests_json"], [])
+            item["related_locations"] = _loads(item["related_locations_json"], [])
+            item.setdefault("in_world_time", item["scene_in_world_time"])
+            item.setdefault("location_id", item["scene_location_id"])
+            item.setdefault("scene_time_sort", item["scene_time_sort"])
+            prior = best_by_event.get(source_event_id)
+            item_projection_rank = (-0.05 if item.get("domain") == "canon" else 0.0, str(item.get("memory_id")))
+            prior_projection_rank = (
+                -0.05 if prior and prior.get("domain") == "canon" else 0.0,
+                str(prior.get("memory_id")) if prior else "",
+            )
+            if prior is None or item_projection_rank > prior_projection_rank:
+                best_by_event[source_event_id] = item
+        candidates = list(best_by_event.values())
+        self._projection_cache[cache_key] = candidates
+        return candidates
+
+    def _attach_joined_scene_context(self, item: dict[str, Any]) -> None:
+        """Attach the scene already joined by retrieval; never N+1 lookup it."""
+        scene_id = item.get("source_scene_id")
+        if not scene_id:
+            return
+        item["scene"] = {
+            "scene_id": scene_id,
+            "campaign_id": item.pop("scene_campaign_id"),
+            "in_world_time": item.pop("scene_in_world_time"),
+            "scene_time_sort": item.pop("scene_time_sort"),
+            "location_id": item.pop("scene_location_id"),
+            "participants": _loads(item.pop("scene_participants_json"), []),
+            "witnesses": _loads(item.pop("scene_witnesses_json"), []),
+            "created_at": item.pop("scene_created_at"),
+        }
+        item.setdefault("in_world_time", item["scene"]["in_world_time"])
+        item.setdefault("location_id", item["scene"]["location_id"])
+        item.setdefault("scene_time_sort", item["scene"]["scene_time_sort"])
+
+    def _complete_product_trace(
+        self,
+        decision: Any,
+        *,
+        campaign_id: str,
+        actor_id: str,
+        actor_type: str,
+    ) -> None:
+        """Materialize product trace detail only after ranking has selected IDs."""
+        EvidenceAuthorizer(self._conn()).add_selected_candidates(
+            decision,
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            actor_type=actor_type,
+            selected_event_ids=list(decision.trace.get("selected_evidence_ids", [])),
+        )
+
+    def _selected_authorized_events(
+        self,
+        *,
+        campaign_id: str,
+        selected_event_ids: list[str],
+        authorized_event_ids: set[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Load spans only for ranked evidence already approved by the decision."""
+        selected = list(dict.fromkeys(selected_event_ids))
+        unauthorized = [event_id for event_id in selected if event_id not in authorized_event_ids]
+        if unauthorized:
+            raise PermissionError("selected evidence is absent from the authorization decision")
+        if not selected:
+            return {}
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(selected), 900):
+            batch = selected[start:start + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn().execute(
+                "SELECT se.event_id, se.scene_id, se.source_span FROM scene_event se "
+                "JOIN scene_record sr ON sr.scene_id=se.scene_id "
+                "WHERE sr.campaign_id=? AND se.event_id IN (" + placeholders + ")",
+                [campaign_id, *batch],
+            ).fetchall()
+            rows_by_id.update({str(row["event_id"]): {"source_event_id": row["event_id"], "source_scene_id": row["scene_id"], "source_span": row["source_span"]} for row in rows})
+        missing = [event_id for event_id in selected if event_id not in rows_by_id]
+        if missing:
+            raise PermissionError("selected evidence disappeared before deep recall")
+        return rows_by_id
 
     def _attach_scene_context(self, item: dict[str, Any]) -> None:
         scene_id = item.get("source_scene_id")
