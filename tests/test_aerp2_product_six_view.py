@@ -4,10 +4,11 @@ import hashlib
 import json
 import math
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
-from mempalace_rpg import RankingResult, RpgMemoryKernel, SceneEventInput, SixViewRanker
+from mempalace_rpg import FixedSixViewPolicy, FusionRoutingDecision, FusionRoutingPolicy, RankingResult, RawAnchoredP5Policy, RpgMemoryKernel, SceneEventInput, SixViewRanker
 from mempalace_rpg.retrieval import AuthorizedRetrievalCandidate, structured_observation
 
 
@@ -274,6 +275,296 @@ def _candidate(
         identifier, "scene", raw or identifier + " raw", observation or identifier + " observation",
         checkpoint, policy, (scene_time, ranking_key), ranking_key,
     )
+
+
+def _raw_p5_golden_inputs() -> tuple[dict[str, dict[str, int]], dict[str, str], tuple[str, ...]]:
+    identifiers = tuple(f"event-{index:02d}" for index in range(12))
+    keys = {identifier: f"key-{11 - index:02d}" for index, identifier in enumerate(identifiers)}
+    raw_order = list(identifiers)
+    p5_boost_order = [identifiers[10], identifiers[11], *identifiers[:10]]
+    ranks = {
+        "raw_bm25": {identifier: index + 1 for index, identifier in enumerate(raw_order)},
+        "observation_bm25": {identifier: index + 1 for index, identifier in enumerate(p5_boost_order)},
+        "raw_dense": {identifier: index + 1 for index, identifier in enumerate(raw_order)},
+        "observation_dense": {identifier: index + 1 for index, identifier in enumerate(p5_boost_order)},
+        "checkpoint_dense": {identifier: index + 1 for index, identifier in enumerate(raw_order)},
+        "combo_dense": {identifier: index + 1 for index, identifier in enumerate(p5_boost_order)},
+    }
+    return ranks, keys, identifiers
+
+
+def test_raw_anchored_p5_is_explicit_and_keeps_default_ranker_trace_and_encoder_calls_exact():
+    candidates = [
+        _candidate("event-a", raw="raw alpha", observation="observation alpha", ranking_key="safe-a"),
+        _candidate("event-b", raw="raw beta", observation="observation beta", ranking_key="safe-b"),
+    ]
+    default_encoder = _CountingEncoder()
+    candidate_encoder = _CountingEncoder()
+    default = SixViewRanker(default_encoder).rank(query="safe query", candidates=candidates)
+    gated = SixViewRanker(candidate_encoder, routing_policy=RawAnchoredP5Policy(-math.inf)).rank(query="safe query", candidates=candidates)
+
+    assert "aerp4_raw_anchored_p5" not in default.trace
+    assert default_encoder.queries == candidate_encoder.queries == ["safe query"]
+    assert default_encoder.passage_batches == candidate_encoder.passage_batches
+    assert gated.trace["aerp4_raw_anchored_p5"]["route"] == "p5"
+
+
+def test_raw_anchored_p5_controls_ratio_equality_and_short_universes():
+    ranking_keys = {"a": "a", "b": "b"}
+    ranks = {
+        "raw_bm25": {"a": 1, "b": 2}, "observation_bm25": {"a": 2, "b": 1},
+        "raw_dense": {"a": 1, "b": 2}, "observation_dense": {"a": 2, "b": 1},
+        "checkpoint_dense": {"a": 1, "b": 2}, "combo_dense": {"a": 2, "b": 1},
+    }
+    unconstrained = RawAnchoredP5Policy(0.0).decide(ranks=ranks, ranking_keys_by_id=ranking_keys, rrf_k=60)
+    raw_totals, p5_totals = dict(unconstrained.raw_totals), dict(unconstrained.p5_totals)
+    limit = min(10, len(ranking_keys))
+    raw_top = sorted(raw_totals, key=lambda identifier: (-raw_totals[identifier], ranking_keys[identifier]))[:limit]
+    p5_top = sorted(p5_totals, key=lambda identifier: (-p5_totals[identifier], ranking_keys[identifier]))[:limit]
+    ratio = sum(raw_totals[identifier] for identifier in p5_top) / sum(raw_totals[identifier] for identifier in raw_top)
+    equality = RawAnchoredP5Policy(ratio).decide(ranks=ranks, ranking_keys_by_id=ranking_keys, rrf_k=60)
+
+    assert equality.anchor_ratio == ratio
+    assert equality.route == "p5"
+    assert RawAnchoredP5Policy(math.inf).decide(ranks=ranks, ranking_keys_by_id=ranking_keys, rrf_k=60).route == "raw"
+    assert RawAnchoredP5Policy(-math.inf).decide(ranks=ranks, ranking_keys_by_id=ranking_keys, rrf_k=60).route == "p5"
+    for count in range(1, 10):
+        result = SixViewRanker(_CountingEncoder(), routing_policy=RawAnchoredP5Policy(0.0)).rank(
+            query="q", candidates=[_candidate(f"event-{index}", ranking_key=f"key-{index}") for index in range(count)]
+        )
+        assert len(result.ranked_event_ids) == count
+
+
+def test_raw_anchored_p5_receipt_and_ledger_are_text_safe_and_replay_actual_effective_weights():
+    candidates = [
+        _candidate("event-a", raw="EVIDENCE ALPHA", observation="category=secret", ranking_key="plaintext-ranking-key-a"),
+        _candidate("event-b", raw="EVIDENCE BETA", observation="category=secret", ranking_key="plaintext-ranking-key-b"),
+    ]
+    result = SixViewRanker(_CountingEncoder(), diagnostic_ledger=True, routing_policy=RawAnchoredP5Policy(-math.inf)).rank(
+        query="P5 PRIVATE QUERY", candidates=candidates
+    )
+    receipt = result.trace["aerp4_raw_anchored_p5"]
+    serialized = json.dumps(receipt, sort_keys=True)
+
+    assert receipt["schema"] == "aerp4-raw-anchored-p5-v1"
+    assert math.isfinite(receipt["A"])
+    assert set(receipt["effective_weights"]) == set(SixViewRanker.weights)
+    assert receipt["effective_weights"]["checkpoint_dense"] == 0.0
+    assert all(secret not in serialized for secret in ("P5 PRIVATE QUERY", "EVIDENCE", "category", "plaintext-ranking-key"))
+    assert len(receipt["final_ranking_sha256"]) == 64
+    expected_config = {
+        "schema": "aerp4-raw-anchored-p5-v1", "policy": "raw_anchored_p5", "tau": "-inf",
+        "raw_weights": {"raw_bm25": 2.0, "observation_bm25": 0.0, "raw_dense": 1.0, "observation_dense": 0.0, "checkpoint_dense": 0.0, "combo_dense": 0.0},
+        "p5_weights": {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 0.0, "combo_dense": 1.0},
+        "support_top_k": 10, "comparator": ">=",
+        "ordinary_sum_view_order": ["raw_bm25", "observation_bm25", "raw_dense", "observation_dense", "checkpoint_dense", "combo_dense"], "rrf_k": 60,
+    }
+    assert receipt["config"] == expected_config
+    assert receipt["config_sha256"] == _ledger_digest(expected_config)
+    ranking_key_hashes = {candidate.source_event_id: hashlib.sha256(candidate.ranking_key.encode()).hexdigest() for candidate in candidates}
+    ledger = result.trace["fcd1_diagnostic_ledger"]
+    ranks = {
+        view: {row["source_event_id"]: row["component_ranks"][view] for row in ledger["fused_top_50"]}
+        for view in expected_config["ordinary_sum_view_order"]
+    }
+    raw_weights, p5_weights = expected_config["raw_weights"], expected_config["p5_weights"]
+    raw_totals = {item: sum(raw_weights[view] / (60 + ranks[view][item]) for view in expected_config["ordinary_sum_view_order"]) for item in ranks["raw_bm25"]}
+    p5_totals = {item: sum(p5_weights[view] / (60 + ranks[view][item]) for view in expected_config["ordinary_sum_view_order"]) for item in ranks["raw_bm25"]}
+    raw_top = sorted(raw_totals, key=lambda item: (-raw_totals[item], candidates[[candidate.source_event_id for candidate in candidates].index(item)].ranking_key))
+    p5_top = sorted(p5_totals, key=lambda item: (-p5_totals[item], candidates[[candidate.source_event_id for candidate in candidates].index(item)].ranking_key))
+    assert receipt["numerator"] == sum(raw_totals[item] for item in p5_top)
+    assert receipt["denominator"] == sum(raw_totals[item] for item in raw_top)
+    assert receipt["A"] == receipt["numerator"] / receipt["denominator"]
+    assert receipt["raw_top10_ranking_sha256"] == _ledger_digest([ranking_key_hashes[item] for item in raw_top])
+    assert receipt["p5_top10_ranking_sha256"] == _ledger_digest([ranking_key_hashes[item] for item in p5_top])
+    assert receipt["final_ranking_sha256"] == _ledger_digest([ranking_key_hashes[item] for item in result.ranked_event_ids])
+    for row in result.trace["fcd1_diagnostic_ledger"]["fused_top_50"]:
+        assert row["contributions"]["checkpoint_dense"] == 0.0
+        assert row["final_rrf"] == sum(row["contributions"].values())
+        assert set(row["contributions"]) == set(receipt["effective_weights"])
+
+
+def test_raw_anchored_positive_infinity_routes_raw_and_replays_receipt_and_zero_views():
+    candidates = [_candidate(f"event-{index}", raw=f"raw {index}", observation=f"observation {index}", ranking_key=f"key-{index}") for index in range(3)]
+    result = SixViewRanker(_CountingEncoder(), diagnostic_ledger=True, routing_policy=RawAnchoredP5Policy(math.inf)).rank(query="raw gate", candidates=candidates)
+    receipt, ledger = result.trace["aerp4_raw_anchored_p5"], result.trace["fcd1_diagnostic_ledger"]
+    raw_weights = {"raw_bm25": 2.0, "observation_bm25": 0.0, "raw_dense": 1.0, "observation_dense": 0.0, "checkpoint_dense": 0.0, "combo_dense": 0.0}
+    config = {
+        "schema": "aerp4-raw-anchored-p5-v1", "policy": "raw_anchored_p5", "tau": "+inf",
+        "raw_weights": raw_weights, "p5_weights": {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 0.0, "combo_dense": 1.0},
+        "support_top_k": 10, "comparator": ">=", "ordinary_sum_view_order": list(raw_weights), "rrf_k": 60,
+    }
+    key_hashes = {candidate.source_event_id: hashlib.sha256(candidate.ranking_key.encode()).hexdigest() for candidate in candidates}
+    ranks = {view: {row["source_event_id"]: row["component_ranks"][view] for row in ledger["fused_top_50"]} for view in raw_weights}
+    raw_totals = {item: sum(raw_weights[view] / (60 + ranks[view][item]) for view in raw_weights) for item in key_hashes}
+    raw_top = sorted(raw_totals, key=lambda item: (-raw_totals[item], next(candidate.ranking_key for candidate in candidates if candidate.source_event_id == item)))
+
+    assert receipt["route"] == "raw" and receipt["effective_weights"] == raw_weights
+    assert receipt["config"] == config and receipt["config_sha256"] == _ledger_digest(config)
+    assert receipt["numerator"] == receipt["denominator"] == sum(raw_totals[item] for item in raw_top)
+    assert receipt["A"] == 1.0
+    assert receipt["raw_top10_ranking_sha256"] == receipt["p5_top10_ranking_sha256"] == _ledger_digest([key_hashes[item] for item in raw_top])
+    assert receipt["final_ranking_sha256"] == _ledger_digest([key_hashes[item] for item in result.ranked_event_ids])
+    for row in ledger["fused_top_50"]:
+        assert all(row["contributions"][view] == 0.0 for view in ("observation_bm25", "observation_dense", "checkpoint_dense", "combo_dense"))
+        assert row["final_rrf"] == sum(raw_weights[view] / (60 + row["component_ranks"][view]) for view in raw_weights)
+
+
+@pytest.mark.parametrize("mutation", ["raw_totals", "p5_totals", "numerator", "denominator", "ratio", "config", "wrong_expert"])
+def test_raw_anchored_coordinated_decision_mutations_reach_raw_validator_and_fail_closed(mutation):
+    class MutatingRawPolicy(RawAnchoredP5Policy):
+        def decide(self, **kwargs):
+            decision = super().decide(**kwargs)
+            if mutation == "raw_totals": return replace(decision, raw_totals=((decision.raw_totals[0][0], decision.raw_totals[0][1] + 1.0), *decision.raw_totals[1:]))
+            if mutation == "p5_totals": return replace(decision, p5_totals=((decision.p5_totals[0][0], decision.p5_totals[0][1] + 1.0), *decision.p5_totals[1:]))
+            if mutation == "numerator": return replace(decision, anchor_numerator=decision.anchor_numerator + 1.0)
+            if mutation == "denominator": return replace(decision, anchor_denominator=decision.anchor_denominator + 1.0)
+            if mutation == "ratio": return replace(decision, anchor_ratio=decision.anchor_ratio + 0.1)
+            if mutation == "config":
+                config = {**decision.config, "support_top_k": 9}
+                return replace(decision, config_json=json.dumps(config, sort_keys=True, separators=(",", ":")), config_sha256=_ledger_digest(config))
+            return replace(decision, route="raw", totals=decision.raw_totals, effective_weights=(("raw_bm25", 2.0), ("observation_bm25", 0.0), ("raw_dense", 1.0), ("observation_dense", 0.0), ("checkpoint_dense", 0.0), ("combo_dense", 0.0)))
+
+    with pytest.raises(ValueError, match="raw-anchored"):
+        SixViewRanker(_CountingEncoder(), routing_policy=MutatingRawPolicy(-math.inf)).rank(
+            query="q", candidates=[_candidate("event-a", ranking_key="a"), _candidate("event-b", ranking_key="b")]
+        )
+
+
+def test_raw_anchored_p5_rejects_nan_empty_universe_and_policy_errors():
+    with pytest.raises(ValueError, match="tau"):
+        RawAnchoredP5Policy(math.nan)
+    with pytest.raises(ValueError, match="non-empty"):
+        SixViewRanker(_CountingEncoder(), routing_policy=RawAnchoredP5Policy(0.0)).rank(query="q", candidates=[])
+
+    class ExplodingPolicy:
+        def decide(self, **_kwargs):
+            raise RuntimeError("policy exploded")
+
+    with pytest.raises(RuntimeError, match="policy exploded"):
+        SixViewRanker(_CountingEncoder(), routing_policy=ExplodingPolicy()).rank(query="q", candidates=[_candidate("event")])
+
+
+def test_raw_anchored_tau_is_read_only_and_private_or_post_decision_drift_fails_closed():
+    ranks, keys, _identifiers = _raw_p5_golden_inputs()
+    policy = RawAnchoredP5Policy(0.25)
+    decision = policy.decide(ranks=ranks, ranking_keys_by_id=keys, rrf_k=60)
+    with pytest.raises(AttributeError, match="tau"):
+        policy.tau = 0.75
+    assert policy.tau == 0.25
+    assert policy.decide(ranks=ranks, ranking_keys_by_id=keys, rrf_k=60) == decision
+    object.__setattr__(policy, "_tau", 0.75)
+    with pytest.raises(ValueError, match="tau"):
+        policy.decide(ranks=ranks, ranking_keys_by_id=keys, rrf_k=60)
+
+    class DriftingRawPolicy(RawAnchoredP5Policy):
+        def decide(self, **kwargs):
+            value = super().decide(**kwargs)
+            object.__setattr__(self, "_tau", 0.75)
+            return value
+
+    with pytest.raises(ValueError, match="raw-anchored"):
+        SixViewRanker(_CountingEncoder(), routing_policy=DriftingRawPolicy(-math.inf)).rank(
+            query="q", candidates=[_candidate("event-a", ranking_key="a"), _candidate("event-b", ranking_key="b")]
+        )
+
+
+def test_raw_anchored_p5_public_contract_config_and_receipts_recompute_from_literal_formula():
+    assert FusionRoutingPolicy and FixedSixViewPolicy and RawAnchoredP5Policy
+    ranks = {
+        "raw_bm25": {"a": 1, "b": 2, "c": 3}, "observation_bm25": {"a": 2, "b": 1, "c": 3},
+        "raw_dense": {"a": 1, "b": 3, "c": 2}, "observation_dense": {"a": 3, "b": 1, "c": 2},
+        "checkpoint_dense": {"a": 1, "b": 2, "c": 3}, "combo_dense": {"a": 3, "b": 2, "c": 1},
+    }
+    keys = {"a": "ranking-a", "b": "ranking-b", "c": "ranking-c"}
+    raw_weights = {"raw_bm25": 2.0, "observation_bm25": 0.0, "raw_dense": 1.0, "observation_dense": 0.0, "checkpoint_dense": 0.0, "combo_dense": 0.0}
+    p5_weights = {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 0.0, "combo_dense": 1.0}
+    order = ("raw_bm25", "observation_bm25", "raw_dense", "observation_dense", "checkpoint_dense", "combo_dense")
+    raw_totals = {item: sum(raw_weights[view] / (60 + ranks[view][item]) for view in order) for item in keys}
+    p5_totals = {item: sum(p5_weights[view] / (60 + ranks[view][item]) for view in order) for item in keys}
+    raw_top = sorted(keys, key=lambda item: (-raw_totals[item], keys[item]))
+    p5_top = sorted(keys, key=lambda item: (-p5_totals[item], keys[item]))
+    numerator = sum(raw_totals[item] for item in p5_top)
+    denominator = sum(raw_totals[item] for item in raw_top)
+    decision = RawAnchoredP5Policy(numerator / denominator).decide(ranks=ranks, ranking_keys_by_id=keys, rrf_k=60)
+    expected_config = {
+        "schema": "aerp4-raw-anchored-p5-v1", "policy": "raw_anchored_p5", "tau": numerator / denominator,
+        "raw_weights": raw_weights, "p5_weights": p5_weights, "support_top_k": 10,
+        "comparator": ">=", "ordinary_sum_view_order": list(order), "rrf_k": 60,
+    }
+
+    assert dict(decision.raw_totals) == raw_totals
+    assert dict(decision.p5_totals) == p5_totals
+    assert decision.anchor_numerator == numerator
+    assert decision.anchor_denominator == denominator
+    assert decision.anchor_ratio == numerator / denominator
+    assert decision.config == expected_config
+    assert decision.config_sha256 == _ledger_digest(expected_config)
+
+
+def test_raw_anchored_p5_twelve_candidate_literal_gate_has_distinct_top10_and_digest_controls():
+    ranks, keys, identifiers = _raw_p5_golden_inputs()
+    order = ("raw_bm25", "observation_bm25", "raw_dense", "observation_dense", "checkpoint_dense", "combo_dense")
+    raw_weights = {"raw_bm25": 2.0, "observation_bm25": 0.0, "raw_dense": 1.0, "observation_dense": 0.0, "checkpoint_dense": 0.0, "combo_dense": 0.0}
+    p5_weights = {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 0.0, "combo_dense": 1.0}
+    raw_totals = {item: sum(raw_weights[view] / (60 + ranks[view][item]) for view in order) for item in identifiers}
+    p5_totals = {item: sum(p5_weights[view] / (60 + ranks[view][item]) for view in order) for item in identifiers}
+    raw_top = sorted(identifiers, key=lambda item: (-raw_totals[item], keys[item]))[:10]
+    p5_top = sorted(identifiers, key=lambda item: (-p5_totals[item], keys[item]))[:10]
+    numerator, denominator = sum(raw_totals[item] for item in p5_top), sum(raw_totals[item] for item in raw_top)
+    ratio = numerator / denominator
+    hashes = {item: hashlib.sha256(keys[item].encode()).hexdigest() for item in identifiers}
+    expected_raw_digest = _ledger_digest([hashes[item] for item in raw_top])
+    expected_p5_digest = _ledger_digest([hashes[item] for item in p5_top])
+    expected_final_digest = _ledger_digest([hashes[item] for item in sorted(p5_totals, key=lambda item: (-p5_totals[item], keys[item]))])
+    at_threshold = RawAnchoredP5Policy(ratio).decide(ranks=ranks, ranking_keys_by_id=keys, rrf_k=60)
+    above_threshold = RawAnchoredP5Policy(math.nextafter(ratio, math.inf)).decide(ranks=ranks, ranking_keys_by_id=keys, rrf_k=60)
+
+    assert set(raw_top) != set(p5_top) and ratio != 1.0
+    assert dict(at_threshold.raw_totals) == raw_totals and dict(at_threshold.p5_totals) == p5_totals
+    assert at_threshold.route == "p5" and above_threshold.route == "raw"
+    assert at_threshold.raw_top10_ranking_sha256 == expected_raw_digest
+    assert at_threshold.p5_top10_ranking_sha256 == expected_p5_digest
+    assert at_threshold.final_ranking_sha256 == expected_final_digest
+
+
+def test_explicit_fixed_adapter_matches_default_and_policy_mutations_fail_closed():
+    candidates = [_candidate("event-a", ranking_key="a"), _candidate("event-b", ranking_key="b")]
+    default_encoder, fixed_encoder = _CountingEncoder(), _CountingEncoder()
+    default = SixViewRanker(default_encoder, diagnostic_ledger=True).rank(query="q", candidates=candidates)
+    fixed = SixViewRanker(fixed_encoder, diagnostic_ledger=True, routing_policy=FixedSixViewPolicy()).rank(query="q", candidates=candidates)
+    assert (fixed.ranked_event_ids, fixed.scores, fixed.trace) == (default.ranked_event_ids, default.scores, default.trace)
+    assert fixed_encoder.queries == default_encoder.queries and fixed_encoder.passage_batches == default_encoder.passage_batches
+
+    class MutatedPolicy:
+        def __init__(self, mode): self.mode = mode
+        def decide(self, **_kwargs):
+            totals = (("event-a", 1.0), ("event-a", 1.0)) if self.mode == "duplicate_totals" else (("event-a", 1.0), ("event-b", 1.0))
+            if self.mode == "wrong_total": totals = (("event-a", 0.0), ("event-b", 0.0))
+            weights = tuple({"raw_bm25": 2.0, "observation_bm25": 0.0, "raw_dense": 1.0, "observation_dense": 0.0, "checkpoint_dense": 0.0, "combo_dense": 0.0}.items())
+            if self.mode == "duplicate_weights": weights = weights[:-1] + (weights[0],)
+            if self.mode == "wrong_weights": weights = tuple({**dict(weights), "checkpoint_dense": 1.0}.items())
+            return FusionRoutingDecision(route="raw", totals=totals, effective_weights=weights)
+
+    for mode in ("duplicate_totals", "wrong_total", "duplicate_weights", "wrong_weights"):
+        with pytest.raises(ValueError, match="routing policy decision"):
+            SixViewRanker(_CountingEncoder(), routing_policy=MutatedPolicy(mode)).rank(query="q", candidates=candidates)
+
+
+def test_explicit_policy_empty_and_duplicate_routing_keys_fail_closed():
+    class EmptyPolicy:
+        def __init__(self): self.calls = 0
+        def decide(self, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("empty policy invoked")
+
+    policy = EmptyPolicy()
+    with pytest.raises(RuntimeError, match="empty policy invoked"):
+        SixViewRanker(_CountingEncoder(), routing_policy=policy).rank(query="q", candidates=[])
+    assert policy.calls == 1
+    ranks = {view: {"a": 1, "b": 2} for view in SixViewRanker.weights}
+    with pytest.raises(ValueError, match="ranking_key"):
+        RawAnchoredP5Policy(0.0).decide(ranks=ranks, ranking_keys_by_id={"a": "duplicate", "b": "duplicate"}, rrf_k=60)
 
 
 def test_passage_views_are_cached_but_each_query_is_encoded_once_and_checkpoint_texts_deduplicate():

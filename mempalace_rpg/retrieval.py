@@ -134,20 +134,270 @@ def _ordered(scores: dict[str, float], ranking_keys: dict[str, str]) -> list[str
     )]
 
 
+SIX_VIEW_WEIGHTS = {
+    "raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0,
+    "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0,
+}
+RAW_EXPERT_WEIGHTS = {
+    "raw_bm25": 2.0, "observation_bm25": 0.0, "raw_dense": 1.0,
+    "observation_dense": 0.0, "checkpoint_dense": 0.0, "combo_dense": 0.0,
+}
+P5_EXPERT_WEIGHTS = {
+    "raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0,
+    "observation_dense": 2.0, "checkpoint_dense": 0.0, "combo_dense": 1.0,
+}
+
+
+@dataclass(frozen=True)
+class FusionRoutingDecision:
+    """Immutable, score-only result of a routing policy over precomputed ranks."""
+
+    route: str
+    totals: tuple[tuple[str, float], ...]
+    effective_weights: tuple[tuple[str, float], ...]
+    raw_totals: tuple[tuple[str, float], ...] = ()
+    p5_totals: tuple[tuple[str, float], ...] = ()
+    anchor_numerator: float | None = None
+    anchor_denominator: float | None = None
+    anchor_ratio: float | None = None
+    raw_top10_ranking_sha256: str | None = None
+    p5_top10_ranking_sha256: str | None = None
+    final_ranking_sha256: str | None = None
+    config_json: str | None = None
+    config_sha256: str | None = None
+
+    @property
+    def config(self) -> dict[str, Any] | None:
+        if self.config_json is None:
+            return None
+        try:
+            value = json.loads(self.config_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("routing policy config is invalid") from exc
+        if not isinstance(value, dict):
+            raise ValueError("routing policy config is invalid")
+        return value
+
+
+class FusionRoutingPolicy(Protocol):
+    """Score-only routing seam; implementations receive no query or candidate text."""
+
+    def decide(
+        self, *, ranks: dict[str, dict[str, int]], ranking_keys_by_id: dict[str, str], rrf_k: int
+    ) -> FusionRoutingDecision: ...
+
+
+class FixedSixViewPolicy:
+    """The historical fixed six-view adapter, available as an explicit seam."""
+
+    def decide(
+        self, *, ranks: dict[str, dict[str, int]], ranking_keys_by_id: dict[str, str], rrf_k: int
+    ) -> FusionRoutingDecision:
+        _validate_routing_inputs(ranks=ranks, ranking_keys_by_id=ranking_keys_by_id, rrf_k=rrf_k)
+        totals = _rrf_totals(ranks, SIX_VIEW_WEIGHTS, rrf_k)
+        return FusionRoutingDecision(
+            route="six_view", totals=tuple(totals.items()),
+            effective_weights=tuple(SIX_VIEW_WEIGHTS.items()),
+        )
+
+
+class RawAnchoredP5Policy:
+    """A single pre-registered raw-anchored gate between Raw and P5 experts."""
+
+    schema = "aerp4-raw-anchored-p5-v1"
+    policy = "raw_anchored_p5"
+
+    def __init__(self, tau: float) -> None:
+        value = self._validated_tau(tau)
+        object.__setattr__(self, "_tau", value)
+        object.__setattr__(self, "_tau_integrity_sha256", _digest({"tau": self._tau_receipt(value)}))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"tau", "_tau", "_tau_integrity_sha256"} and hasattr(self, "_tau"):
+            raise AttributeError("tau is read-only")
+        object.__setattr__(self, name, value)
+
+    @staticmethod
+    def _validated_tau(tau: Any) -> float:
+        if isinstance(tau, bool):
+            raise ValueError("tau must be numeric")
+        try:
+            value = float(tau)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("tau must be numeric") from exc
+        if math.isnan(value):
+            raise ValueError("tau must not be NaN")
+        return value
+
+    @staticmethod
+    def _tau_receipt(tau: float) -> float | str:
+        return tau if math.isfinite(tau) else ("+inf" if tau > 0 else "-inf")
+
+    def _tau_snapshot(self) -> float:
+        value = self._validated_tau(object.__getattribute__(self, "_tau"))
+        if _digest({"tau": self._tau_receipt(value)}) != object.__getattribute__(self, "_tau_integrity_sha256"):
+            raise ValueError("raw-anchored tau integrity mismatch")
+        return value
+
+    @property
+    def tau(self) -> float:
+        return self._tau_snapshot()
+
+    def _config(self, rrf_k: int, tau: float) -> dict[str, Any]:
+        return {
+            "schema": self.schema, "policy": self.policy, "tau": self._tau_receipt(tau),
+            "raw_weights": dict(RAW_EXPERT_WEIGHTS), "p5_weights": dict(P5_EXPERT_WEIGHTS),
+            "support_top_k": 10, "comparator": ">=",
+            "ordinary_sum_view_order": list(SIX_VIEW_WEIGHTS), "rrf_k": rrf_k,
+        }
+
+    def decide(
+        self, *, ranks: dict[str, dict[str, int]], ranking_keys_by_id: dict[str, str], rrf_k: int
+    ) -> FusionRoutingDecision:
+        tau = self._tau_snapshot()
+        ids = _validate_routing_inputs(ranks=ranks, ranking_keys_by_id=ranking_keys_by_id, rrf_k=rrf_k)
+        raw_totals = _rrf_totals(ranks, RAW_EXPERT_WEIGHTS, rrf_k)
+        p5_totals = _rrf_totals(ranks, P5_EXPERT_WEIGHTS, rrf_k)
+        limit = min(10, len(ids))
+        raw_top = _ordered(raw_totals, ranking_keys_by_id)[:limit]
+        p5_top = _ordered(p5_totals, ranking_keys_by_id)[:limit]
+        denominator = sum(raw_totals[identifier] for identifier in raw_top)
+        numerator = sum(raw_totals[identifier] for identifier in p5_top)
+        if not math.isfinite(numerator) or not math.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError("raw-anchored policy ratio is invalid")
+        anchor_ratio = numerator / denominator
+        if not math.isfinite(anchor_ratio):
+            raise ValueError("raw-anchored policy ratio is non-finite")
+        route, weights, totals = (
+            ("p5", P5_EXPERT_WEIGHTS, p5_totals)
+            if anchor_ratio >= tau else ("raw", RAW_EXPERT_WEIGHTS, raw_totals)
+        )
+        config = self._config(rrf_k, tau)
+        ranking_key_sha256 = {
+            identifier: hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest()
+            for identifier in ids
+        }
+        return FusionRoutingDecision(
+            route=route, totals=tuple(totals.items()), effective_weights=tuple(weights.items()),
+            raw_totals=tuple(raw_totals.items()), p5_totals=tuple(p5_totals.items()),
+            anchor_numerator=numerator, anchor_denominator=denominator, anchor_ratio=anchor_ratio,
+            raw_top10_ranking_sha256=_digest([ranking_key_sha256[identifier] for identifier in raw_top]),
+            p5_top10_ranking_sha256=_digest([ranking_key_sha256[identifier] for identifier in p5_top]),
+            final_ranking_sha256=_digest([ranking_key_sha256[identifier] for identifier in _ordered(totals, ranking_keys_by_id)]),
+            config_json=json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False),
+            config_sha256=_digest(config),
+        )
+
+
+def _validate_routing_inputs(
+    *, ranks: dict[str, dict[str, int]], ranking_keys_by_id: dict[str, str], rrf_k: int
+) -> list[str]:
+    if not isinstance(rrf_k, int) or isinstance(rrf_k, bool) or rrf_k < 0:
+        raise ValueError("routing rrf_k is invalid")
+    if set(ranks) != set(SIX_VIEW_WEIGHTS) or not ranking_keys_by_id:
+        raise ValueError("routing candidate universe must be non-empty and complete")
+    ids = list(ranking_keys_by_id)
+    if any(not isinstance(identifier, str) or not identifier or not isinstance(key, str) or not key for identifier, key in ranking_keys_by_id.items()) or len(set(ranking_keys_by_id.values())) != len(ranking_keys_by_id):
+        raise ValueError("routing ranking_key values must be unique non-empty strings")
+    expected = set(range(1, len(ids) + 1))
+    for view, view_ranks in ranks.items():
+        if set(view_ranks) != set(ids) or set(view_ranks.values()) != expected or any(not isinstance(rank, int) or isinstance(rank, bool) for rank in view_ranks.values()):
+            raise ValueError("routing ranks are invalid")
+    return ids
+
+
+def _rrf_totals(ranks: dict[str, dict[str, int]], weights: dict[str, float], rrf_k: int) -> dict[str, float]:
+    if set(weights) != set(SIX_VIEW_WEIGHTS) or any(isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight < 0.0 for weight in weights.values()):
+        raise ValueError("routing weights are invalid")
+    identifiers = list(next(iter(ranks.values())))
+    totals = {
+        identifier: sum(weights[view] / (rrf_k + ranks[view][identifier]) for view in SIX_VIEW_WEIGHTS)
+        for identifier in identifiers
+    }
+    if not all(math.isfinite(total) for total in totals.values()):
+        raise ValueError("weighted RRF score is non-finite")
+    return totals
+
+
+def _routing_pairs(value: Any, expected_keys: set[str], label: str) -> dict[str, float]:
+    if not isinstance(value, tuple) or len(value) != len(expected_keys):
+        raise ValueError("routing policy decision is invalid")
+    result: dict[str, float] = {}
+    for pair in value:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise ValueError("routing policy decision is invalid")
+        key, numeric = pair
+        if not isinstance(key, str) or key in result or isinstance(numeric, bool) or not isinstance(numeric, (int, float)) or not math.isfinite(numeric):
+            raise ValueError("routing policy decision is invalid")
+        result[key] = float(numeric)
+    if set(result) != expected_keys:
+        raise ValueError("routing policy decision is invalid")
+    return result
+
+
+def _validated_routing_decision(
+    decision: FusionRoutingDecision, *, ranks: dict[str, dict[str, int]], ranking_keys_by_id: dict[str, str], rrf_k: int
+) -> tuple[dict[str, float], dict[str, float]]:
+    if not isinstance(decision, FusionRoutingDecision):
+        raise ValueError("routing policy returned an invalid decision")
+    totals = _routing_pairs(decision.totals, set(ranking_keys_by_id), "totals")
+    weights = _routing_pairs(decision.effective_weights, set(SIX_VIEW_WEIGHTS), "weights")
+    expected_weights = {"six_view": SIX_VIEW_WEIGHTS, "raw": RAW_EXPERT_WEIGHTS, "p5": P5_EXPERT_WEIGHTS}.get(decision.route)
+    if expected_weights is None or weights != expected_weights:
+        raise ValueError("routing policy decision is invalid")
+    replayed = _rrf_totals(ranks, weights, rrf_k)
+    if totals != replayed:
+        raise ValueError("routing policy decision is invalid")
+    return totals, weights
+
+
+def _validate_raw_anchored_decision(
+    policy: RawAnchoredP5Policy, decision: FusionRoutingDecision, *, ranks: dict[str, dict[str, int]], ranking_keys_by_id: dict[str, str], rrf_k: int
+) -> tuple[dict[str, float], dict[str, float], list[str], list[str], dict[str, Any]]:
+    raw_totals = _routing_pairs(decision.raw_totals, set(ranking_keys_by_id), "raw totals")
+    p5_totals = _routing_pairs(decision.p5_totals, set(ranking_keys_by_id), "p5 totals")
+    expected_raw = _rrf_totals(ranks, RAW_EXPERT_WEIGHTS, rrf_k)
+    expected_p5 = _rrf_totals(ranks, P5_EXPERT_WEIGHTS, rrf_k)
+    if raw_totals != expected_raw or p5_totals != expected_p5:
+        raise ValueError("raw-anchored policy decision is invalid")
+    limit = min(10, len(ranking_keys_by_id))
+    raw_top = _ordered(expected_raw, ranking_keys_by_id)[:limit]
+    p5_top = _ordered(expected_p5, ranking_keys_by_id)[:limit]
+    numerator = sum(expected_raw[identifier] for identifier in p5_top)
+    denominator = sum(expected_raw[identifier] for identifier in raw_top)
+    ratio = numerator / denominator
+    tau = policy._tau_snapshot()
+    config = policy._config(rrf_k, tau)
+    ranking_key_sha256 = {
+        identifier: hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest()
+        for identifier in ranking_keys_by_id
+    }
+    totals = expected_p5 if ratio >= tau else expected_raw
+    if (
+        decision.anchor_numerator != numerator or decision.anchor_denominator != denominator
+        or decision.anchor_ratio != ratio or decision.config != config
+        or decision.config_sha256 != _digest(config)
+        or decision.route != ("p5" if ratio >= tau else "raw")
+        or decision.raw_top10_ranking_sha256 != _digest([ranking_key_sha256[identifier] for identifier in raw_top])
+        or decision.p5_top10_ranking_sha256 != _digest([ranking_key_sha256[identifier] for identifier in p5_top])
+        or decision.final_ranking_sha256 != _digest([ranking_key_sha256[identifier] for identifier in _ordered(totals, ranking_keys_by_id)])
+    ):
+        raise ValueError("raw-anchored policy decision is invalid")
+    return expected_raw, expected_p5, raw_top, p5_top, config
+
+
 class SixViewRanker:
     """Frozen weighted-RRF six-view ranker over already authorized candidates."""
 
-    weights = {
-        "raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0,
-        "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0,
-    }
+    weights = SIX_VIEW_WEIGHTS
     rrf_k = 60
 
-    def __init__(self, encoder: DenseEncoder, *, diagnostic_ledger: bool = False) -> None:
+    def __init__(self, encoder: DenseEncoder, *, diagnostic_ledger: bool = False, routing_policy: FusionRoutingPolicy | None = None) -> None:
         if type(diagnostic_ledger) is not bool:
             raise ValueError("diagnostic_ledger must be a bool")
         self.encoder = encoder
         self.diagnostic_ledger = diagnostic_ledger
+        self.routing_policy = routing_policy
         self._passage_cache: dict[tuple[str, str, str], tuple[tuple[float, ...], ...]] = {}
 
     def _encoder_identity(self) -> str:
@@ -194,9 +444,11 @@ class SixViewRanker:
         group_ids: list[str],
         ordered_groups: list[tuple[tuple[str, tuple[str | None, ...]], list[AuthorizedRetrievalCandidate]]],
         group_scores: dict[str, float],
+        effective_weights: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         """Build the benchmark-only, text-free replay ledger after ranking is frozen."""
         self._fcd1_validate_score_views(score_views)
+        weights = self.weights if effective_weights is None else effective_weights
         ranking_key_order = {
             candidate.source_event_id: index
             for index, candidate in enumerate(candidates, start=1)
@@ -271,7 +523,7 @@ class SixViewRanker:
                     "ranking_key_order": ranking_key_order[identifier],
                     "rank": rank,
                     "final_rrf": totals[identifier],
-                    "component_ranks": {name: ranks[name][identifier] for name in self.weights},
+                    "component_ranks": {name: ranks[name][identifier] for name in weights},
                     "component_rank_receipts": [
                         {
                             "view": name,
@@ -279,9 +531,9 @@ class SixViewRanker:
                             "ranking_key_sha256": ranking_key_sha256[identifier],
                             "rank": ranks[name][identifier],
                         }
-                        for name in self.weights
+                        for name in weights
                     ],
-                    "contributions": {name: self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights},
+                    "contributions": {name: weights[name] / (self.rrf_k + ranks[name][identifier]) for name in weights},
                 }
                 for rank, identifier in enumerate(ordered[:50], start=1)
             ],
@@ -298,6 +550,9 @@ class SixViewRanker:
         query_sha256 = hashlib.sha256(query.encode()).hexdigest()
         encoder_identity = self._encoder_identity()
         if not candidates:
+            if self.routing_policy is not None:
+                self.routing_policy.decide(ranks={}, ranking_keys_by_id={}, rrf_k=self.rrf_k)
+                raise ValueError("routing candidate universe must be non-empty")
             trace = {
                 "schema": "aerp2-product-six-view-v1",
                 "encoder_identity": encoder_identity,
@@ -378,9 +633,26 @@ class SixViewRanker:
             }
             for name, scores in score_views.items()
         }
-        totals = {identifier: sum(self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights) for identifier in ids}
-        if not all(math.isfinite(score) for score in totals.values()):
-            raise ValueError("weighted RRF score is non-finite")
+        effective_weights = self.weights
+        decision: FusionRoutingDecision | None = None
+        raw_audit: tuple[dict[str, float], dict[str, float], list[str], list[str], dict[str, Any]] | None = None
+        if self.routing_policy is None:
+            # Preserve the frozen default arithmetic and trace path exactly.
+            totals = {identifier: sum(self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights) for identifier in ids}
+            if not all(math.isfinite(score) for score in totals.values()):
+                raise ValueError("weighted RRF score is non-finite")
+        else:
+            decision = self.routing_policy.decide(
+                ranks=ranks, ranking_keys_by_id=ranking_keys_by_id, rrf_k=self.rrf_k,
+            )
+            totals, effective_weights = _validated_routing_decision(
+                decision, ranks=ranks, ranking_keys_by_id=ranking_keys_by_id, rrf_k=self.rrf_k,
+            )
+            if isinstance(self.routing_policy, RawAnchoredP5Policy):
+                raw_audit = _validate_raw_anchored_decision(
+                    self.routing_policy, decision, ranks=ranks,
+                    ranking_keys_by_id=ranking_keys_by_id, rrf_k=self.rrf_k,
+                )
         ordered = _ordered(totals, ranking_keys_by_id)
         ranking_key_sha256 = {
             identifier: hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest()
@@ -399,15 +671,15 @@ class SixViewRanker:
                 "source_event_id": identifier,
                 "ranking_key_sha256": ranking_key_sha256[identifier],
                 "final_rrf": totals[identifier],
-                "component_ranks": {name: ranks[name][identifier] for name in self.weights},
-                "contributions": {name: self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights},
+                "component_ranks": {name: ranks[name][identifier] for name in effective_weights},
+                "contributions": {name: effective_weights[name] / (self.rrf_k + ranks[name][identifier]) for name in effective_weights},
             }
             for identifier in ordered
         ]
         trace = {
             "schema": "aerp2-product-six-view-v1",
             "encoder_identity": encoder_identity,
-            "weights": dict(self.weights), "rrf_k": self.rrf_k,
+            "weights": dict(effective_weights), "rrf_k": self.rrf_k,
             "query_sha256": query_sha256,
             "input_sha256": input_sha256,
             "view_digests": {
@@ -416,15 +688,37 @@ class SixViewRanker:
             },
             "selected": selected,
         }
+        if isinstance(self.routing_policy, RawAnchoredP5Policy):
+            if decision is None or raw_audit is None or decision.anchor_ratio is None or decision.anchor_numerator is None or decision.anchor_denominator is None or decision.config_sha256 is None:
+                raise ValueError("raw-anchored policy decision is incomplete")
+            _raw_totals, _p5_totals, raw_top, p5_top, config = raw_audit
+            trace["aerp4_raw_anchored_p5"] = {
+                "schema": RawAnchoredP5Policy.schema,
+                "policy": RawAnchoredP5Policy.policy,
+                "config": config,
+                "config_sha256": decision.config_sha256,
+                "numerator": decision.anchor_numerator,
+                "denominator": decision.anchor_denominator,
+                "A": decision.anchor_ratio,
+                "raw_top10_ranking_sha256": _digest([ranking_key_sha256[identifier] for identifier in raw_top]),
+                "p5_top10_ranking_sha256": _digest([ranking_key_sha256[identifier] for identifier in p5_top]),
+                "route": decision.route,
+                "effective_weights": dict(effective_weights),
+                "final_ranking_sha256": _digest([ranking_key_sha256[identifier] for identifier in ordered]),
+            }
         if self.diagnostic_ledger:
             trace["fcd1_diagnostic_ledger"] = self._fcd1_diagnostic_ledger(
                 input_sha256=input_sha256, candidates=candidates,
                 ranking_key_sha256=ranking_key_sha256, score_views=score_views,
                 ranks=ranks, ranking_keys_by_id=ranking_keys_by_id, totals=totals,
                 ordered=ordered, group_ids=group_ids, ordered_groups=ordered_groups,
-                group_scores=group_scores,
+                group_scores=group_scores, effective_weights=effective_weights,
             )
         return RankingResult(ordered, totals, trace)
 
 
-__all__ = ["AuthorizedEventRanker", "AuthorizedRetrievalCandidate", "DenseEncoder", "RankingResult", "SixViewRanker", "structured_observation"]
+__all__ = [
+    "AuthorizedEventRanker", "AuthorizedRetrievalCandidate", "DenseEncoder",
+    "FixedSixViewPolicy", "FusionRoutingDecision", "FusionRoutingPolicy",
+    "RankingResult", "RawAnchoredP5Policy", "SixViewRanker", "structured_observation",
+]
