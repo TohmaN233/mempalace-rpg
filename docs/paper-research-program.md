@@ -36,6 +36,15 @@ interchangeable with the public-product result.  Track B has a protocol but no
 completed controlled story-generation experiment.  No current artifact is a
 paper-level result.
 
+The burned-data AERP-6 transition ledger is a read-only mechanism gate over the
+frozen staged LoCoMo artifact.  It records per-evidence six-view and cumulative
+full-order ranks, Top-10 boundary margins, raw-to-full transitions, the fixed
+no-checkpoint and joint-removal diagnostics, and separate identities for the
+published raw-fusion comparator versus the full-order raw prefix.  Its only
+router-related output is rank-only preparation evidence for the existing
+`RawAnchoredP5Policy`; it cannot select `tau`, alter live ranking, or make a
+confirmation claim.
+
 ## Track A: retrieval
 
 ### Frozen method and comparators
