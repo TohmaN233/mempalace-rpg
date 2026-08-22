@@ -117,11 +117,14 @@ def test_strict_sixview_trace_rejects_view_and_ranking_key_corruption():
 def test_trace_identity_sets_and_empty_selection_fail_closed():
     mapping = {"e": "dialog", "other": "other-dialog"}
     ranking = {"schema": "aerp2-product-six-view-v1", "query_sha256": "a" * 64, "input_sha256": "b" * 64, "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS}, "encoder_identity": "encoder", "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS), "rrf_k": 60, "selected": [{"source_event_id": "e", "ranking_key_sha256": harness._sha256(b"dialog")}]} 
-    trace = {"retrieval_ranking": ranking, "selected_evidence_ids": ["e"], "authorized_candidate_ids": ["e"], "denied_partitions": [], "candidate_generation": {"candidate_count": 1}, "candidates": [{"source_event_id": "e", "decision": "allow"}], "returned_spans": []}
+    trace = {"retrieval_ranking": ranking, "selected_evidence_ids": ["e"], "authorized_candidate_ids": list(mapping), "denied_partitions": [], "candidate_generation": {"candidate_count": 2}, "candidates": [{"source_event_id": "e", "decision": "allow"}], "returned_spans": []}
     lineage = [{"seed_ledger": {"forbidden_field_counts": {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": "d" * 64, "ranker_texts_sha256": "e" * 64}}]
     summary = harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": ["dialog"]}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=2)
+    assert summary["checks"]["trace_identity_sets"]
+    trace["candidates"] = [{"source_event_id": "other", "decision": "allow"}]
+    summary = harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": ["dialog"]}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=2)
     assert not summary["checks"]["trace_identity_sets"]
-    trace["authorized_candidate_ids"] = list(mapping); trace["candidates"] = [{"source_event_id": key, "decision": "allow"} for key in mapping]; trace["candidate_generation"] = {"candidate_count": 2}; trace["selected_evidence_ids"] = []; ranking["selected"] = []
+    trace["candidates"] = []; trace["selected_evidence_ids"] = []; ranking["selected"] = []
     summary = harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": []}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=2)
     assert not summary["checks"]["nonempty_selection"]
 

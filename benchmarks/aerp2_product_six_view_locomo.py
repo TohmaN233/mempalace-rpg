@@ -331,7 +331,16 @@ def summarize_product_safety(*, traces: dict[str, Any], product_rankings: dict[s
         candidates = trace.get("candidates") if isinstance(trace, dict) else None
         candidate_ids = [row.get("source_event_id") for row in candidates] if isinstance(candidates, list) and all(isinstance(row, dict) for row in candidates) else []
         selected_row_ids = [row.get("source_event_id") for row in selected_rows] if isinstance(selected_rows, list) and all(isinstance(row, dict) for row in selected_rows) else []
-        identity_ok = isinstance(authorized, list) and len(authorized) == len(set(authorized)) and set(authorized) == set(mapping) and isinstance(candidates, list) and len(candidate_ids) == len(set(candidate_ids)) and set(candidate_ids) == set(mapping)
+        identity_ok = (
+            isinstance(authorized, list)
+            and len(authorized) == len(set(authorized))
+            and set(authorized) == set(mapping)
+            and isinstance(candidates, list)
+            and isinstance(selected_ids, list)
+            and len(candidate_ids) == len(set(candidate_ids))
+            and candidate_ids == selected_ids
+            and all(row.get("decision") == "allow" for row in candidates)
+        )
         identity_complete += int(identity_ok)
         nonempty_ok = isinstance(selected_ids, list) and bool(selected_ids) and isinstance(selected_rows, list) and bool(selected_rows) and selected_row_ids == selected_ids
         nonempty_selection += int(nonempty_ok)
@@ -719,7 +728,9 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
         question_audits = build_question_audits(question_rows=question_rows, scorer=scorer, rankings=rankings, source_pool_rankings=source_pool_rankings, traces=traces, product_event_maps=product_event_maps, lineage_by_conversation=lineage_by_conversation)
         diagnostics = split_diagnostics(question_rows, scorer_splits)
         advance_phase(phases, "score_gate")
-        if not safety["pass"]: raise RuntimeError("product safety/trace summary failed")
+        if not safety["pass"]:
+            failed = sorted(name for name, passed in safety["checks"].items() if passed is not True)
+            raise RuntimeError(f"product safety/trace summary failed: {failed}")
         verify_frozen_input(dataset_receipt); verify_frozen_input(artifact_receipt)
         state_after = aerp1.git_state(ROOT)
         if not aerp1.same_git_state(state_before, state_after): raise RuntimeError("worktree changed during quality run")
