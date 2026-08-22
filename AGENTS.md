@@ -31,6 +31,10 @@ retrieval with weights `2.0/0.5/1.0/2.0/2.0/1.0` and weighted RRF `k=60`.
 Checkpoint roll-ups are chronological and may cross actors only when their
 security-policy identity is the same. A caller may provide
 `payload.retrieval_checkpoint_id`; otherwise the source scene is the checkpoint.
+For rebuild-stable product ranking, callers should provide a non-empty unique
+`payload.retrieval_ranking_key` (LoCoMo uses its opaque dialog ID). The kernel
+falls back to `source_event_id` for ordinary compatibility, but UUID fallbacks
+cannot make cross-rebuild ranking ties or digests stable.
 
 Dense runtimes are injected through separate `encode_query` and
 `encode_passages` methods plus a stable encoder identity. Passage vectors are

@@ -144,10 +144,12 @@ def _candidate(
     observation: str | None = None,
     checkpoint: str = "checkpoint",
     scene_time: int = 1,
+    ranking_key: str | None = None,
 ) -> AuthorizedRetrievalCandidate:
+    ranking_key = ranking_key or identifier
     return AuthorizedRetrievalCandidate(
         identifier, "scene", raw or identifier + " raw", observation or identifier + " observation",
-        checkpoint, policy, (scene_time, identifier),
+        checkpoint, policy, (scene_time, ranking_key), ranking_key,
     )
 
 
@@ -190,6 +192,75 @@ def test_cjk_tokenization_matches_inside_a_cjk_run_and_rollups_are_chronological
     ]
     ranker.rank(query="q", candidates=same_policy)
     assert ["early observation\nlate observation"] in encoder.passage_batches
+
+
+def test_ranking_key_makes_tied_rankings_and_digests_independent_of_event_uuid():
+    first = [
+        AuthorizedRetrievalCandidate("uuid-first-a", "scene-a", "alpha", "alpha observation", "session", ("canonical", "public"), (1, "dialog-a"), ranking_key="dialog-a"),
+        AuthorizedRetrievalCandidate("uuid-first-b", "scene-b", "beta", "beta observation", "session", ("canonical", "public"), (2, "dialog-b"), ranking_key="dialog-b"),
+    ]
+    rebuilt = [
+        AuthorizedRetrievalCandidate("uuid-rebuilt-b", "scene-b", "beta", "beta observation", "session", ("canonical", "public"), (2, "dialog-b"), ranking_key="dialog-b"),
+        AuthorizedRetrievalCandidate("uuid-rebuilt-a", "scene-a", "alpha", "alpha observation", "session", ("canonical", "public"), (1, "dialog-a"), ranking_key="dialog-a"),
+    ]
+
+    first_result = SixViewRanker(_CountingEncoder()).rank(query="tie", candidates=first)
+    rebuilt_result = SixViewRanker(_CountingEncoder()).rank(query="tie", candidates=rebuilt)
+    first_keys = {candidate.source_event_id: candidate.ranking_key for candidate in first}
+    rebuilt_keys = {candidate.source_event_id: candidate.ranking_key for candidate in rebuilt}
+
+    assert [first_keys[event_id] for event_id in first_result.ranked_event_ids] == [rebuilt_keys[event_id] for event_id in rebuilt_result.ranked_event_ids] == ["dialog-a", "dialog-b"]
+    assert first_result.trace["input_sha256"] == rebuilt_result.trace["input_sha256"]
+    assert first_result.trace["view_digests"] == rebuilt_result.trace["view_digests"]
+    assert "dialog-a" not in str(first_result.trace["selected"])
+
+
+def test_duplicate_ranking_key_fails_closed():
+    with pytest.raises(ValueError, match="ranking_key"):
+        SixViewRanker(_CountingEncoder()).rank(query="q", candidates=[
+            AuthorizedRetrievalCandidate("event-a", "scene", "one", "one", "session", ("canonical", "public"), (1, "same"), ranking_key="same"),
+            AuthorizedRetrievalCandidate("event-b", "scene", "two", "two", "session", ("canonical", "public"), (2, "same"), ranking_key="same"),
+        ])
+
+
+def test_blank_ranking_key_fails_closed():
+    with pytest.raises(ValueError, match="ranking_key"):
+        SixViewRanker(_CountingEncoder()).rank(
+            query="q",
+            candidates=[AuthorizedRetrievalCandidate(
+                "event", "scene", "text", "observation", "session",
+                ("canonical", "public"), (1, "ignored"), ranking_key=" ",
+            )],
+        )
+
+
+def test_kernel_uses_payload_ranking_key_and_falls_back_to_source_event_id(tmp_path):
+    spy = _SpyRanker()
+    with RpgMemoryKernel(db_path=str(tmp_path / "ranking-key.sqlite3"), retrieval_ranker=spy) as kernel:
+        kernel.commit_scene(campaign_id="c", scene_id="explicit", in_world_time="1", transcript="EXPLICIT", events=[_event("EXPLICIT", payload={"retrieval_ranking_key": "opaque-dialog-1"})])
+        kernel.commit_scene(campaign_id="c", scene_id="fallback", in_world_time="2", transcript="FALLBACK", events=[_event("FALLBACK")])
+        kernel.build_memory_pack(campaign_id="c", actor_id="hero", actor_type="npc", query="q")
+
+    candidates_by_text = {candidate.raw_text: candidate for candidate in spy.seen}
+    assert candidates_by_text["EXPLICIT"].ranking_key == "opaque-dialog-1"
+    assert candidates_by_text["FALLBACK"].ranking_key == candidates_by_text["FALLBACK"].source_event_id
+    assert candidates_by_text["FALLBACK"].checkpoint_key == "fallback"
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("retrieval_ranking_key", ""),
+    ("retrieval_ranking_key", 42),
+    ("retrieval_checkpoint_id", " "),
+    ("retrieval_checkpoint_id", 42),
+])
+def test_present_malformed_product_ranking_payload_keys_fail_closed(tmp_path, field, value):
+    spy = _SpyRanker()
+    with RpgMemoryKernel(db_path=str(tmp_path / f"{field}-{type(value).__name__}.sqlite3"), retrieval_ranker=spy) as kernel:
+        kernel.commit_scene(campaign_id="c", scene_id="scene", in_world_time="1", transcript="EVENT", events=[_event("EVENT", payload={field: value})])
+        with pytest.raises(ValueError, match=field):
+            kernel.build_memory_pack(campaign_id="c", actor_id="hero", actor_type="npc", query="q")
+
+    assert spy.calls == 0
 
 
 def test_kernel_trims_selected_trace_to_packed_evidence(tmp_path):

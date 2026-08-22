@@ -378,6 +378,12 @@ stable identity; importing the retrieval module does not start ONNX or Chroma.
 The ranking trace contains hashes, ranks, finite scores/contributions, and only
 packed evidence IDs, never transcript text.
 
+For rebuild-stable rank ties and ranking digests, set a unique, non-empty
+`payload.retrieval_ranking_key` on each source event (for example, LoCoMo's
+opaque dialog ID). If omitted, the kernel falls back to `source_event_id` for
+ordinary compatibility; generated UUIDs therefore cannot provide stable
+cross-rebuild ordering.
+
 The release claim is intentionally gated by a frozen annotation-free LoCoMo
 run. Product Six-View must have zero unauthorized output, complete trace
 coverage, beat the strongest raw-only control by at least 5 percentage points

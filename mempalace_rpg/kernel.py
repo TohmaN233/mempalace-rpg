@@ -1722,10 +1722,20 @@ class RpgMemoryKernel:
                 "truth_status", "visibility", "branch_id", "branch_status",
                 "access_owner_id", "access_scope_id", "belief_owner_id", "witness_set_json",
             ))
-            checkpoint = payload.get("retrieval_checkpoint_id")
-            if not isinstance(checkpoint, str) or not checkpoint.strip():
+            if "retrieval_checkpoint_id" not in payload:
                 checkpoint = str(row["scene_id"])
+            else:
+                checkpoint = payload["retrieval_checkpoint_id"]
+                if not isinstance(checkpoint, str) or not checkpoint.strip():
+                    raise ValueError("malformed product retrieval_checkpoint_id")
             checkpoint = checkpoint.strip()
+            if "retrieval_ranking_key" not in payload:
+                ranking_key = event_id
+            else:
+                ranking_key = payload["retrieval_ranking_key"]
+                if not isinstance(ranking_key, str) or not ranking_key.strip():
+                    raise ValueError("malformed product retrieval_ranking_key")
+            ranking_key = ranking_key.strip()
             summary = str(row["summary"] or "")
             raw = str(row["source_span"] or summary)
             candidates.append(AuthorizedRetrievalCandidate(
@@ -1739,7 +1749,8 @@ class RpgMemoryKernel:
                     in_world_time=row["in_world_time"], location_id=row["location_id"],
                 ),
                 checkpoint_key=checkpoint, policy_tuple=policy_tuple,
-                chronological_order_key=(int(row["scene_time_sort"]), event_id),
+                chronological_order_key=(int(row["scene_time_sort"]), ranking_key),
+                ranking_key=ranking_key,
             ))
         result = self.retrieval_ranker.rank(query=query, candidates=candidates)
         if not isinstance(result, RankingResult):

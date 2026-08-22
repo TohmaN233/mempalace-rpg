@@ -23,6 +23,7 @@ class AuthorizedRetrievalCandidate:
     checkpoint_key: str
     policy_tuple: tuple[str | None, ...]
     chronological_order_key: tuple[int, str]
+    ranking_key: str
 
 
 @dataclass(frozen=True)
@@ -127,8 +128,10 @@ def _validated_vectors(values: Any, expected_count: int, label: str) -> list[lis
     return output
 
 
-def _ordered(scores: dict[str, float]) -> list[str]:
-    return [identifier for identifier, _score in sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))]
+def _ordered(scores: dict[str, float], ranking_keys: dict[str, str]) -> list[str]:
+    return [identifier for identifier, _score in sorted(
+        scores.items(), key=lambda pair: (-pair[1], ranking_keys[pair[0]])
+    )]
 
 
 class SixViewRanker:
@@ -191,6 +194,14 @@ class SixViewRanker:
         ids = [candidate.source_event_id for candidate in candidates]
         if len(ids) != len(set(ids)) or any(not identifier for identifier in ids):
             raise ValueError("ranker candidates must have unique non-empty source_event_id values")
+        ranking_keys = [candidate.ranking_key for candidate in candidates]
+        if any(not isinstance(key, str) or not key.strip() for key in ranking_keys):
+            raise ValueError("ranker candidates must have unique non-empty ranking_key values")
+        if len(ranking_keys) != len(set(ranking_keys)):
+            raise ValueError("ranker candidates must have unique non-empty ranking_key values")
+        candidates = sorted(candidates, key=lambda candidate: candidate.ranking_key)
+        ids = [candidate.source_event_id for candidate in candidates]
+        ranking_keys_by_id = {candidate.source_event_id: candidate.ranking_key for candidate in candidates}
         query_vector = _validated_vectors([self.encoder.encode_query(query)], 1, "query")[0]
         raw = [candidate.raw_text for candidate in candidates]
         observation = [candidate.observation for candidate in candidates]
@@ -203,7 +214,16 @@ class SixViewRanker:
             groups.setdefault((checkpoint, candidate.policy_tuple), []).append(candidate)
         ordered_groups = sorted(groups.items(), key=lambda item: _digest([item[0][0], list(item[0][1])]))
         group_ids = ["group:" + _digest([key[0], list(key[1])]) for key, _members in ordered_groups]
-        group_texts = ["\n".join(member.observation for member in sorted(members, key=lambda member: member.chronological_order_key)) for _key, members in ordered_groups]
+        group_texts = [
+            "\n".join(
+                member.observation
+                for member in sorted(
+                    members,
+                    key=lambda member: (member.chronological_order_key[0], member.ranking_key),
+                )
+            )
+            for _key, members in ordered_groups
+        ]
         unique_group_texts = list(dict.fromkeys(group_texts))
         unique_group_vectors = self._passage_vectors(view="checkpoint", texts=unique_group_texts, encoder_identity=encoder_identity)
         group_vectors_by_text = dict(zip(unique_group_texts, unique_group_vectors))
@@ -220,14 +240,21 @@ class SixViewRanker:
             "checkpoint_dense": checkpoint_scores,
             "combo_dense": self._dense_scores(query_vector, self._passage_vectors(view="combo", texts=combo, encoder_identity=encoder_identity), ids, "combo"),
         }
-        ranks = {name: {identifier: rank for rank, identifier in enumerate(_ordered(scores), start=1)} for name, scores in score_views.items()}
+        ranks = {
+            name: {
+                identifier: rank
+                for rank, identifier in enumerate(_ordered(scores, ranking_keys_by_id), start=1)
+            }
+            for name, scores in score_views.items()
+        }
         totals = {identifier: sum(self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights) for identifier in ids}
         if not all(math.isfinite(score) for score in totals.values()):
             raise ValueError("weighted RRF score is non-finite")
-        ordered = _ordered(totals)
+        ordered = _ordered(totals, ranking_keys_by_id)
         selected = [
             {
                 "source_event_id": identifier,
+                "ranking_key_sha256": hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest(),
                 "final_rrf": totals[identifier],
                 "component_ranks": {name: ranks[name][identifier] for name in self.weights},
                 "contributions": {name: self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights},
@@ -239,8 +266,18 @@ class SixViewRanker:
             "encoder_identity": encoder_identity,
             "weights": dict(self.weights), "rrf_k": self.rrf_k,
             "query_sha256": query_sha256,
-            "input_sha256": _digest([{"id": candidate.source_event_id, "raw_sha256": hashlib.sha256(candidate.raw_text.encode()).hexdigest(), "observation_sha256": hashlib.sha256(candidate.observation.encode()).hexdigest(), "checkpoint": candidate.checkpoint_key.strip(), "policy": candidate.policy_tuple, "chronological_order_key": candidate.chronological_order_key} for candidate in candidates]),
-            "view_digests": {name: _digest(_ordered(scores)) for name, scores in score_views.items()},
+            "input_sha256": _digest([{
+                "ranking_key": candidate.ranking_key,
+                "raw_sha256": hashlib.sha256(candidate.raw_text.encode()).hexdigest(),
+                "observation_sha256": hashlib.sha256(candidate.observation.encode()).hexdigest(),
+                "checkpoint": candidate.checkpoint_key.strip(),
+                "policy": candidate.policy_tuple,
+                "scene_time_sort": candidate.chronological_order_key[0],
+            } for candidate in candidates]),
+            "view_digests": {
+                name: _digest([ranking_keys_by_id[identifier] for identifier in _ordered(scores, ranking_keys_by_id)])
+                for name, scores in score_views.items()
+            },
             "selected": selected,
         })
 
