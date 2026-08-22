@@ -92,6 +92,18 @@ Paper statistics must report question-macro and conversation-weighted estimands
 separately; the existing conversation bootstrap must not be presented as an
 interval for a differently weighted point estimate.
 
+## Paper research program
+
+The paper program is split into independently gated retrieval and story-generation
+tracks.  The authoritative protocol, data roles, original-product comparison
+semantics, success thresholds, and paper-ready definition live in
+`docs/paper-research-program.md`.  Do not call the original repository's direct
+Chroma benchmark candidate the MemPalace public product: the product comparison
+must execute `palace.get_collection(...).upsert(...)` followed by
+`searcher.search_memories(...)`.  Do not use LongMemEval-V2 as an official
+evidence-R@10 dataset because its public package omits answer-bearing evidence
+annotations.
+
 ## Verification
 
 Run `python -m pytest -q`, including `tests/test_aerp1_authorized_evidence_audit.py`

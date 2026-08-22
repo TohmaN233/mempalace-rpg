@@ -4,11 +4,14 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import mempalace_rpg.kernel as kernel_module
 from mempalace_rpg import RpgMemoryKernel, SceneEventInput
 from mempalace_rpg.maintenance import backup, delete_after, delete_scenes, restore, sync_branch
 
 
-def test_backup_restore_and_delete_after(tmp_path):
+def test_backup_restore_and_delete_after(tmp_path, monkeypatch):
+    clock = {"now": "2026-01-01T00:00:00+00:00"}
+    monkeypatch.setattr(kernel_module, "_utcnow", lambda: clock["now"])
     db = tmp_path / "rpg.sqlite3"
     kernel = RpgMemoryKernel(str(db))
     old_scene = kernel.commit_scene(
@@ -23,7 +26,8 @@ def test_backup_restore_and_delete_after(tmp_path):
     backup_result = backup(str(db))
     assert Path(backup_result["db_backup"]).exists()
 
-    cutoff = datetime.now(timezone.utc).isoformat()
+    cutoff = "2026-01-01T00:00:01+00:00"
+    clock["now"] = "2026-01-01T00:00:02+00:00"
     new_scene = kernel.commit_scene(
         scene_id="new_scene",
         campaign_id="c",
