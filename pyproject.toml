@@ -39,6 +39,9 @@ dev = [
   "pytest>=7.0",
   "ruff==0.15.15",
 ]
+benchmark = [
+  "ijson>=3.2,<4",
+]
 
 [build-system]
 requires = ["hatchling"]

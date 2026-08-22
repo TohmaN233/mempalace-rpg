@@ -250,6 +250,8 @@ def _validate_study(study: Mapping[str, Any]) -> None:
     if producer["retrieval_implementation_sha256"] != retrieval["implementation_sha256"]: raise ValueError("producer/retrieval implementation mismatch")
     splits = _mapping(study["splits"], "study.splits"); _exact_keys(splits, {"source_separated_crosswalk_sha256", "question_random_split"}, "study.splits"); _token(splits["source_separated_crosswalk_sha256"], "study split crosswalk")
     if splits["question_random_split"] is not False: raise ValueError("question-random split is forbidden")
+    joint_crosswalk = _sha({partition: _partition_spec(study, partition)["crosswalk_sha256"] for partition in ("train", "dev")})
+    if splits["source_separated_crosswalk_sha256"] != joint_crosswalk: raise ValueError("study split crosswalk joint digest mismatch")
     analyzers = _mapping(study["analyzers"], "study.analyzers"); _exact_keys(analyzers, {"gate", "prefreeze", "label", "guardrail"}, "study.analyzers")
     for key in analyzers: _analyzer(study, key)
     slots = _mapping(study["output_slots"], "study.output_slots"); _exact_keys(slots, {"train_prefreeze", "dev_prefreeze", "tau_select", "dev_eval"}, "study.output_slots")

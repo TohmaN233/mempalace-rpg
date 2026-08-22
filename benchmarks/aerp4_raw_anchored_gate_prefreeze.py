@@ -51,13 +51,14 @@ def _production_trace(value:Any, *, route:str)->dict[str,Any]:
         expected={view:weights[view]/(60+ranks[view]) for view in VIEWS}
         if any(_finite(contrib[view],"contribution") != expected[view] for view in VIEWS):raise ValueError("contribution replay mismatch")
         if final != sum(expected[view] for view in VIEWS):raise ValueError("final RRF replay mismatch")
-        if final >= previous:raise ValueError("selected ordering tie/unverifiable stable order")
+        if final > previous:raise ValueError("selected scores are not non-increasing")
+        if i == 10 and not previous > final:raise ValueError("selected Top10 cutoff tie is unprovable")
         previous=final
         for view in VIEWS:rank_vectors[view].append(ranks[view])
         tokens.append(token)
     if not tokens:raise ValueError("selected must retain full authorized universe")
     expected_ranks=set(range(1,len(tokens)+1))
-    if any(set(values)!=expected_ranks for values in rank_vectors.values()):raise ValueError("selected view ranks are not full-universe permutations")
+    if any(set(values)!=expected_ranks for values in rank_vectors.values()):raise ValueError("selected tie/unverifiable view ranks are not full-universe permutations")
     if r["final_ranking_sha256"]!=_sha(tokens):raise ValueError(f"{route} final ranking digest mismatch")
     if route=="raw" and r["raw_top10_ranking_sha256"]!=_sha(tokens[:10]):raise ValueError("raw selected order does not match raw top10")
     if route=="p5" and r["p5_top10_ranking_sha256"]!=_sha(tokens[:10]):raise ValueError("p5 selected order does not match p5 top10")
