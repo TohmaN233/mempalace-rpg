@@ -25,9 +25,10 @@ def _safety() -> dict:
 
 
 def _sentinels(manifest: str = "a" * 64) -> dict:
-    def row(mode: str, digest: str) -> dict:
-        return {"schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": manifest, "mode": mode, "input_count": 1, "input_sha256": digest, "embedding_sha256": digest, "dtype": "float32-little-endian", "shape": [1, 3]}
-    return {"query": row("query", "d" * 64), "passage": row("passage", "e" * 64)}
+    def row(role: str, native_mode: str, digest: str) -> dict:
+        native = {"schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": manifest, "mode": native_mode, "input_count": 1, "input_sha256": digest, "embedding_sha256": digest, "dtype": "float32-little-endian", "shape": [1, 3]}
+        return {"schema": harness.STAGED_ENCODER_SENTINEL_PROJECTION_SCHEMA, "role": role, "native_receipt_sha256": harness._canonical(native), **{key: value for key, value in native.items() if key not in {"schema", "mode"}}}
+    return {"input_encoder": row("input", "query", "d" * 64), "passage_encoder": row("passage", "passage", "e" * 64)}
 
 
 def _snapshot(manifest: str = "a" * 64) -> dict:
@@ -545,6 +546,33 @@ def test_prefreeze_receipt_validator_requires_pinned_aggregate_contract_and_raw_
     with pytest.raises(ValueError, match="raw parity"):
         harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state)
     receipt["stream_receipts"]["raw_component_parity"]["arms"]["raw_dense"]["top10_order_exact_questions"] = 1986
+    expected_sentinels = json.loads(json.dumps(receipt["encoder_sentinels"]))
+    assert harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state, expected_sentinels=expected_sentinels) == streams
+    receipt["encoder_sentinels"]["input_encoder"]["native_receipt_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="model provenance"):
+        harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state)
+    with pytest.raises(ValueError, match="model provenance"):
+        harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state, expected_sentinels=expected_sentinels)
+    receipt["encoder_sentinels"] = expected_sentinels
+    coordinated_sentinels = json.loads(json.dumps(expected_sentinels))
+    coordinated_input = coordinated_sentinels["input_encoder"]
+    coordinated_input["input_sha256"] = "0" * 64
+    coordinated_native = {
+        "schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": coordinated_input["manifest_sha256"],
+        "mode": "query", "input_count": coordinated_input["input_count"],
+        "input_sha256": coordinated_input["input_sha256"], "embedding_sha256": coordinated_input["embedding_sha256"],
+        "dtype": coordinated_input["dtype"], "shape": coordinated_input["shape"],
+    }
+    coordinated_input["native_receipt_sha256"] = harness._canonical(coordinated_native)
+    receipt["encoder_sentinels"] = coordinated_sentinels
+    assert harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state) == streams
+    with pytest.raises(ValueError, match="sentinel mismatch"):
+        harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state, expected_sentinels=expected_sentinels)
+    receipt["encoder_sentinels"] = expected_sentinels
+    receipt["encoder_sentinels"]["input_encoder"] = {"schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": "f" * 64, "mode": "input", "input_count": 1, "input_sha256": "d" * 64, "embedding_sha256": "d" * 64, "dtype": "float32-little-endian", "shape": [1, 3]}
+    with pytest.raises(ValueError, match="model provenance"):
+        harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state)
+    receipt["encoder_sentinels"] = expected_sentinels
     receipt["encoder_identity"] = "A" * 64
     with pytest.raises(ValueError, match="identity digest"):
         harness.validate_prefreeze_receipt(receipt, manifest_sha256="d" * 64, dataset_sha256="e" * 64, expected_git_state=state)
@@ -584,6 +612,53 @@ def test_prefreeze_output_safety_rejects_label_or_text_fields() -> None:
     harness.validate_prefreeze_output_safety({"stream_receipts": {"fresh_streams_sha256": "a" * 64}})
     with pytest.raises(ValueError, match="forbidden"):
         harness.validate_prefreeze_output_safety({"query": "x"})
+
+
+def test_staged_sentinel_receipt_is_output_safe_without_relaxing_query_ban() -> None:
+    """Prefreeze must serialize the legacy probes under ID-free safe keys."""
+    class Hash:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": "a" * 64,
+                "mode": self.mode, "input_count": 1, "input_sha256": "b" * 64,
+                "embedding_sha256": "c" * 64, "dtype": "float32-little-endian", "shape": [1, 3],
+            }
+
+    class Encoder:
+        def sentinel_embedding_hash(self, _values: list[str], *, mode: str) -> Hash:
+            return Hash(mode)
+
+    legacy_runtime, legacy_sentinels = harness.encoder_sentinel_receipts(Encoder())
+    staged_runtime, staged_sentinels = harness.encoder_sentinel_receipts(Encoder(), staged_output=True)
+    producer_shaped_receipt = {
+        "schema": harness.PREFREEZE_SCHEMA, "version": 1, "status": "complete", "manifest_sha256": "d" * 64,
+        "phase_ledger": list(harness.PREFREEZE_PHASES), "input_freeze": {}, "git_state_before": {}, "git_state_after": {},
+        "source_repo": {}, "historical_source": {}, "encoder_identity": "e" * 64,
+        "adapter_implementation_sha256": "f" * 64, "implementation_sha256": {}, "model_runtime": {},
+        "encoder_sentinels": staged_sentinels, "encoder_snapshot_pair": {}, "stream_receipts": {},
+        "safety_summary": {}, "claim_boundary": "bounded",
+    }
+    harness.validate_prefreeze_output_safety(producer_shaped_receipt)
+    assert staged_runtime == legacy_runtime
+    assert set(legacy_sentinels) == {"query", "passage"}
+    assert legacy_sentinels["query"]["mode"] == "query"
+    assert set(staged_sentinels) == {"input_encoder", "passage_encoder"}
+    input_projection = staged_sentinels["input_encoder"]
+    assert input_projection["schema"] == harness.STAGED_ENCODER_SENTINEL_PROJECTION_SCHEMA
+    assert input_projection["role"] == "input"
+    assert "mode" not in input_projection
+    assert input_projection["native_receipt_sha256"] == harness._canonical(legacy_runtime["query"])
+    assert harness._validate_native_encoder_sentinel_shape(legacy_runtime["query"], mode="query", manifest_sha256="a" * 64, embedding_dimension=3)
+    forged_native = {**legacy_runtime["query"], "mode": "input"}
+    assert not harness._validate_native_encoder_sentinel_shape(forged_native, mode="input", manifest_sha256="a" * 64, embedding_dimension=3)
+    assert input_projection["native_receipt_sha256"] != harness._canonical(forged_native)
+    with pytest.raises(ValueError, match="forbidden"):
+        harness.validate_prefreeze_output_safety({"encoder_sentinels": {"query": staged_sentinels["input_encoder"]}})
+    with pytest.raises(ValueError, match="forbidden"):
+        harness.validate_prefreeze_output_safety({"encoder_sentinels": {"input_encoder": {"query": "x"}}})
 
 
 def test_shared_sentinel_receipt_helper_has_one_frozen_probe_contract() -> None:
@@ -672,7 +747,7 @@ def test_staged_receipt_drift_blocks_artifact_and_scorer_label_firewall(tmp_path
     monkeypatch.setattr(harness, "_historical_modules", historical_modules)
     monkeypatch.setattr(harness, "adapter_implementation_digest", lambda: "f" * 64)
     monkeypatch.setattr(harness, "encoder_runtime_provider_receipt", lambda *_args: {})
-    monkeypatch.setattr(harness, "encoder_sentinel_receipts", lambda _encoder: ({"query": {}}, {"query": {}}))
+    monkeypatch.setattr(harness, "encoder_sentinel_receipts", lambda _encoder, **_kwargs: ({"query": {}}, {"input_encoder": {}}))
     monkeypatch.setattr(harness.aerp1, "_conversation_items", lambda _retrieval: {f"conversation-{index}": [f"item-{index}"] for index in range(10)})
     fake_fresh = SimpleNamespace(rankings={"product_six_view": {}}, source_pool_rankings={}, traces={}, lineage=[], lineage_by_conversation={}, legacy_event_maps={}, product_event_maps={}, question_conversations={})
     monkeypatch.setattr(harness, "freeze_fresh_streams", lambda **_kwargs: fake_fresh)

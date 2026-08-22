@@ -439,9 +439,10 @@ def test_staged_prefreeze_receipt_binds_product_stream_and_both_input_receipts(m
     artifact["adapter_implementation_sha256"] = "3" * 64
     artifact["encoder_identity"] = "4" * 64
     artifact["model_runtime"] = {"onnx_sha256": "5" * 64, "embedding_dimension": 3, "session_providers": ["CPUExecutionProvider"], "onnxruntime_version": "1"}
-    def sentinel(mode: str, digest: str) -> dict:
-        return {"schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": "2" * 64, "mode": mode, "input_count": 1, "input_sha256": digest, "embedding_sha256": digest, "dtype": "float32-little-endian", "shape": [1, 3]}
-    artifact["encoder_sentinels"] = {"query": sentinel("query", "5" * 64), "passage": sentinel("passage", "6" * 64)}
+    def sentinel(role: str, native_mode: str, digest: str) -> dict:
+        native = {"schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": "2" * 64, "mode": native_mode, "input_count": 1, "input_sha256": digest, "embedding_sha256": digest, "dtype": "float32-little-endian", "shape": [1, 3]}
+        return {"schema": harness.STAGED_ENCODER_SENTINEL_PROJECTION_SCHEMA, "role": role, "native_receipt_sha256": harness._canonical(native), **{key: value for key, value in native.items() if key not in {"schema", "mode"}}}
+    artifact["encoder_sentinels"] = {"input_encoder": sentinel("input", "query", "5" * 64), "passage_encoder": sentinel("passage", "passage", "6" * 64)}
     snapshot = {"schema": harness.ENCODER_RECEIPT_SCHEMA, "model_dir": "C:/model", "manifest_sha256": "2" * 64, "manifest_variant": "fp32", "files": [{"relative_path": "model.onnx", "sha256": "7" * 64, "stat": {"byte_count": 1, "device": 0, "inode": 0, "modified_ns": 0}}]}
     artifact["encoder_snapshot_pair"] = {"start": snapshot, "end": dict(snapshot)}
     streams = {

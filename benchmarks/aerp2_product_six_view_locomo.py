@@ -39,6 +39,7 @@ PREFREEZE_CONSUMPTION_SCHEMA = "aerp3-fcd1-prefreeze-consumption-v1"
 SENTINEL_INPUT_TEXT = "aerp2 product query sentinel"
 SENTINEL_PASSAGE_TEXT = "aerp2 product passage sentinel"
 ENCODER_RECEIPT_SCHEMA = "mempalace.locomo_bge_encoder.v1"
+STAGED_ENCODER_SENTINEL_PROJECTION_SCHEMA = "aerp3-staged-encoder-sentinel-projection-v1"
 FCD1_LOCOMO_POLICY_TUPLE = ("canonical", "public_world", "main", "active", None, None, None, "[]")
 SAFETY_CHECKS = (
     "trace_count", "audit_complete", "ranking_schema", "selected_matches_product_output",
@@ -714,8 +715,8 @@ def encoder_runtime_provider_receipt(encoder: Any, inputs: dict[str, Any]) -> di
     return {"session_providers": list(providers), "onnxruntime_version": version}
 
 
-def encoder_sentinel_receipts(encoder: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    """One frozen probe for both prefreeze publication and staged replay."""
+def encoder_sentinel_receipts(encoder: Any, *, staged_output: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Probe once, retaining legacy keys unless an ID/text-free receipt is needed."""
     def json_native(receipt: Any) -> Any:
         if not isinstance(receipt, dict):
             return receipt
@@ -729,9 +730,35 @@ def encoder_sentinel_receipts(encoder: Any) -> tuple[dict[str, Any], dict[str, A
         "query": json_native(encoder.sentinel_embedding_hash([SENTINEL_INPUT_TEXT], mode="query").to_dict()),
         "passage": json_native(encoder.sentinel_embedding_hash([SENTINEL_PASSAGE_TEXT], mode="passage").to_dict()),
     }
-    # These names and probes are the legacy report contract.  Prefreeze only
-    # shares the receipt; it must not rename an established report field.
-    return runtime, {"query": runtime["query"], "passage": runtime["passage"]}
+    # Legacy quality artifacts publish the established query/passage keys and
+    # actual encoder modes. Prefreeze is recursively safety-scanned, so it
+    # serializes the same hash payload under content-free role vocabulary.
+    if staged_output:
+        def staged_projection(receipt: Any, *, source_mode: str, receipt_mode: str) -> dict[str, Any]:
+            native_required = {"schema", "manifest_sha256", "mode", "input_count", "input_sha256", "embedding_sha256", "dtype", "shape"}
+            if not isinstance(receipt, dict) or set(receipt) != native_required or receipt.get("schema") != ENCODER_RECEIPT_SCHEMA or receipt.get("mode") != source_mode:
+                raise RuntimeError("encoder native sentinel receipt is malformed")
+            # The native record itself contains the forbidden role word
+            # "query", so publish an explicitly different projection rather
+            # than claiming it is a native encoder receipt with a new mode.
+            return {
+                "schema": STAGED_ENCODER_SENTINEL_PROJECTION_SCHEMA,
+                "role": receipt_mode,
+                "native_receipt_sha256": _canonical(receipt),
+                "manifest_sha256": receipt["manifest_sha256"],
+                "input_count": receipt["input_count"],
+                "input_sha256": receipt["input_sha256"],
+                "embedding_sha256": receipt["embedding_sha256"],
+                "dtype": receipt["dtype"],
+                "shape": receipt["shape"],
+            }
+        published = {
+            "input_encoder": staged_projection(runtime["query"], source_mode="query", receipt_mode="input"),
+            "passage_encoder": staged_projection(runtime["passage"], source_mode="passage", receipt_mode="passage"),
+        }
+    else:
+        published = {"query": runtime["query"], "passage": runtime["passage"]}
+    return runtime, published
 
 
 class HistoricalBgeAdapter:
@@ -1074,7 +1101,7 @@ def run_prefreeze(*, dataset_path: Path, model_dir: Path, source_repo: Path, out
         adapter_digest = adapter_implementation_digest()
         runtime_provider = encoder_runtime_provider_receipt(encoder, manifest["inputs"])
         identity = _canonical({"model": encoder.manifest.canonical_sha256, "historical_encoder": source_digests["benchmarks/locomo_bge_encoder.py"], "adapter": adapter_digest, "runtime_provider": runtime_provider})
-        runtime_sentinels, encoder_sentinels = encoder_sentinel_receipts(encoder)
+        runtime_sentinels, encoder_sentinels = encoder_sentinel_receipts(encoder, staged_output=True)
         advance_phase(phases, "source_model_load", contract=PREFREEZE_PHASES)
         dataset = protocol.load_official_locomo10(dataset_path)
         retrieval, _builder_scorer = protocol.prepare_hard_story_track(dataset, candidate_pool_size=manifest["protocol"]["source_pool"], require_official_counts=True)
@@ -1123,9 +1150,26 @@ def _git_oid40(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 40 and all(character in "0123456789abcdef" for character in value)
 
 
-def _validate_encoder_sentinel_shape(value: Any, *, mode: str, manifest_sha256: str, embedding_dimension: int) -> bool:
+def _validate_native_encoder_sentinel_shape(value: Any, *, mode: str, manifest_sha256: str, embedding_dimension: int) -> bool:
     required = {"schema", "manifest_sha256", "mode", "input_count", "input_sha256", "embedding_sha256", "dtype", "shape"}
-    return isinstance(value, dict) and set(value) == required and value.get("schema") == ENCODER_RECEIPT_SCHEMA and value.get("manifest_sha256") == manifest_sha256 and value.get("mode") == mode and value.get("input_count") == 1 and not isinstance(value["input_count"], bool) and _sha256_hex(value.get("input_sha256")) and _sha256_hex(value.get("embedding_sha256")) and value.get("dtype") == "float32-little-endian" and value.get("shape") == [1, embedding_dimension]
+    return mode in {"query", "passage"} and isinstance(value, dict) and set(value) == required and value.get("schema") == ENCODER_RECEIPT_SCHEMA and value.get("manifest_sha256") == manifest_sha256 and value.get("mode") == mode and value.get("input_count") == 1 and not isinstance(value["input_count"], bool) and _sha256_hex(value.get("input_sha256")) and _sha256_hex(value.get("embedding_sha256")) and value.get("dtype") == "float32-little-endian" and value.get("shape") == [1, embedding_dimension]
+
+
+def _validate_staged_encoder_sentinel_projection(value: Any, *, role: str, manifest_sha256: str, embedding_dimension: int) -> bool:
+    required = {"schema", "role", "native_receipt_sha256", "manifest_sha256", "input_count", "input_sha256", "embedding_sha256", "dtype", "shape"}
+    if not (role in {"input", "passage"} and isinstance(value, dict) and set(value) == required and value.get("schema") == STAGED_ENCODER_SENTINEL_PROJECTION_SCHEMA and value.get("role") == role and _sha256_hex(value.get("native_receipt_sha256")) and value.get("manifest_sha256") == manifest_sha256 and value.get("input_count") == 1 and not isinstance(value["input_count"], bool) and _sha256_hex(value.get("input_sha256")) and _sha256_hex(value.get("embedding_sha256")) and value.get("dtype") == "float32-little-endian" and value.get("shape") == [1, embedding_dimension]):
+        return False
+    native = {
+        "schema": ENCODER_RECEIPT_SCHEMA,
+        "manifest_sha256": value["manifest_sha256"],
+        "mode": {"input": "query", "passage": "passage"}[role],
+        "input_count": value["input_count"],
+        "input_sha256": value["input_sha256"],
+        "embedding_sha256": value["embedding_sha256"],
+        "dtype": value["dtype"],
+        "shape": value["shape"],
+    }
+    return value["native_receipt_sha256"] == _canonical(native)
 
 
 def _validate_snapshot_shape(value: Any, *, manifest_sha256: str) -> bool:
@@ -1160,7 +1204,7 @@ def validate_prefreeze_receipt(receipt: dict[str, Any], *, manifest_sha256: str,
     if not isinstance(source, dict) or set(source) != {"path", "pinned_commit", "git_state"} or source.get("pinned_commit") != HISTORICAL_COMMIT or not isinstance(source.get("path"), str) or not source["path"] or not isinstance(source_git, dict) or set(source_git) != git_keys or source_git.get("git_dirty") is not False or not _git_oid40(source_git.get("git_head")) or not _git_oid40(source_git.get("git_tree")) or not _sha256_hex(source_git.get("worktree_status_sha256")) or not _sha256_hex(source_git.get("commit_diff_sha256")) or not isinstance(source_git.get("commit_diff_bytes"), int) or isinstance(source_git["commit_diff_bytes"], bool) or source_git["commit_diff_bytes"] < 0 or not isinstance(historical, dict) or set(historical) != {"commit", "files"} or historical.get("commit") != HISTORICAL_COMMIT or not isinstance(historical.get("files"), dict) or not historical["files"] or any(not _sha256_hex(value) for value in historical["files"].values()):
         raise ValueError("prefreeze receipt source provenance is malformed")
     runtime = receipt.get("model_runtime"); sentinels = receipt.get("encoder_sentinels"); snapshots = receipt.get("encoder_snapshot_pair")
-    if not isinstance(runtime, dict) or set(runtime) != {"onnx_sha256", "embedding_dimension", "session_providers", "onnxruntime_version"} or not _sha256_hex(runtime.get("onnx_sha256")) or not isinstance(runtime.get("embedding_dimension"), int) or runtime["embedding_dimension"] < 1 or not isinstance(runtime.get("session_providers"), list) or not runtime["session_providers"] or not isinstance(runtime.get("onnxruntime_version"), str) or not runtime["onnxruntime_version"] or not isinstance(sentinels, dict) or set(sentinels) != {"query", "passage"} or not _validate_encoder_sentinel_shape(sentinels["query"], mode="query", manifest_sha256=input_freeze["model_manifest_sha256"], embedding_dimension=runtime["embedding_dimension"]) or not _validate_encoder_sentinel_shape(sentinels["passage"], mode="passage", manifest_sha256=input_freeze["model_manifest_sha256"], embedding_dimension=runtime["embedding_dimension"]) or not isinstance(snapshots, dict) or set(snapshots) != {"start", "end"} or snapshots["start"] != snapshots["end"] or not _validate_snapshot_shape(snapshots["start"], manifest_sha256=input_freeze["model_manifest_sha256"]):
+    if not isinstance(runtime, dict) or set(runtime) != {"onnx_sha256", "embedding_dimension", "session_providers", "onnxruntime_version"} or not _sha256_hex(runtime.get("onnx_sha256")) or not isinstance(runtime.get("embedding_dimension"), int) or runtime["embedding_dimension"] < 1 or not isinstance(runtime.get("session_providers"), list) or not runtime["session_providers"] or not isinstance(runtime.get("onnxruntime_version"), str) or not runtime["onnxruntime_version"] or not isinstance(sentinels, dict) or set(sentinels) != {"input_encoder", "passage_encoder"} or not _validate_staged_encoder_sentinel_projection(sentinels["input_encoder"], role="input", manifest_sha256=input_freeze["model_manifest_sha256"], embedding_dimension=runtime["embedding_dimension"]) or not _validate_staged_encoder_sentinel_projection(sentinels["passage_encoder"], role="passage", manifest_sha256=input_freeze["model_manifest_sha256"], embedding_dimension=runtime["embedding_dimension"]) or not isinstance(snapshots, dict) or set(snapshots) != {"start", "end"} or snapshots["start"] != snapshots["end"] or not _validate_snapshot_shape(snapshots["start"], manifest_sha256=input_freeze["model_manifest_sha256"]):
         raise ValueError("prefreeze receipt model provenance is malformed")
     safety = receipt.get("safety_summary")
     safety_keys = {"expected_trace_count", "trace_count", "audit_complete_count", "ranking_schema_complete_count", "fcd1_ledger_complete_count", "selected_match_count", "trace_identity_complete_count", "nonempty_selection_count", "unauthorized_selected_count", "legacy_mapping", "product_mapping", "lineage", "ranking_digest_count", "checks", "pass"}
@@ -1224,7 +1268,7 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
         adapter_digest = adapter_implementation_digest()
         runtime_provider = encoder_runtime_provider_receipt(encoder, manifest["inputs"])
         identity = _canonical({"model": encoder.manifest.canonical_sha256, "historical_encoder": source_digests["benchmarks/locomo_bge_encoder.py"], "adapter": adapter_digest, "runtime_provider": runtime_provider})
-        runtime_sentinels, encoder_sentinels = encoder_sentinel_receipts(encoder)
+        runtime_sentinels, encoder_sentinels = encoder_sentinel_receipts(encoder, staged_output=prefreeze_input is not None)
         advance_phase(phases, "source_model_load", contract=phase_contract)
         dataset = protocol.load_official_locomo10(dataset_path)
         retrieval, scorer = protocol.prepare_hard_story_track(dataset, candidate_pool_size=manifest["protocol"]["source_pool"], require_official_counts=True)
