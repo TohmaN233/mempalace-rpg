@@ -1,0 +1,48 @@
+{
+  "schema": "aerp1-locomo-three-way-manifest",
+  "version": 1,
+  "dataset": {
+    "name": "LoCoMo10",
+    "sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+    "expected_conversations": 10,
+    "expected_questions": 1986,
+    "expected_hard_questions": 603
+  },
+  "protocol": {
+    "top_k": 10,
+    "candidate_pool_size": 10,
+    "scorer": "official_exact_dialog_id",
+    "split": "all",
+    "annotation_free_retrieval": true,
+    "raw_dialog_text": "speaker/date/caption/text fixed labels"
+  },
+  "original_mempalace": {
+    "commit": "72ccd2f3653ab902e419d15bb542c88045342b04",
+    "source_files": {
+      "benchmarks/locomo_story_protocol.py": "3525630215ac760962fe38f0ac5f80f6af23fc6988844c389836587df45fa55c",
+      "benchmarks/locomo_story_candidate.py": "38544f1809f94a8506926e914b9616ef9f303b0352b783cc85aade75975945f0",
+      "benchmarks/locomo_bge_encoder.py": "2c74b79529c63788f2afa65d72bc11fbb5cb8977ae217ca795058acedacb0820"
+    }
+  },
+  "embedding": {
+    "model": "BAAI/bge-small-en-v1.5",
+    "variant": "fp32",
+    "manifest_sha256": "454d14761089976b0437135fd70c6da49fc836ad9344d43b0a693d343fc0ea85",
+    "similarity": "normalized_float32_dot_product",
+    "tie_break": "opaque_dialog_id_ascending"
+  },
+  "columns": [
+    {
+      "id": "raw_dialog_bm25",
+      "role": "scientific_sparse_control"
+    },
+    {
+      "id": "pinned_original_mempalace_raw_vector_dialog",
+      "role": "controlled_original_architecture_comparator"
+    },
+    {
+      "id": "latest_rpg_authorized_ranker",
+      "role": "current_product_authorized_ranker"
+    }
+  ]
+}
