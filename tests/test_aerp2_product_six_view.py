@@ -317,6 +317,23 @@ def test_cjk_tokenization_matches_inside_a_cjk_run_and_rollups_are_chronological
     assert ["early observation\nlate observation"] in encoder.passage_batches
 
 
+def test_repeated_query_terms_do_not_change_raw_or_observation_bm25_scores_or_order():
+    candidates = [
+        _candidate("event-a", raw="alpha beta", observation="summary=alpha beta", ranking_key="a"),
+        _candidate("event-b", raw="alpha alpha", observation="summary=alpha", ranking_key="b"),
+        _candidate("event-c", raw="beta", observation="summary=beta", ranking_key="c"),
+    ]
+    ranker = SixViewRanker(_CountingEncoder(), diagnostic_ledger=True)
+    repeated = ranker.rank(query="alpha alpha beta alpha", candidates=candidates)
+    deduplicated = ranker.rank(query="alpha beta", candidates=candidates)
+
+    for view in ("raw_bm25", "observation_bm25"):
+        repeated_rows = repeated.trace["fcd1_diagnostic_ledger"]["view_top_50"][view]
+        deduplicated_rows = deduplicated.trace["fcd1_diagnostic_ledger"]["view_top_50"][view]
+        assert [row["source_event_id"] for row in repeated_rows] == [row["source_event_id"] for row in deduplicated_rows]
+        assert {row["source_event_id"]: row["score"] for row in repeated_rows} == {row["source_event_id"]: row["score"] for row in deduplicated_rows}
+
+
 def test_ranking_key_makes_tied_rankings_and_digests_independent_of_event_uuid():
     first = [
         AuthorizedRetrievalCandidate("uuid-first-a", "scene-a", "alpha", "alpha observation", "session", ("canonical", "public"), (1, "dialog-a"), ranking_key="dialog-a"),

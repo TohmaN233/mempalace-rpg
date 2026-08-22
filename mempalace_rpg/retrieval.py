@@ -87,7 +87,7 @@ def _tokens(text: str) -> list[str]:
 
 
 def _bm25(query: str, texts: Sequence[str], ids: Sequence[str]) -> dict[str, float]:
-    query_tokens = _tokens(query)
+    query_tokens = tuple(dict.fromkeys(_tokens(query)))
     documents = [_tokens(text) for text in texts]
     frequencies = [Counter(document) for document in documents]
     document_frequencies = Counter(token for document in documents for token in set(document))
