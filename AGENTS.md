@@ -45,6 +45,46 @@ packed. Do not put transcript text in the ranking trace. Do not add graph or
 clustering retrieval until the frozen annotation-free evaluation identifies a
 remaining recall gap.
 
+## AERP-3 / FCD research boundary
+
+Checkpoint `e8ca3a7` is a frozen engineering result, not a release-qualified or
+paper-level retrieval claim. Product Six-View improves the strongest raw control
+overall and on the hard subset, but it misses the frozen P1/P2 gates and regresses
+on the adversarial category. Do not describe fixed RRF as the established cause.
+Correlated product projections, checkpoint tie semantics, representation mismatch,
+candidate-depth differences, and inherited historical weights remain competing
+explanations.
+
+The ordered program is Frozen Causal Decomposition (FCD). It must remain diagnostic
+until the evidence selects a mechanism:
+
+1. FCD-0 may decompose the frozen Product top-10 against the frozen raw BM25+dense
+   RRF top-10 and raw top-50 union. Its `fusion_promotion` and `fusion_demotion`
+   labels describe output set relations only; they do not establish Product
+   view-pool coverage or fusion causality.
+2. FCD-1 must capture a benchmark-only ranking ledger before kernel trace
+   compaction and before scorer-label access: every Product view's top-50 IDs and
+   scores, fused top-50, checkpoint tie groups, raw-control top-50, and authorization
+   digest. The existing top-10 ranking digests, product traces, safety results, and
+   all 1,986 outputs must remain identical.
+3. FCD-2 must run, in order, raw-component parity, the six-view source-pool oracle,
+   fusion-semantics parity, then fixed add-view/leave-one-view-out diagnostics. It
+   must produce exactly one frozen verdict: `FUSION_SUPPORTED`,
+   `REPRESENTATION_SUPPORTED`, or `COMPONENT_PARITY_FAILED`. No tuning is allowed.
+4. Only `FUSION_SUPPORTED` permits one pre-registered annotation-free fusion
+   candidate, developed on a separate development corpus. Otherwise the next work
+   is projection research. Graph or clustering remains blocked until current
+   Product views miss recoverable evidence on multiple datasets.
+
+A retrieval-paper claim additionally requires a frozen implementation, one blind
+execution with no subsequent tuning, and at least two untouched confirmatory
+datasets. P1/P2, ACL leakage, trace completeness, exact-span replay, performance,
+and failure-injection gates remain unchanged. A systems-paper path is separate and
+would require a formal threat model, explicit invariants, and security evaluation.
+Paper statistics must report question-macro and conversation-weighted estimands
+separately; the existing conversation bootstrap must not be presented as an
+interval for a differently weighted point estimate.
+
 ## Verification
 
 Run `python -m pytest -q`, including `tests/test_aerp1_authorized_evidence_audit.py`
@@ -54,6 +94,12 @@ contract. The release-quality retrieval gate is
 `python -m benchmarks.aerp2_product_six_view_locomo` from a clean worktree; its
 JSON output must remain outside both repositories, and both `p1_pass` and
 `p2_pass` (therefore `release_pass`) must be true. Then run `git diff --check`.
+
+The non-causal FCD-0 checkpoint diagnostic is
+`python -m benchmarks.aerp2_fusion_error_decomposition --artifact <quality-json>
+--expected-artifact-sha256 <sha256> --expected-git-head <commit>
+--output <outside-repo-json>`. It must fail closed on receipt or denominator drift,
+must not rerank, and must keep generated reports outside the repository.
 
 ## AERP-1 branch and artifact boundary
 
