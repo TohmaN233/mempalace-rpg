@@ -182,8 +182,13 @@ def _validate_header(artifact: dict[str, Any], expected_head: str, *, prefreeze:
         if streams["safety_summary_sha256"] != stable_safety_receipt(_mapping(receipt["safety_summary"], "prefreeze safety summary")) or streams["safety_summary_sha256"] != stable_safety_receipt(_mapping(artifact.get("safety_summary"), "artifact safety summary")):
             raise ValueError("prefreeze safety receipt mismatch")
         event_maps = _mapping(artifact.get("event_dialog_mapping_sha256"), "artifact event mapping receipts")
-        if event_maps != {"legacy": streams["legacy_event_mapping_sha256"], "product": streams["product_event_mapping_sha256"]}:
-            raise ValueError("artifact prefreeze event mapping mismatch")
+        artifact_safety = _mapping(artifact.get("safety_summary"), "artifact safety summary")
+        expected_event_maps = {
+            "legacy": _digest_value(_mapping(artifact_safety.get("legacy_mapping"), "artifact safety legacy mapping").get("mapping_sha256"), "artifact safety legacy mapping receipt"),
+            "product": _digest_value(_mapping(artifact_safety.get("product_mapping"), "artifact safety product mapping").get("mapping_sha256"), "artifact safety product mapping receipt"),
+        }
+        if event_maps != expected_event_maps:
+            raise ValueError("artifact event mapping is inconsistent with artifact safety")
         # FCD-2 never maintains a divergent interpretation of the prefreeze
         # schema, including its small-denominator synthetic tests.
         from benchmarks.aerp2_product_six_view_locomo import validate_prefreeze_receipt

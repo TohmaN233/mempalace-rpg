@@ -457,7 +457,12 @@ def test_staged_prefreeze_receipt_binds_product_stream_and_both_input_receipts(m
     }
     streams["raw_component_parity"]["sha256"] = _canonical_sha256({"arms": streams["raw_component_parity"]["arms"]})
     streams["fresh_streams_sha256"] = _canonical_sha256(streams)
-    artifact["event_dialog_mapping_sha256"] = {"legacy": streams["legacy_event_mapping_sha256"], "product": streams["product_event_mapping_sha256"]}
+    # Event maps are UUID-bearing per-run receipts; their consistency anchor is
+    # this artifact's safety summary, not the cross-run stable stream digests.
+    artifact["event_dialog_mapping_sha256"] = {
+        "legacy": artifact["safety_summary"]["legacy_mapping"]["mapping_sha256"],
+        "product": artifact["safety_summary"]["product_mapping"]["mapping_sha256"],
+    }
     prefreeze = {"schema": "aerp2-product-six-view-prefreeze-v1", "version": 1, "status": "complete", "manifest_sha256": "7" * 64, "phase_ledger": ["input_byte_freeze", "source_model_load", "sanitized_retrieval_construction", "fresh_streams_frozen", "prelabel_safety", "state_recheck", "atomic_publish_ready"], "stream_receipts": streams, "input_freeze": artifact["input_freeze"], "historical_source": artifact["historical_source"], "source_repo": artifact["source_repo"], "encoder_identity": artifact["encoder_identity"], "adapter_implementation_sha256": artifact["adapter_implementation_sha256"], "model_runtime": artifact["model_runtime"], "encoder_sentinels": artifact["encoder_sentinels"], "encoder_snapshot_pair": artifact["encoder_snapshot_pair"], "safety_summary": artifact["safety_summary"], "claim_boundary": "bounded", "git_state_before": artifact["git_state_before"], "git_state_after": artifact["git_state_after"], "implementation_sha256": {"harness": hashlib.sha256((module.ROOT / "benchmarks" / "aerp2_product_six_view_locomo.py").read_bytes()).hexdigest(), "ranker": hashlib.sha256((module.ROOT / "mempalace_rpg" / "retrieval.py").read_bytes()).hexdigest(), "prefreeze_cli": hashlib.sha256((module.ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py").read_bytes()).hexdigest()}}
     prefreeze_raw = json.dumps(prefreeze, sort_keys=True, separators=(",", ":")).encode("utf-8")
     prefreeze_sha = hashlib.sha256(prefreeze_raw).hexdigest()
@@ -475,6 +480,18 @@ def test_staged_prefreeze_receipt_binds_product_stream_and_both_input_receipts(m
 
     report = module.analyze(artifact_path, expected_artifact_sha256=hashlib.sha256(artifact_raw).hexdigest(), expected_git_head="a" * 40, prefreeze_receipt_path=prefreeze_path, expected_prefreeze_sha256=prefreeze_sha)
     assert report["input_receipt"]["prefreeze_sha256"] == prefreeze_sha
+    raw_map_drift = json.loads(artifact_raw)
+    raw_map_drift["event_dialog_mapping_sha256"]["legacy"] = "0" * 64
+    raw_map_drift_bytes = json.dumps(raw_map_drift, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    raw_map_drift_path = tmp_path / "raw-map-drift.json"; raw_map_drift_path.write_bytes(raw_map_drift_bytes)
+    with pytest.raises(ValueError, match="event mapping is inconsistent with artifact safety"):
+        module.analyze(raw_map_drift_path, expected_artifact_sha256=hashlib.sha256(raw_map_drift_bytes).hexdigest(), expected_git_head="a" * 40, prefreeze_receipt_path=prefreeze_path, expected_prefreeze_sha256=prefreeze_sha)
+    stable_consumption_drift = json.loads(artifact_raw)
+    stable_consumption_drift["fcd1_prefreeze_consumption"]["legacy_event_mapping_sha256"] = "0" * 64
+    stable_consumption_drift_bytes = json.dumps(stable_consumption_drift, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    stable_consumption_drift_path = tmp_path / "stable-map-drift.json"; stable_consumption_drift_path.write_bytes(stable_consumption_drift_bytes)
+    with pytest.raises(ValueError, match="prefreeze consumption mismatch"):
+        module.analyze(stable_consumption_drift_path, expected_artifact_sha256=hashlib.sha256(stable_consumption_drift_bytes).hexdigest(), expected_git_head="a" * 40, prefreeze_receipt_path=prefreeze_path, expected_prefreeze_sha256=prefreeze_sha)
     output = tmp_path / "staged-report.json"
     with pytest.raises(ValueError, match="external"):
         module.atomic_json(source_repo / "forbidden-report.json", report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
