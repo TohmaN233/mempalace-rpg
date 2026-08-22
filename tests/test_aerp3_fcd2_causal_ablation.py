@@ -30,6 +30,8 @@ def test_production_protocol_pins_precede_synthetic_monkeypatching() -> None:
     assert module.BASELINE_ARM == "raw_bm25_plus_raw_dense"
     assert module.VIEWS == ("raw_bm25", "raw_dense", "observation_bm25", "observation_dense", "checkpoint_dense", "combo_dense")
     assert module.ADD_VIEW_ORDER == module.VIEWS
+    assert module.PRODUCT_FUSION_VIEW_ORDER == ("raw_bm25", "observation_bm25", "raw_dense", "observation_dense", "checkpoint_dense", "combo_dense")
+    assert module.ADD_VIEW_ORDER != module.PRODUCT_FUSION_VIEW_ORDER
     assert module.RRF_K == 60
     assert module.FROZEN_WEIGHTS == {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0}
     assert module.P1_MIN_DELTA == 0.05
@@ -37,6 +39,7 @@ def test_production_protocol_pins_precede_synthetic_monkeypatching() -> None:
     assert module.STRICT_MAJORITY_MULTIPLIER == 2
     assert module.EXPECTED_CONVERSATIONS == 10
     assert module.MIN_RECOVERY_CONVERSATIONS == 8
+    assert module.EXPECTED_QUESTIONS * 2 * len(module.ADD_VIEW_ORDER) == 23832
     assert module.PRODUCT_TOP10_SHA256 == "64007282069621bb3e603598938993ebe0907e8e84ebaa65394741ab618e5441"
 
 
@@ -48,23 +51,29 @@ def test_preregistered_delta_comparators_include_equality_and_reject_one_step_be
 
 
 def _row(identifier: str, rank: int) -> dict[str, object]:
+    prefix = identifier[0]
+    if prefix in {"b", "d", "g", "z"}:
+        order = {"b": 1, "d": 2, "g": 3, "z": 4}[prefix]
+    else:
+        order = 5 + int(identifier.split("-")[1])
     return {
         "source_event_id": f"event:{identifier}",
         "ranking_key_sha256": _sha(identifier),
-        # The producer order is the global opaque ranking-key lexical order:
-        # b < d < g < z, continuously numbered across the full universe.
-        "ranking_key_order": {"b": 1, "d": 2, "g": 3, "z": 4}[identifier[0]],
+        "ranking_key_order": order,
         "rank": rank,
         "score": float(100 - rank),
     }
 
 
-def _ledger(views: dict[str, list[dict[str, object]]]) -> dict:
-    weights = {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0}
-    order_receipts = {name: _canonical_sha256([row["ranking_key_sha256"] for row in rows]) for name, rows in views.items()}
-    full_orders = {name: [row["source_event_id"] for row in rows] for name, rows in views.items()}
+def _ledger(views: dict[str, list[dict[str, object]]], *, full_orders: dict[str, list[str]] | None = None, weights: dict[str, float] | None = None) -> dict:
+    weights = weights or {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0}
+    product_order = ("raw_bm25", "observation_bm25", "raw_dense", "observation_dense", "checkpoint_dense", "combo_dense")
+    full_orders = full_orders or {name: [row["source_event_id"] for row in rows] for name, rows in views.items()}
+    known_rows = {row["source_event_id"]: row for rows in views.values() for row in rows}
+    event_hash = lambda event: known_rows[event]["ranking_key_sha256"] if event in known_rows else _sha(event.removeprefix("event:"))
+    order_receipts = {name: _canonical_sha256([event_hash(event) for event in order]) for name, order in full_orders.items()}
     policy = "4" * 64
-    event_rows = {row["source_event_id"]: row for row in views["raw_bm25"]}
+    event_rows = {event: known_rows.get(event, {"ranking_key_sha256": event_hash(event), "ranking_key_order": rank + 1, "score": float(-rank)}) for rank, event in enumerate(full_orders["raw_bm25"])}
     checkpoint_rows = {row["source_event_id"]: row for row in views["checkpoint_dense"]}
     groups = []
     for event, row in event_rows.items():
@@ -73,7 +82,7 @@ def _ledger(views: dict[str, list[dict[str, object]]]) -> dict:
             "group_id": "group:" + _canonical_sha256([checkpoint, policy]),
             "checkpoint_sha256": checkpoint,
             "policy_sha256": policy,
-            "checkpoint_score": checkpoint_rows[event]["score"],
+            "checkpoint_score": checkpoint_rows.get(event, {"score": event_rows[event]["score"]})["score"],
             "member_count": 1,
             "chronological_members": [{"source_event_id": event, "ranking_key_sha256": row["ranking_key_sha256"]}],
         })
@@ -84,18 +93,20 @@ def _ledger(views: dict[str, list[dict[str, object]]]) -> dict:
     fused = []
     for event, row in event_rows.items():
         component_ranks = {name: full_orders[name].index(event) + 1 for name in views}
-        contributions = {name: weights[name] / (60 + component_ranks[name]) for name in views}
+        contributions = {name: weights[name] / (60 + component_ranks[name]) for name in product_order}
+        final = sum(contributions[name] for name in product_order)
         fused.append({
             "source_event_id": event,
             "ranking_key_sha256": row["ranking_key_sha256"],
             "ranking_key_order": row["ranking_key_order"],
             "rank": 0,
-            "final_rrf": sum(contributions.values()),
+            "final_rrf": final,
             "component_ranks": component_ranks,
             "component_rank_receipts": [{"view": name, "view_order_sha256": order_receipts[name], "ranking_key_sha256": row["ranking_key_sha256"], "rank": component_ranks[name]} for name in views],
             "contributions": contributions,
         })
     fused.sort(key=lambda row: (-float(row["final_rrf"]), row["ranking_key_order"]))
+    fused = fused[:len(views["raw_bm25"])]
     for rank, row in enumerate(fused, start=1):
         row["rank"] = rank
     return {
@@ -160,7 +171,12 @@ def _artifact(kind: str = "fusion", *, duplicate_gold: bool = False) -> dict:
                 "checkpoint_dense": [_row(identifier, rank) for rank, identifier in enumerate([pool[item][2], pool[item][1], pool[item][0], pool[item][3]], start=1)],
                 "combo_dense": [_row(identifier, rank) for rank, identifier in enumerate([pool[item][0], pool[item][2], pool[item][1], pool[item][3]], start=1)],
             }
-        traces[item] = {"retrieval_ranking": {"fcd1_diagnostic_ledger": _ledger(views)}}
+        tails = [f"tail-{index:02d}-{item}" for index in range(56)]
+        full_orders = {
+            name: [row["source_event_id"] for row in rows] + [f"event:{tail}" for tail in tails]
+            for name, rows in views.items()
+        }
+        traces[item] = {"retrieval_ranking": {"fcd1_diagnostic_ledger": _ledger(views, full_orders=full_orders)}}
     questions = []
     for index, item in enumerate(items):
         resolved = [golds[item], golds[item]] if duplicate_gold and index == 0 else [golds[item]]
@@ -210,6 +226,43 @@ def _configured(module, monkeypatch: pytest.MonkeyPatch, artifact: dict | None =
     monkeypatch.setattr(module, "_analyzer_git_state", lambda: dict(analyzer_state))
 
 
+def _rebind_artifact_receipts(artifact: dict) -> None:
+    artifact["ranking_stream_sha256"] = {arm: _canonical_sha256(stream) for arm, stream in artifact["rankings_top10"].items()}
+    artifact["source_pool_stream_sha256"] = {arm: _canonical_sha256(stream) for arm, stream in artifact["source_pool_rankings"].items()}
+    product_digest = _canonical_sha256(artifact["rankings_top10"]["product_six_view"])
+    artifact["fcd1_acceptance"]["reference_product_top10_sha256"] = product_digest
+    artifact["fcd1_acceptance"]["actual_product_top10_sha256"] = product_digest
+    for audit in artifact["question_audits"]:
+        item = audit["composite_id"][1]
+        for arm, stream in artifact["source_pool_rankings"].items():
+            audit["source_pool"][arm]["sha256"] = _canonical_sha256(stream[item])
+        audit["top10"] = {arm: stream[item] for arm, stream in artifact["rankings_top10"].items()}
+        ledger = artifact["product_traces"][item]["retrieval_ranking"]["fcd1_diagnostic_ledger"]
+        audit["product_retrieval"]["fcd1_diagnostic_ledger_sha256"] = _canonical_sha256(ledger)
+
+
+def _internal_tie_artifact() -> tuple[dict, dict[str, float]]:
+    """Valid FCD-1-shaped data with a non-cutoff fusion tie in producer order."""
+    artifact = _artifact()
+    weights = {view: 1.0 for view in ("raw_bm25", "raw_dense", "observation_bm25", "observation_dense", "checkpoint_dense", "combo_dense")}
+    for index in range(10):
+        item = f"item-{index}"
+        identifiers = [f"b-{item}", f"d-{item}", f"g-{item}", f"z-{item}"]
+        reverse = [identifiers[1], identifiers[0], identifiers[2], identifiers[3]]
+        views = {
+            view: [_row(identifier, rank) for rank, identifier in enumerate(reverse if view in {"raw_bm25", "raw_dense", "observation_bm25"} else identifiers, start=1)]
+            for view in ("raw_bm25", "raw_dense", "observation_bm25", "observation_dense", "checkpoint_dense", "combo_dense")
+        }
+        tails = [f"tail-{tail:02d}-{item}" for tail in range(56)]
+        full_orders = {view: [row["source_event_id"] for row in rows] + [f"event:{tail}" for tail in tails] for view, rows in views.items()}
+        artifact["product_traces"][item] = {"retrieval_ranking": {"fcd1_diagnostic_ledger": _ledger(views, full_orders=full_orders, weights=weights)}}
+        for arm in ("raw_bm25", "raw_dense"):
+            artifact["source_pool_rankings"][arm][item] = reverse
+            artifact["rankings_top10"][arm][item] = reverse[:2]
+    _rebind_artifact_receipts(artifact)
+    return artifact, weights
+
+
 def _analyze(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str = "fusion", *, duplicate_gold: bool = False) -> tuple[dict, Path, bytes]:
     artifact = _artifact(kind, duplicate_gold=duplicate_gold)
     _configured(module, monkeypatch, artifact)
@@ -239,6 +292,7 @@ def test_report_separates_artifact_producer_and_analyzer_git_provenance(module, 
     assert receipt["artifact_producer_git_head"] == "a" * 40
     assert set(receipt["analyzer_git_state"]) == {"git_head", "git_tree", "git_dirty", "worktree_status_sha256", "commit_diff_sha256", "commit_diff_bytes"}
     assert receipt["analyzer_git_state"]["git_dirty"] is False
+    assert report["protocol"]["oracle"] == "six_view_per_view_top50_candidate_coverage"
 
 
 def test_duplicate_gold_and_unresolved_are_counted_without_id_leakage(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -247,7 +301,7 @@ def test_duplicate_gold_and_unresolved_are_counted_without_id_leakage(module, mo
     assert report["verdict"] == "FUSION_SUPPORTED"
     assert report["stages"]["oracle"]["overall"] == pytest.approx((2 / 3 + 9) / 10)
     first_conversation = _sha("conversation-0")
-    assert report["stages"]["hashed_conversation_recovery"][first_conversation] == {"recoverable": 2, "nonrecoverable": 0}
+    assert report["stages"]["hashed_budgeted_recovery"][first_conversation] == {"recoverable": 2, "nonrecoverable": 0}
     serialized = json.dumps(report, sort_keys=True)
     assert "item-" not in serialized and "conversation-" not in serialized and "g-item" not in serialized
     assert "query" not in serialized.casefold() and "transcript" not in serialized.casefold() and "answer" not in serialized.casefold()
@@ -266,11 +320,37 @@ def test_top50_tail_order_difference_is_reported_but_not_a_parity_blocker(module
 def test_rrf_and_aggregate_ablations_replay_a_nonidentical_fixture(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     report, _path, _raw = _analyze(module, monkeypatch, tmp_path, "nonidentical")
     artifact = _artifact("nonidentical")
-    first = artifact["product_traces"]["item-0"]["retrieval_ranking"]["fcd1_diagnostic_ledger"]["view_top_50"]
+    ledger = artifact["product_traces"]["item-0"]["retrieval_ranking"]["fcd1_diagnostic_ledger"]
     expected = [_sha("d-item-0"), _sha("g-item-0"), _sha("b-item-0"), _sha("z-item-0")]
+    event_hashes = {
+        member["source_event_id"]: member["ranking_key_sha256"]
+        for group in ledger["checkpoint_tie_groups"]
+        for member in group["chronological_members"]
+    }
 
-    assert module._rrf(first) == expected
-    assert report["fusion_semantics_parity"] == {"status": "complete", "expected_questions": 10, "top10_order_exact_questions": 10}
+    replay = module.replay_weighted_rrf(ledger)
+    assert "ordered_events" not in replay
+    assert {event_hashes[event] for event in module._top_membership(replay, 4)} == set(expected)
+    assert report["fusion_semantics_parity"] == {
+        "status": "complete", "expected_questions": 10,
+        "full_order_receipts_exact_questions": 10,
+        "full_fused_top50_membership_exact_questions": 10,
+        "stored_fused_top50_order_consistent_questions": 10,
+        "product_top10_stored_order_exact_questions": 10,
+        "strict_top50_boundary_questions": 10,
+        "strict_top10_boundary_questions": 10,
+        "tie_break_unprovable_questions": 0,
+    }
+    assert report["protocol"]["fusion_view_accumulation_order"] == list(module.PRODUCT_FUSION_VIEW_ORDER)
+    assert report["protocol"]["add_view_order"] == list(module.ADD_VIEW_ORDER)
+    assert report["protocol"]["ablation"] == "full_order_rank_counterfactual"
+    assert report["ablation_replay"] == {
+        "status": "complete", "full_authorized_universe": True,
+        "expected_scenario_question_checks": 120,
+        "scenario_question_checks": 120,
+        "strict_top10_boundary_questions": 120,
+        "all_scenarios_strict_top10_boundary": True,
+    }
     assert {view: metric["overall"] for view, metric in report["stages"]["ablations"]["add_view"].items()} == {
         "raw_bm25": 1.0, "raw_dense": 1.0, "observation_bm25": 1.0,
         "observation_dense": 1.0, "checkpoint_dense": 0.0, "combo_dense": 0.0,
@@ -279,6 +359,139 @@ def test_rrf_and_aggregate_ablations_replay_a_nonidentical_fixture(module, monke
         "raw_bm25": 0.0, "raw_dense": 0.0, "observation_bm25": 1.0,
         "observation_dense": 1.0, "checkpoint_dense": 1.0, "combo_dense": 0.0,
     }
+
+
+def _full_replay_ledger(size: int = 60) -> dict:
+    events = [f"event:{index:03d}" for index in range(size)]
+    return {"view_full_order": {view: list(events) for view in ("raw_bm25", "raw_dense", "observation_bm25", "observation_dense", "checkpoint_dense", "combo_dense")}}
+
+
+def test_full_order_replay_uses_candidates_beyond_top50_and_counterfactual_tail_membership(module) -> None:
+    baseline = _full_replay_ledger()
+    replay = module.replay_weighted_rrf(baseline)
+    assert len(replay["scores"]) == 60
+    assert module._strict_cutoff(replay, 50) and module._strict_cutoff(replay, 10)
+
+    boundary_changed = deepcopy(baseline)
+    raw = boundary_changed["view_full_order"]["raw_bm25"]
+    raw[49], raw[50] = raw[50], raw[49]
+    changed = module.replay_weighted_rrf(boundary_changed)
+    assert changed["scores"]["event:049"] != replay["scores"]["event:049"]
+
+    counterfactual_changed = deepcopy(baseline)
+    raw = counterfactual_changed["view_full_order"]["raw_bm25"]
+    raw[9], raw[10] = raw[10], raw[9]
+    before = module.replay_weighted_rrf(baseline, active_views=("raw_bm25",))
+    after = module.replay_weighted_rrf(counterfactual_changed, active_views=("raw_bm25",))
+    assert module._top_membership(before, 10) != module._top_membership(after, 10)
+
+
+def test_oracle_is_per_view_top50_coverage_not_full_order_universe(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _configured(module, monkeypatch)
+    artifact = _artifact()
+    first = artifact["questions"][0]
+    first["gold"]["official_exact"] = {"resolved_dialog_ids": ["tail-00-item-0"], "unresolved_evidence_item_count": 0, "evidence_item_count": 1}
+    ledger = artifact["product_traces"]["item-0"]["retrieval_ranking"]["fcd1_diagnostic_ledger"]
+    assert "event:tail-00-item-0" in ledger["view_full_order"]["raw_bm25"]
+    assert "event:tail-00-item-0" not in [row["source_event_id"] for row in ledger["view_top_50"]["raw_bm25"]]
+    raw = json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    path = tmp_path / "tail-gold.json"; path.write_bytes(raw)
+    report = module.analyze(path, expected_artifact_sha256=hashlib.sha256(raw).hexdigest(), expected_git_head="a" * 40)
+    assert report["protocol"]["oracle"] == "six_view_per_view_top50_candidate_coverage"
+    assert report["stages"]["oracle"]["overall"] == pytest.approx(0.9)
+
+
+@pytest.mark.parametrize("cutoff", [10, 50])
+def test_full_order_cutoff_ties_are_explicitly_unprovable_not_hash_ordered(module, monkeypatch: pytest.MonkeyPatch, cutoff: int) -> None:
+    monkeypatch.setattr(module, "FROZEN_WEIGHTS", {view: 1.0 for view in module.VIEWS})
+    ledger = _full_replay_ledger()
+    first, second = ledger["view_full_order"]["raw_bm25"], ledger["view_full_order"]["raw_dense"]
+    first[cutoff - 1], first[cutoff] = first[cutoff], first[cutoff - 1]
+    replay = module.replay_weighted_rrf(ledger, active_views=("raw_bm25", "raw_dense"))
+    assert not module._strict_cutoff(replay, cutoff)
+
+
+def test_tie_break_unprovable_stops_before_gold_join(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    original = module.replay_weighted_rrf
+    def tie_at_product_top10(ledger, *, active_views=None):
+        replay = original(ledger, active_views=active_views)
+        if active_views is None:
+            events = list(replay["scores"])
+            replay["scores"][events[module.TOP_K - 1]] = replay["scores"][events[module.TOP_K]]
+        return replay
+    monkeypatch.setattr(module, "replay_weighted_rrf", tie_at_product_top10)
+    monkeypatch.setattr(module, "_gold", lambda _question: (_ for _ in ()).throw(AssertionError("tie gate accessed gold")))
+    report, _path, _raw = _analyze(module, monkeypatch, tmp_path)
+    assert report["verdict"] == "FUSION_TIEBREAK_UNPROVABLE"
+    assert report["fusion_semantics_parity"]["tie_break_unprovable_questions"] == 10
+    assert report["ablation_replay"] == {
+        "status": "not_run_due_to_fusion_semantics_parity",
+        "full_authorized_universe": True,
+        "expected_scenario_question_checks": 120,
+        "scenario_question_checks": 0,
+        "strict_top10_boundary_questions": 0,
+        "all_scenarios_strict_top10_boundary": False,
+    }
+
+
+def test_scenario_only_tie_stops_before_gold_without_rewriting_baseline_semantics(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    original = module.replay_weighted_rrf
+
+    def tie_only_counterfactuals(ledger, *, active_views=None):
+        replay = original(ledger, active_views=active_views)
+        if active_views is not None:
+            events = list(replay["scores"])
+            replay["scores"][events[module.TOP_K - 1]] = replay["scores"][events[module.TOP_K]]
+        return replay
+
+    monkeypatch.setattr(module, "replay_weighted_rrf", tie_only_counterfactuals)
+    monkeypatch.setattr(module, "_gold", lambda _question: (_ for _ in ()).throw(AssertionError("ablation tie accessed gold")))
+    report, _path, _raw = _analyze(module, monkeypatch, tmp_path)
+
+    assert report["verdict"] == "ABLATION_TIEBREAK_UNPROVABLE"
+    assert report["later_stages"] == "not_run_due_to_ablation_replay"
+    assert report["fusion_semantics_parity"]["status"] == "complete"
+    assert report["fusion_semantics_parity"]["tie_break_unprovable_questions"] == 0
+    assert report["ablation_replay"] == {
+        "status": "FUSION_TIEBREAK_UNPROVABLE",
+        "full_authorized_universe": True,
+        "expected_scenario_question_checks": 120,
+        "scenario_question_checks": 120,
+        "strict_top10_boundary_questions": 0,
+        "all_scenarios_strict_top10_boundary": False,
+    }
+
+
+def test_internal_fusion_tie_uses_stored_producer_order_not_raw_view_or_replay_order(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    artifact, weights = _internal_tie_artifact()
+    _configured(module, monkeypatch, artifact)
+    monkeypatch.setattr(module, "FROZEN_WEIGHTS", weights)
+    ledger = artifact["product_traces"]["item-0"]["retrieval_ranking"]["fcd1_diagnostic_ledger"]
+    stored = [row["source_event_id"] for row in ledger["fused_top_50"]]
+    raw = [row["source_event_id"] for row in ledger["view_top_50"]["raw_bm25"]]
+    assert raw[:2] == list(reversed(stored[:2]))
+    assert ledger["fused_top_50"][0]["final_rrf"] == ledger["fused_top_50"][1]["final_rrf"]
+    raw_bytes = json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    path = tmp_path / "internal-tie.json"; path.write_bytes(raw_bytes)
+
+    report = module.analyze(path, expected_artifact_sha256=hashlib.sha256(raw_bytes).hexdigest(), expected_git_head="a" * 40)
+
+    semantics = report["fusion_semantics_parity"]
+    assert report["verdict"] == "FUSION_SUPPORTED"
+    assert semantics["full_fused_top50_membership_exact_questions"] == 10
+    assert semantics["stored_fused_top50_order_consistent_questions"] == 10
+    assert semantics["product_top10_stored_order_exact_questions"] == 10
+    assert semantics["strict_top50_boundary_questions"] == 10
+    assert semantics["strict_top10_boundary_questions"] == 10
+
+
+def test_one_ulp_fusion_score_gap_controls_cutoff_membership_without_tie_order(module) -> None:
+    lower = math.nextafter(1.0, -math.inf)
+    replay = {"scores": {"opaque-a": 1.0, "opaque-b": lower, "opaque-c": 0.5}}
+    assert module._strict_cutoff(replay, 1)
+    assert module._top_membership(replay, 1) == {"opaque-a"}
+    replay["scores"]["opaque-b"] = 1.0
+    assert not module._strict_cutoff(replay, 1)
 
 
 def test_fusion_semantics_failure_stops_before_later_label_stages(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -290,7 +503,7 @@ def test_fusion_semantics_failure_stops_before_later_label_stages(module, monkey
 
     assert report["verdict"] == "FUSION_SEMANTICS_PARITY_FAILED"
     assert report["later_stages"] == "not_run_due_to_fusion_semantics_parity"
-    assert report["fusion_semantics_parity"]["top10_order_exact_questions"] == 0
+    assert report["fusion_semantics_parity"]["product_top10_stored_order_exact_questions"] == 0
 
 
 def test_raw_parity_failure_never_reads_gold(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -319,7 +532,7 @@ def test_preregistered_recovery_boundaries(module, monkeypatch: pytest.MonkeyPat
     assert report["verdict"] == verdict
     assert report["protocol"]["expected_conversations"] == 10
     assert report["stages"]["gates"]["strict_majority"] is strict_majority
-    assert report["stages"]["gates"]["recovery_conversation_pass"] is conversation_pass
+    assert report["stages"]["gates"]["budgeted_recovery_conversation_pass"] is conversation_pass
 
 
 @pytest.mark.parametrize("mutate", [
@@ -358,6 +571,11 @@ def test_ledger_view_receipt_drift_fails_even_when_audit_digest_is_rebound(modul
     lambda ledger: ledger.__setitem__("authorization_sha256", "0" * 64),
     lambda ledger: ledger["fused_top_50"][0].__setitem__("final_rrf", 0.0),
     lambda ledger: ledger["fused_top_50"][0]["component_rank_receipts"][0].__setitem__("rank", 99),
+    lambda ledger: ledger["view_full_order"]["raw_bm25"].__setitem__(50, ledger["view_full_order"]["raw_bm25"][49]),
+    lambda ledger: ledger["view_order_sha256"].__setitem__("raw_bm25", "0" * 64),
+    lambda ledger: ledger["fused_top_50"][0]["contributions"].__setitem__("raw_bm25", 0.0),
+    lambda ledger: ledger["fused_top_50"][0]["contributions"].__setitem__("raw_bm25", math.nextafter(ledger["fused_top_50"][0]["contributions"]["raw_bm25"], math.inf)),
+    lambda ledger: ledger["fused_top_50"][0].__setitem__("final_rrf", math.nextafter(ledger["fused_top_50"][0]["final_rrf"], math.inf)),
 ])
 def test_rebound_audit_cannot_hide_authorization_or_fused_ledger_mutation(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutate) -> None:
     _configured(module, monkeypatch)
@@ -367,6 +585,17 @@ def test_rebound_audit_cannot_hide_authorization_or_fused_ledger_mutation(module
     artifact["question_audits"][0]["product_retrieval"]["fcd1_diagnostic_ledger_sha256"] = _canonical_sha256(ledger)
     raw = json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
     path = tmp_path / "fused-drift.json"; path.write_bytes(raw)
+    with pytest.raises(ValueError):
+        module.analyze(path, expected_artifact_sha256=hashlib.sha256(raw).hexdigest(), expected_git_head="a" * 40)
+
+
+@pytest.mark.parametrize(("field", "value"), [("RRF_K", 59), ("FROZEN_WEIGHTS", {"raw_bm25": 3.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0})])
+def test_frozen_rrf_parameters_cannot_drift(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str, value: object) -> None:
+    _configured(module, monkeypatch)
+    artifact = _artifact()
+    monkeypatch.setattr(module, field, value)
+    raw = json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    path = tmp_path / f"{field}.json"; path.write_bytes(raw)
     with pytest.raises(ValueError):
         module.analyze(path, expected_artifact_sha256=hashlib.sha256(raw).hexdigest(), expected_git_head="a" * 40)
 

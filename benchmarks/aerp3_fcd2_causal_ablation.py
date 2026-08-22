@@ -29,6 +29,7 @@ BASELINE_ARM = "raw_bm25_plus_raw_dense"
 TOP10_ARMS = ("raw_bm25", "raw_dense", "raw_bm25_plus_raw_dense", "legacy_rpg", "product_six_view", "historical_six_view")
 VIEWS = ("raw_bm25", "raw_dense", "observation_bm25", "observation_dense", "checkpoint_dense", "combo_dense")
 ADD_VIEW_ORDER = ("raw_bm25", "raw_dense", "observation_bm25", "observation_dense", "checkpoint_dense", "combo_dense")
+PRODUCT_FUSION_VIEW_ORDER = ("raw_bm25", "observation_bm25", "raw_dense", "observation_dense", "checkpoint_dense", "combo_dense")
 RRF_K = 60
 FROZEN_WEIGHTS = {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0}
 P1_MIN_DELTA = 0.05
@@ -466,7 +467,7 @@ def _ledger(trace: dict[str, Any]) -> dict[str, Any]:
         if set(receipts_by_view) != set(VIEWS):
             raise ValueError("question FCD-1 component-rank receipt views differ")
         expected_contributions: dict[str, float] = {}
-        for view in VIEWS:
+        for view in PRODUCT_FUSION_VIEW_ORDER:
             component_rank = ranks[view]
             if not isinstance(component_rank, int) or isinstance(component_rank, bool) or not 1 <= component_rank <= len(full_orders_by_view[view]) or full_orders_by_view[view][component_rank - 1] != event:
                 raise ValueError("question FCD-1 component rank does not replay full order")
@@ -474,11 +475,12 @@ def _ledger(trace: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("question FCD-1 component-rank receipt does not replay")
             expected = FROZEN_WEIGHTS[view] / (RRF_K + component_rank)
             contribution = contributions[view]
-            if isinstance(contribution, bool) or not isinstance(contribution, (int, float)) or not math.isfinite(contribution) or not math.isclose(float(contribution), expected, rel_tol=0.0, abs_tol=1e-15):
+            if isinstance(contribution, bool) or not isinstance(contribution, (int, float)) or not math.isfinite(contribution) or float(contribution) != expected:
                 raise ValueError("question FCD-1 contribution does not replay")
             expected_contributions[view] = expected
         final = row.get("final_rrf")
-        if isinstance(final, bool) or not isinstance(final, (int, float)) or not math.isfinite(final) or not math.isclose(float(final), math.fsum(expected_contributions.values()), rel_tol=0.0, abs_tol=1e-15):
+        expected_final = sum(expected_contributions[view] for view in PRODUCT_FUSION_VIEW_ORDER)
+        if isinstance(final, bool) or not isinstance(final, (int, float)) or not math.isfinite(final) or float(final) != expected_final:
             raise ValueError("question FCD-1 fused score does not replay")
         fused_ids.append(event)
     if len(set(fused_ids)) != EXPECTED_POOL:
@@ -497,6 +499,62 @@ def _view_hashes(ledger: dict[str, Any], view: str) -> list[str]:
 
 def _view_rows(ledger: dict[str, Any], view: str) -> list[dict[str, Any]]:
     return _ids_rows(_mapping(ledger["view_top_50"], "views").get(view), f"{view} top-50")
+
+
+def replay_weighted_rrf(ledger: dict[str, Any], *, active_views: tuple[str, ...] | None = None) -> dict[str, Any]:
+    """Pure full-universe weighted-RRF replay without manufacturing tie order."""
+    active = PRODUCT_FUSION_VIEW_ORDER if active_views is None else tuple(active_views)
+    if not active or any(view not in PRODUCT_FUSION_VIEW_ORDER for view in active) or len(set(active)) != len(active):
+        raise ValueError("FCD-2 active fusion views are malformed")
+    full_orders = _mapping(ledger.get("view_full_order"), "question FCD-1 full view orders")
+    if set(full_orders) != set(VIEWS):
+        raise ValueError("question FCD-1 full view order schema is malformed")
+    universe = full_orders[PRODUCT_FUSION_VIEW_ORDER[0]]
+    if not isinstance(universe, list) or not universe or any(not isinstance(event, str) or not event for event in universe) or len(universe) != len(set(universe)):
+        raise ValueError("question FCD-1 full fusion universe is malformed")
+    universe_set = set(universe)
+    ranks: dict[str, dict[str, int]] = {}
+    for view in PRODUCT_FUSION_VIEW_ORDER:
+        order = full_orders[view]
+        if not isinstance(order, list) or len(order) != len(universe) or set(order) != universe_set or len(order) != len(set(order)):
+            raise ValueError("question FCD-1 full fusion orders differ")
+        ranks[view] = {event: rank for rank, event in enumerate(order, start=1)}
+    scores: dict[str, float] = {}
+    contributions: dict[str, dict[str, float]] = {}
+    for event in universe:
+        row: dict[str, float] = {}
+        for view in PRODUCT_FUSION_VIEW_ORDER:
+            if view in active:
+                contribution = FROZEN_WEIGHTS[view] / (RRF_K + ranks[view][event])
+                row[view] = contribution
+        # Match the producer's ordinary ``sum`` and insertion order exactly;
+        # do not use math.fsum or any alternate view ordering.
+        scores[event] = sum(row[view] for view in PRODUCT_FUSION_VIEW_ORDER if view in row)
+        contributions[event] = row
+    return {"scores": scores, "ranks": ranks, "contributions": contributions}
+
+
+def _strict_cutoff(replay: dict[str, Any], cutoff: int) -> bool:
+    scores = replay["scores"]
+    if not isinstance(cutoff, int) or isinstance(cutoff, bool) or cutoff < 1 or not isinstance(scores, dict) or len(scores) <= cutoff:
+        return False
+    values = list(scores.values())
+    if any(isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) for score in values):
+        return False
+    descending = sorted(values, reverse=True)
+    return descending[cutoff - 1] > descending[cutoff]
+
+
+def _top_membership(replay: dict[str, Any], cutoff: int) -> set[str]:
+    """Return a cutoff-safe membership set; callers must not infer tie order."""
+    if not _strict_cutoff(replay, cutoff):
+        raise ValueError("full-order fusion cutoff tie is not provable")
+    scores = replay["scores"]
+    threshold = sorted(scores.values(), reverse=True)[cutoff - 1]
+    result = {event for event, score in scores.items() if score >= threshold}
+    if len(result) != cutoff:
+        raise ValueError("full-order fusion membership is not uniquely determined")
+    return result
 
 
 def _ids_rows(value: Any, label: str) -> list[dict[str, Any]]:
@@ -520,20 +578,6 @@ def _ids_rows(value: Any, label: str) -> list[dict[str, Any]]:
     if len({row["source_event_id"] for row in result}) != EXPECTED_POOL or len({row["ranking_key_sha256"] for row in result}) != EXPECTED_POOL:
         raise ValueError(f"{label} identities are not unique")
     return result
-
-
-def _rrf(views: dict[str, list[dict[str, Any]]]) -> list[str]:
-    scores: dict[str, float] = {}
-    orders: dict[str, int] = {}
-    for view in VIEWS:
-        for rank, row in enumerate(views[view], start=1):
-            identifier = row["ranking_key_sha256"]
-            order = row["ranking_key_order"]
-            if identifier in orders and orders[identifier] != order:
-                raise ValueError("FCD-1 ranking-key order differs across views")
-            orders[identifier] = order
-            scores[identifier] = scores.get(identifier, 0.0) + FROZEN_WEIGHTS[view] / (RRF_K + rank)
-    return [identifier for identifier, _ in sorted(scores.items(), key=lambda item: (-item[1], orders[item[0]]))[:EXPECTED_POOL]]
 
 
 def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expected_git_head: str, prefreeze_receipt_path: Path | str | None = None, expected_prefreeze_sha256: str | None = None, _artifact_bytes: bytes | None = None) -> dict[str, Any]:
@@ -585,18 +629,91 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
         raw_structural_ok = raw_structural_ok and exact10 == EXPECTED_QUESTIONS and set50 == EXPECTED_QUESTIONS
 
     semantics: dict[str, Any] = {"status": "not_run_due_to_component_parity"}
-    views_by_item: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    ledgers_by_item: dict[str, dict[str, Any]] = {}
     semantics_ok = False
+    baseline_tie_break_unprovable = 0
     if raw_structural_ok:
-        exact = 0
+        full_order_receipts = fused_membership = stored_fused_order = product_stored_order = strict_top50 = strict_top10 = 0
         for item in item_ids:
             ledger = _ledger(_mapping(traces[item], "product trace"))
-            view_records = {view: _view_rows(ledger, view) for view in VIEWS}
+            replay = replay_weighted_rrf(ledger)
+            full_order_receipts += 1
+            strict50 = _strict_cutoff(replay, EXPECTED_POOL)
+            strict10 = _strict_cutoff(replay, TOP_K)
+            strict_top50 += strict50
+            strict_top10 += strict10
+            if not strict50 or not strict10:
+                baseline_tie_break_unprovable += 1
+                continue
+            fused = ledger["fused_top_50"]
+            stored_events = [row["source_event_id"] for row in fused]
+            expected_membership = _top_membership(replay, EXPECTED_POOL)
+            fused_membership += set(stored_events) == expected_membership
+            stored_fused_order += all(
+                replay["scores"][stored_events[index]] >= replay["scores"][stored_events[index + 1]]
+                for index in range(len(stored_events) - 1)
+            )
+            event_hashes = {
+                member["source_event_id"]: member["ranking_key_sha256"]
+                for group in ledger["checkpoint_tie_groups"]
+                for member in group["chronological_members"]
+            }
             product_hashes = [hashlib.sha256(identifier.encode()).hexdigest() for identifier in _ids(_mapping(top10[PRODUCT_ARM], "product top-10").get(item), "product top-10", TOP_K)]
-            exact += _rrf(view_records)[:TOP_K] == product_hashes
-            views_by_item[item] = view_records
-        semantics = {"status": "complete", "expected_questions": EXPECTED_QUESTIONS, "top10_order_exact_questions": exact}
-        semantics_ok = exact == EXPECTED_QUESTIONS
+            product_stored_order += (
+                set(stored_events[:TOP_K]) == _top_membership(replay, TOP_K)
+                and [event_hashes[event] for event in stored_events[:TOP_K]] == product_hashes
+            )
+            ledgers_by_item[item] = ledger
+        semantics = {
+            "status": "FUSION_TIEBREAK_UNPROVABLE" if baseline_tie_break_unprovable else "complete",
+            "expected_questions": EXPECTED_QUESTIONS,
+            "full_order_receipts_exact_questions": full_order_receipts,
+            "full_fused_top50_membership_exact_questions": fused_membership,
+            "stored_fused_top50_order_consistent_questions": stored_fused_order,
+            "product_top10_stored_order_exact_questions": product_stored_order,
+            "strict_top50_boundary_questions": strict_top50,
+            "strict_top10_boundary_questions": strict_top10,
+            "tie_break_unprovable_questions": baseline_tie_break_unprovable,
+        }
+        semantics_ok = baseline_tie_break_unprovable == 0 and all(value == EXPECTED_QUESTIONS for value in (full_order_receipts, fused_membership, stored_fused_order, product_stored_order, strict_top50, strict_top10))
+
+    counterfactual_by_item: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    expected_scenario_question_checks = EXPECTED_QUESTIONS * 2 * len(ADD_VIEW_ORDER)
+    scenario_question_checks = 0
+    scenario_strict_questions = 0
+    ablation_replay: dict[str, Any] = {
+        "status": "not_run_due_to_fusion_semantics_parity",
+        "full_authorized_universe": True,
+        "expected_scenario_question_checks": expected_scenario_question_checks,
+        "scenario_question_checks": 0,
+        "strict_top10_boundary_questions": 0,
+        "all_scenarios_strict_top10_boundary": False,
+    }
+    if semantics_ok:
+        for item in item_ids:
+            add: dict[str, dict[str, Any]] = {}
+            leave: dict[str, dict[str, Any]] = {}
+            for index, view in enumerate(ADD_VIEW_ORDER, start=1):
+                replay = replay_weighted_rrf(ledgers_by_item[item], active_views=ADD_VIEW_ORDER[:index])
+                add[view] = replay; scenario_question_checks += 1
+                scenario_strict_questions += _strict_cutoff(replay, TOP_K)
+            for view in ADD_VIEW_ORDER:
+                replay = replay_weighted_rrf(ledgers_by_item[item], active_views=tuple(name for name in PRODUCT_FUSION_VIEW_ORDER if name != view))
+                leave[view] = replay; scenario_question_checks += 1
+                scenario_strict_questions += _strict_cutoff(replay, TOP_K)
+            counterfactual_by_item[item] = {"add_view": add, "leave_one_out": leave}
+        all_scenarios_strict = (
+            scenario_question_checks == expected_scenario_question_checks
+            and scenario_strict_questions == expected_scenario_question_checks
+        )
+        ablation_replay = {
+            "status": "complete" if all_scenarios_strict else "FUSION_TIEBREAK_UNPROVABLE",
+            "full_authorized_universe": True,
+            "expected_scenario_question_checks": expected_scenario_question_checks,
+            "scenario_question_checks": scenario_question_checks,
+            "strict_top10_boundary_questions": scenario_strict_questions,
+            "all_scenarios_strict_top10_boundary": all_scenarios_strict,
+        }
 
     base = {
         "schema": SCHEMA, "version": 1, "status": "complete",
@@ -604,9 +721,10 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
             "official_exact": "resolved_dialog_ids_plus_unresolved_evidence_item_count",
             "top_k": TOP_K, "pool_size": EXPECTED_POOL, "raw_component_arms": list(RAW_ARMS),
             "raw_parity_gate": "top10_order_and_top50_set_and_recall_delta_zero",
-            "fusion_semantics_gate": "top50_truncated_weighted_rrf_matches_frozen_product_top10_order",
-            "oracle": "six_view_top50_union_membership", "rrf_k": RRF_K,
-            "weights": FROZEN_WEIGHTS, "add_view_order": list(ADD_VIEW_ORDER),
+            "fusion_semantics_gate": "full_authorized_universe_weighted_rrf_membership_with_strict_cutoffs_and_stored_producer_order_consistency",
+            "oracle": "six_view_per_view_top50_candidate_coverage", "rrf_k": RRF_K,
+            "weights": FROZEN_WEIGHTS, "fusion_view_accumulation_order": list(PRODUCT_FUSION_VIEW_ORDER),
+            "add_view_order": list(ADD_VIEW_ORDER), "ablation": "full_order_rank_counterfactual",
             "p1_min_delta": P1_MIN_DELTA, "p2_min_delta": P2_MIN_DELTA,
             "strict_majority_multiplier": STRICT_MAJORITY_MULTIPLIER,
             "expected_conversations": EXPECTED_CONVERSATIONS,
@@ -615,17 +733,37 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
         "input_receipt": {"artifact_sha256": receipt, **({"prefreeze_sha256": prefreeze_sha} if prefreeze_sha is not None else {}), "artifact_producer_git_head": expected_git_head, "analyzer_git_state": analyzer_git_state, "analyzer_implementation_sha256": _sha(Path(__file__).read_bytes())},
         "raw_component_parity": parity,
         "fusion_semantics_parity": semantics,
+        "ablation_replay": ablation_replay,
     }
     if not raw_structural_ok:
         report = {**base, "verdict": "COMPONENT_PARITY_FAILED", "later_stages": "not_run_due_to_component_parity", "claim_boundary": "No label-derived causal conclusion is made when raw component parity fails."}
         _unchanged(artifact_file, raw)
         if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
         return report
-    if not semantics_ok:
-        report = {**base, "verdict": "FUSION_SEMANTICS_PARITY_FAILED", "later_stages": "not_run_due_to_fusion_semantics_parity", "claim_boundary": "No label-derived causal conclusion is made when frozen fusion semantics do not replay."}
+    if baseline_tie_break_unprovable:
+        report = {**base, "verdict": "FUSION_TIEBREAK_UNPROVABLE", "later_stages": "not_run_due_to_fusion_semantics_parity", "claim_boundary": "No label-derived conclusion is made when a required fusion cutoff tie lacks a proven global lexical order."}
         _unchanged(artifact_file, raw)
         if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
         return report
+    if not semantics_ok:
+        report = {**base, "verdict": "FUSION_SEMANTICS_PARITY_FAILED", "later_stages": "not_run_due_to_fusion_semantics_parity", "claim_boundary": "No label-derived causal conclusion is made when frozen full-order fusion semantics do not replay."}
+        _unchanged(artifact_file, raw)
+        if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
+        return report
+    if ablation_replay["status"] != "complete":
+        report = {**base, "verdict": "ABLATION_TIEBREAK_UNPROVABLE", "later_stages": "not_run_due_to_ablation_replay", "claim_boundary": "No label-derived conclusion is made when a fixed full-order ablation scenario has an unprovable Top-10 cutoff tie."}
+        _unchanged(artifact_file, raw)
+        if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
+        return report
+
+    event_hashes_by_item = {
+        item: {
+            member["source_event_id"]: member["ranking_key_sha256"]
+            for group in ledgers_by_item[item]["checkpoint_tie_groups"]
+            for member in group["chronological_members"]
+        }
+        for item in item_ids
+    }
 
     # The only permitted labels before oracle/ablation now establish the
     # pre-registered raw-control metric parity after both unlabeled replays.
@@ -659,22 +797,22 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
     baseline_rows: list[tuple[int, list[str], int, list[str]]] = []
     product_rows: list[tuple[int, list[str], int, list[str]]] = []
     metadata_by_item: dict[str, tuple[int, list[str], int]] = {}
-    recoverable: dict[str, list[int]] = {}
+    budgeted_recovery: dict[str, list[int]] = {}
     for question in questions:
         item, category, conversation = question.get("item_id"), question.get("category"), question.get("conversation_id")
         if not isinstance(item, str) or not isinstance(category, int) or isinstance(category, bool) or not isinstance(conversation, str) or not conversation:
             raise ValueError("artifact question metadata is invalid")
         gold, unresolved = _gold(question)
         gold_hashes = [hashlib.sha256(identifier.encode()).hexdigest() for identifier in gold]
-        view_records = views_by_item[item]
-        views = {view: [row["ranking_key_sha256"] for row in view_records[view]] for view in VIEWS}
+        ledger = ledgers_by_item[item]
+        views = {view: [row["ranking_key_sha256"] for row in _view_rows(ledger, view)] for view in VIEWS}
         union = set(identifier for view in VIEWS for identifier in views[view])
         product = [hashlib.sha256(identifier.encode()).hexdigest() for identifier in _ids(_mapping(top10[PRODUCT_ARM], "product top-10").get(item), "product top-10", TOP_K)]
         baseline = [hashlib.sha256(identifier.encode()).hexdigest() for identifier in _ids(_mapping(top10[BASELINE_ARM], "baseline top-10").get(item), "baseline top-10", TOP_K)]
         oracle_rows.append((category, gold_hashes, unresolved, union)); product_rows.append((category, gold_hashes, unresolved, product)); baseline_rows.append((category, gold_hashes, unresolved, baseline))
         for view in VIEWS: view_rows[view].append((category, gold_hashes, unresolved, views[view]))
         metadata_by_item[item] = (category, gold_hashes, unresolved)
-        bucket = recoverable.setdefault(_sha(conversation.encode()), [0, 0])
+        bucket = budgeted_recovery.setdefault(_sha(conversation.encode()), [0, 0])
         # The frozen official denominator preserves evidence multiplicity, so
         # recovery counts do too.  One partially recovered multi-evidence item
         # must not be promoted to a wholly recovered question.
@@ -686,23 +824,23 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
     p1 = _p1_pass(deltas["oracle_minus_raw_fusion"])
     p2 = _p2_pass(deltas["product_minus_raw_fusion"])
     ablations = {"add_view": {}, "leave_one_out": {}}
-    for index, view in enumerate(ADD_VIEW_ORDER, start=1):
+    for view in ADD_VIEW_ORDER:
         ablations["add_view"][view] = _aggregate([
-            (*metadata_by_item[item], _rrf({name: records if name in ADD_VIEW_ORDER[:index] else [] for name, records in views_by_item[item].items()}))
+            (*metadata_by_item[item], [event_hashes_by_item[item][event] for event in _top_membership(counterfactual_by_item[item]["add_view"][view], TOP_K)])
             for item in item_ids
         ])
         ablations["leave_one_out"][view] = _aggregate([
-            (*metadata_by_item[item], _rrf({name: records if name != view else [] for name, records in views_by_item[item].items()}))
+            (*metadata_by_item[item], [event_hashes_by_item[item][event] for event in _top_membership(counterfactual_by_item[item]["leave_one_out"][view], TOP_K)])
             for item in item_ids
         ])
-    if len(recoverable) != EXPECTED_CONVERSATIONS:
+    if len(budgeted_recovery) != EXPECTED_CONVERSATIONS:
         raise ValueError("artifact conversation denominator differs")
-    recovered_total = sum(item[0] for item in recoverable.values()); missed_total = recovered_total + sum(item[1] for item in recoverable.values())
+    recovered_total = sum(item[0] for item in budgeted_recovery.values()); missed_total = recovered_total + sum(item[1] for item in budgeted_recovery.values())
     strict_majority = recovered_total * STRICT_MAJORITY_MULTIPLIER > missed_total
-    concentration_count = sum(recovered >= nonrecoverable for recovered, nonrecoverable in recoverable.values())
+    concentration_count = sum(recovered >= nonrecoverable for recovered, nonrecoverable in budgeted_recovery.values())
     concentration = concentration_count >= MIN_RECOVERY_CONVERSATIONS
     fusion = p1 and p2 and strict_majority and concentration
-    report = {**base, "verdict": "FUSION_SUPPORTED" if fusion else "REPRESENTATION_SUPPORTED", "stages": {"oracle": oracle, "raw_fusion": baseline, "product": product, "deltas": deltas, "view_metrics": {view: _aggregate(values) for view, values in view_rows.items()}, "ablations": ablations, "gates": {"p1": p1, "p2": p2, "strict_majority": strict_majority, "recovery_conversation_count": concentration_count, "recovery_conversation_pass": concentration}, "hashed_conversation_recovery": {key: {"recoverable": value[0], "nonrecoverable": value[1]} for key, value in sorted(recoverable.items())}}, "claim_boundary": "Frozen ranking analysis only; it does not establish causal behavior outside this artifact."}
+    report = {**base, "verdict": "FUSION_SUPPORTED" if fusion else "REPRESENTATION_SUPPORTED", "stages": {"oracle": oracle, "raw_fusion": baseline, "product": product, "deltas": deltas, "view_metrics": {view: _aggregate(values) for view, values in view_rows.items()}, "ablations": ablations, "gates": {"p1": p1, "p2": p2, "strict_majority": strict_majority, "budgeted_recovery_conversation_count": concentration_count, "budgeted_recovery_conversation_pass": concentration}, "hashed_budgeted_recovery": {key: {"recoverable": value[0], "nonrecoverable": value[1]} for key, value in sorted(budgeted_recovery.items())}}, "claim_boundary": "Frozen ranking analysis is limited to pre-registered per-view Top-50 candidate coverage and fixed full-order fusion replay; it is not a causal or representation ceiling claim."}
     _unchanged(artifact_file, raw)
     if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
     return report
