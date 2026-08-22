@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from benchmarks import aerp1_locomo_three_way as aerp1
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "aerp3-fcd2-causal-ablation"
@@ -38,6 +40,7 @@ PRODUCT_TOP10_SHA256 = "64007282069621bb3e603598938993ebe0907e8e84ebaa65394741ab
 FORBIDDEN = frozenset({"query", "transcript", "answer", "text"})
 FCD1_LEDGER_FIELDS = frozenset({"schema", "input_sha256", "authorization_sha256", "view_top_50", "view_top_50_sha256", "view_full_order", "view_order_sha256", "fused_top_50", "checkpoint_tie_group_semantics", "checkpoint_tie_groups"})
 FCD1_VIEW_ROW_FIELDS = frozenset({"source_event_id", "ranking_key_sha256", "ranking_key_order", "rank", "score"})
+ANALYZER_GIT_STATE_FIELDS = frozenset({"git_head", "git_tree", "git_dirty", "worktree_status_sha256", "commit_diff_sha256", "commit_diff_bytes"})
 
 
 def _canonical(value: Any) -> bytes:
@@ -70,6 +73,20 @@ def _git_head(value: Any, label: str) -> str:
     return value
 
 
+def _clean_analyzer_git_state(value: Any, label: str) -> dict[str, Any]:
+    state = _mapping(value, label)
+    if set(state) != ANALYZER_GIT_STATE_FIELDS or _git_head(state.get("git_head"), f"{label} head") != state.get("git_head") or _git_head(state.get("git_tree"), f"{label} tree") != state.get("git_tree") or state.get("git_dirty") is not False or _digest_value(state.get("worktree_status_sha256"), f"{label} worktree status") != state.get("worktree_status_sha256") or _digest_value(state.get("commit_diff_sha256"), f"{label} commit diff") != state.get("commit_diff_sha256") or not isinstance(state.get("commit_diff_bytes"), int) or isinstance(state["commit_diff_bytes"], bool) or state["commit_diff_bytes"] < 0:
+        raise ValueError(f"{label} must be an exact clean Git-state receipt")
+    return dict(state)
+
+
+def _analyzer_git_state() -> dict[str, Any]:
+    try:
+        return _clean_analyzer_git_state(aerp1.git_state(ROOT), "analyzer Git state")
+    except ValueError as error:
+        raise RuntimeError("analyzer Git state is not clean or complete") from error
+
+
 def _ids(value: Any, label: str, size: int) -> list[str]:
     if not isinstance(value, list) or len(value) != size or any(not isinstance(item, str) or not item for item in value) or len(set(value)) != size:
         raise ValueError(f"{label} must contain {size} unique opaque IDs")
@@ -89,6 +106,19 @@ def _load(path: Path, expected_sha: str, raw: bytes | None = None) -> tuple[dict
     if artifact.get("schema") != "aerp2-product-six-view-locomo" or artifact.get("status") != "complete":
         raise ValueError("artifact schema or status mismatch")
     return artifact, raw, receipt
+
+
+def _frozen_artifact_producer_head(raw: bytes) -> str:
+    """Bind publication provenance to the already byte-frozen artifact."""
+    try:
+        artifact = _mapping(json.loads(raw), "frozen artifact")
+    except json.JSONDecodeError as error:
+        raise ValueError("frozen artifact is not valid JSON") from error
+    before = _mapping(artifact.get("git_state_before"), "frozen artifact Git state before")
+    after = _mapping(artifact.get("git_state_after"), "frozen artifact Git state after")
+    if before != after or before.get("git_dirty") is not False:
+        raise ValueError("frozen artifact Git receipt is not clean and stable")
+    return _git_head(before.get("git_head"), "frozen artifact producer Git head")
 
 
 def _load_prefreeze(path: Path, expected_sha: str) -> tuple[dict[str, Any], bytes, str]:
@@ -507,6 +537,7 @@ def _rrf(views: dict[str, list[dict[str, Any]]]) -> list[str]:
 
 
 def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expected_git_head: str, prefreeze_receipt_path: Path | str | None = None, expected_prefreeze_sha256: str | None = None, _artifact_bytes: bytes | None = None) -> dict[str, Any]:
+    analyzer_git_state = _analyzer_git_state()
     artifact_file = Path(artifact_path).resolve()
     artifact, raw, receipt = _load(artifact_file, expected_artifact_sha256, _artifact_bytes)
     if (prefreeze_receipt_path is None) != (expected_prefreeze_sha256 is None):
@@ -581,7 +612,7 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
             "expected_conversations": EXPECTED_CONVERSATIONS,
             "min_recovery_conversations": MIN_RECOVERY_CONVERSATIONS,
         },
-        "input_receipt": {"artifact_sha256": receipt, **({"prefreeze_sha256": prefreeze_sha} if prefreeze_sha is not None else {}), "git_head": expected_git_head, "analyzer_implementation_sha256": _sha(Path(__file__).read_bytes())},
+        "input_receipt": {"artifact_sha256": receipt, **({"prefreeze_sha256": prefreeze_sha} if prefreeze_sha is not None else {}), "artifact_producer_git_head": expected_git_head, "analyzer_git_state": analyzer_git_state, "analyzer_implementation_sha256": _sha(Path(__file__).read_bytes())},
         "raw_component_parity": parity,
         "fusion_semantics_parity": semantics,
     }
@@ -705,8 +736,14 @@ def atomic_json(output: Path | str, report: dict[str, Any], *, artifact_path: Pa
     if report.get("schema") != SCHEMA or report.get("status") != "complete":
         raise ValueError("report schema or status mismatch")
     report_receipt = _mapping(report.get("input_receipt"), "report input receipt")
+    required_receipt = {"artifact_sha256", "artifact_producer_git_head", "analyzer_git_state", "analyzer_implementation_sha256"} | ({"prefreeze_sha256"} if prefreeze_path is not None else set())
+    if set(report_receipt) != required_receipt:
+        raise ValueError("report input receipt shape mismatch")
     if _sha(expected_artifact_bytes) != _digest_value(report_receipt.get("artifact_sha256"), "report artifact receipt"):
         raise ValueError("report artifact receipt mismatch")
+    if _git_head(report_receipt.get("artifact_producer_git_head"), "report artifact producer Git head") != _frozen_artifact_producer_head(expected_artifact_bytes):
+        raise ValueError("report artifact producer Git head does not match frozen artifact")
+    analyzer_state = _clean_analyzer_git_state(report_receipt.get("analyzer_git_state"), "report analyzer Git state")
     if _digest_value(report_receipt.get("analyzer_implementation_sha256"), "report analyzer receipt") != _sha(Path(__file__).read_bytes()):
         raise ValueError("report analyzer receipt mismatch")
     if (prefreeze_path is None) != (expected_prefreeze_bytes is None):
@@ -723,13 +760,15 @@ def atomic_json(output: Path | str, report: dict[str, Any], *, artifact_path: Pa
     try:
         _unchanged(artifact, expected_artifact_bytes)
         if prefreeze is not None and expected_prefreeze_bytes is not None: _unchanged(prefreeze, expected_prefreeze_bytes)
-        if _clean_git_head(ROOT) != report_receipt.get("git_head"):
-            raise RuntimeError("root Git head changed before publication")
+        if _analyzer_git_state() != analyzer_state:
+            raise RuntimeError("analyzer Git state changed before publication")
         if prefreeze is not None:
             if source_repo is None or not source_repo.exists():
                 raise RuntimeError("prefreeze source repository is unavailable")
             if _clean_git_head(source_repo) != expected_source_head:
                 raise RuntimeError("prefreeze source Git head changed before publication")
+        if _analyzer_git_state() != analyzer_state:
+            raise RuntimeError("analyzer Git state changed before publication")
         os.link(temporary, output)
         temporary.unlink()
     except BaseException:

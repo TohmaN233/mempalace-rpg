@@ -206,6 +206,8 @@ def _configured(module, monkeypatch: pytest.MonkeyPatch, artifact: dict | None =
     monkeypatch.setattr(module, "TOP_K", 2)
     monkeypatch.setattr(module, "PRODUCT_TOP10_SHA256", artifact["fcd1_acceptance"]["actual_product_top10_sha256"])
     monkeypatch.setattr(module, "_clean_git_head", lambda _path: "a" * 40)
+    analyzer_state = {"git_head": "b" * 40, "git_tree": "c" * 40, "git_dirty": False, "worktree_status_sha256": "d" * 64, "commit_diff_sha256": "e" * 64, "commit_diff_bytes": 0}
+    monkeypatch.setattr(module, "_analyzer_git_state", lambda: dict(analyzer_state))
 
 
 def _analyze(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str = "fusion", *, duplicate_gold: bool = False) -> tuple[dict, Path, bytes]:
@@ -228,6 +230,15 @@ def test_three_frozen_verdict_paths(module, monkeypatch: pytest.MonkeyPatch, tmp
     else:
         assert report["raw_component_parity"]["arms"]["raw_bm25"]["top50_set_exact_questions"] == 10
         assert report["raw_component_parity"]["arms"]["raw_dense"]["official_exact_recall_at_10_delta"] == {"overall": 0.0, "hard": 0.0, "adversarial": 0.0}
+
+
+def test_report_separates_artifact_producer_and_analyzer_git_provenance(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    report, _artifact, _raw = _analyze(module, monkeypatch, tmp_path)
+
+    receipt = report["input_receipt"]
+    assert receipt["artifact_producer_git_head"] == "a" * 40
+    assert set(receipt["analyzer_git_state"]) == {"git_head", "git_tree", "git_dirty", "worktree_status_sha256", "commit_diff_sha256", "commit_diff_bytes"}
+    assert receipt["analyzer_git_state"]["git_dirty"] is False
 
 
 def test_duplicate_gold_and_unresolved_are_counted_without_id_leakage(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -401,6 +412,14 @@ def test_atomic_publisher_rejects_mutation_and_preserves_input(module, monkeypat
     with pytest.raises(ValueError):
         module.atomic_json(output, bad_analyzer, artifact_path=artifact, expected_artifact_bytes=raw)
     assert not output.exists()
+    bad_provenance = deepcopy(report); bad_provenance["input_receipt"]["git_head"] = "a" * 40
+    with pytest.raises(ValueError, match="input receipt shape"):
+        module.atomic_json(output, bad_provenance, artifact_path=artifact, expected_artifact_bytes=raw)
+    assert not output.exists()
+    forged_producer = deepcopy(report); forged_producer["input_receipt"]["artifact_producer_git_head"] = "f" * 40
+    with pytest.raises(ValueError, match="artifact producer Git head"):
+        module.atomic_json(output, forged_producer, artifact_path=artifact, expected_artifact_bytes=raw)
+    assert not output.exists()
     unchanged = artifact.read_bytes()
     with pytest.raises(ValueError):
         module.atomic_json(artifact, report, artifact_path=artifact, expected_artifact_bytes=raw)
@@ -416,6 +435,23 @@ def test_atomic_publisher_rejects_mutation_and_preserves_input(module, monkeypat
     artifact.write_bytes(raw)
     module.atomic_json(output, report, artifact_path=artifact, expected_artifact_bytes=raw)
     assert json.loads(output.read_text(encoding="utf-8"))["verdict"] == "FUSION_SUPPORTED"
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("git_head", "f" * 40), ("git_tree", "f" * 40),
+    ("worktree_status_sha256", "f" * 64), ("commit_diff_sha256", "f" * 64),
+    ("commit_diff_bytes", 1),
+])
+def test_atomic_publisher_rejects_any_analyzer_git_state_drift(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str, value: object) -> None:
+    report, artifact, raw = _analyze(module, monkeypatch, tmp_path)
+    changed = deepcopy(report["input_receipt"]["analyzer_git_state"])
+    changed[field] = value
+    monkeypatch.setattr(module, "_analyzer_git_state", lambda: changed)
+
+    output = tmp_path / f"analyzer-{field}.json"
+    with pytest.raises(RuntimeError, match="analyzer Git state changed"):
+        module.atomic_json(output, report, artifact_path=artifact, expected_artifact_bytes=raw)
+    assert not output.exists()
 
 
 def test_staged_prefreeze_receipt_binds_product_stream_and_both_input_receipts(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -480,6 +516,8 @@ def test_staged_prefreeze_receipt_binds_product_stream_and_both_input_receipts(m
 
     report = module.analyze(artifact_path, expected_artifact_sha256=hashlib.sha256(artifact_raw).hexdigest(), expected_git_head="a" * 40, prefreeze_receipt_path=prefreeze_path, expected_prefreeze_sha256=prefreeze_sha)
     assert report["input_receipt"]["prefreeze_sha256"] == prefreeze_sha
+    assert report["input_receipt"]["artifact_producer_git_head"] == "a" * 40
+    assert report["input_receipt"]["analyzer_git_state"]["git_head"] == "b" * 40
     raw_map_drift = json.loads(artifact_raw)
     raw_map_drift["event_dialog_mapping_sha256"]["legacy"] = "0" * 64
     raw_map_drift_bytes = json.dumps(raw_map_drift, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -506,7 +544,22 @@ def test_staged_prefreeze_receipt_binds_product_stream_and_both_input_receipts(m
     with pytest.raises(RuntimeError, match="source Git head"):
         module.atomic_json(source_drift, report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
     assert not source_drift.exists()
+    analyzer_after_source = tmp_path / "analyzer-after-source.json"
+    analyzer_drift = deepcopy(report["input_receipt"]["analyzer_git_state"])
+    analyzer_drift["git_tree"] = "f" * 40
+    source_checked = {"value": False}
+    def source_check_then_drift(path: Path | str) -> str:
+        if Path(path).resolve() == source_repo.resolve():
+            source_checked["value"] = True
+        return "a" * 40
+    monkeypatch.setattr(module, "_clean_git_head", source_check_then_drift)
+    monkeypatch.setattr(module, "_analyzer_git_state", lambda: analyzer_drift if source_checked["value"] else report["input_receipt"]["analyzer_git_state"])
+    with pytest.raises(RuntimeError, match="analyzer Git state changed"):
+        module.atomic_json(analyzer_after_source, report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
+    assert source_checked["value"] is True
+    assert not analyzer_after_source.exists()
     monkeypatch.setattr(module, "_clean_git_head", lambda _path: "a" * 40)
+    monkeypatch.setattr(module, "_analyzer_git_state", lambda: dict(report["input_receipt"]["analyzer_git_state"]))
     module.atomic_json(output, report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
     assert output.exists()
     with pytest.raises(ValueError):
