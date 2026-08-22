@@ -11,7 +11,8 @@
   "protocol": {
     "top_k": 10,
     "candidate_pool_size": 10,
-    "scorer": "official_exact_dialog_id",
+    "primary_scorer": "official_exact_source_multiplicity",
+    "secondary_scorer": "normalized_repaired_unique_dialog",
     "split": "all",
     "annotation_free_retrieval": true,
     "raw_dialog_text": "speaker/date/caption/text fixed labels"
@@ -21,7 +22,16 @@
     "source_files": {
       "benchmarks/locomo_story_protocol.py": "3525630215ac760962fe38f0ac5f80f6af23fc6988844c389836587df45fa55c",
       "benchmarks/locomo_story_candidate.py": "38544f1809f94a8506926e914b9616ef9f303b0352b783cc85aade75975945f0",
-      "benchmarks/locomo_bge_encoder.py": "2c74b79529c63788f2afa65d72bc11fbb5cb8977ae217ca795058acedacb0820"
+      "benchmarks/locomo_bge_encoder.py": "2c74b79529c63788f2afa65d72bc11fbb5cb8977ae217ca795058acedacb0820",
+      "benchmarks/locomo_story_experiment.py": "ca6302c26b459492bdd0db74c73db3bba28b16b4639086d67f515300ddec239b"
+    },
+    "raw_bm25_control_anchor": {
+      "artifact": "benchmark-runs/locomo_story_dense_v2_full_run1.json",
+      "artifact_sha256": "83b87ed0912a43927b1f4573eb86bc1f0d04bb863acbb38a11ad9c966d27ec9d",
+      "official_exact_overall_question_macro_recall_at_10": 0.5634957788174197,
+      "official_exact_hard_question_macro_recall_at_10": 0.4495262353078535,
+      "normalized_repaired_overall_question_macro_recall_at_10": 0.5641684999745,
+      "normalized_repaired_hard_question_macro_recall_at_10": 0.45118461010055666
     }
   },
   "embedding": {

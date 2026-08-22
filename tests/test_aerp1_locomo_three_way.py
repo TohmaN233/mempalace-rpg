@@ -7,6 +7,7 @@ from benchmarks.aerp1_locomo_three_way import (
     EXPECTED_MANIFEST_SHA256,
     audit_product_trace,
     load_manifest,
+    question_metrics,
     rank_rpg,
     rank_vectors,
     raw_dialogs,
@@ -111,6 +112,34 @@ def test_trace_audit_detects_incomplete_partition_and_unauthorized_selection():
     assert not audit["complete"]
     assert audit["unauthorized_selected_ids"] == ["forbidden"]
     assert not audit["checks"]["candidate_partition_complete"]
+
+
+def test_official_exact_metrics_preserve_multiplicity_and_unresolved_denominator():
+    metrics = question_metrics(
+        ["dialog_a", "dialog_b"],
+        ["dialog_a", "dialog_a"],
+        evidence_item_count=3,
+        unresolved_evidence_item_count=1,
+        top_k=10,
+    )
+
+    assert metrics["retrieved_evidence_count_at_10"] == 2
+    assert metrics["recall_at_10"] == pytest.approx(2 / 3)
+    assert metrics["hit_at_10"] == 1.0
+    assert metrics["all_at_10"] == 0.0
+
+
+def test_zero_evidence_questions_are_explicitly_unscored():
+    metrics = question_metrics(
+        ["dialog_a"],
+        [],
+        evidence_item_count=0,
+        unresolved_evidence_item_count=0,
+        top_k=10,
+    )
+
+    assert not metrics["scored"]
+    assert metrics["recall_at_10"] is None
 
 
 def test_latest_ranker_uses_authorized_universe_and_emits_complete_trace(tmp_path):

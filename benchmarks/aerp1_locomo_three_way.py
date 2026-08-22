@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 from mempalace_rpg import NullEpisodeAdapter, RpgMemoryKernel, SceneEventInput  # noqa: E402
 
 MANIFEST_PATH = ROOT / "tests" / "fixtures" / "aerp1_locomo_three_way_manifest.json"
-EXPECTED_MANIFEST_SHA256 = "6f793658fc173315f0c2c62680c9fa6bc9b515260e1f8c6a35ff1ae9ce45a071"
+EXPECTED_MANIFEST_SHA256 = "e551ba6e3c71fa6f5584e700e31fc2f3fde98beab81b8b2985e8726880590822"
 TRACE_REQUIRED = {
     "policy", "campaign_id", "actor_id", "actor_type", "candidate_generation",
     "candidates", "deduplication", "authorized_candidate_ids",
@@ -93,11 +93,20 @@ def load_original_modules(original_root: Path, manifest: dict[str, Any]) -> tupl
         if observed != digest:
             raise ValueError(f"pinned original source digest mismatch: {relative}")
         snapshots[relative] = observed
+    anchor = expected["raw_bm25_control_anchor"]
+    anchor_path = original_root / anchor["artifact"]
+    anchor_digest = _sha256(anchor_path)
+    if anchor_digest != anchor["artifact_sha256"]:
+        raise ValueError("pinned raw-BM25 control artifact digest mismatch")
     benchmark_root = original_root / "benchmarks"
     protocol = _load_module("locomo_story_protocol", benchmark_root / "locomo_story_protocol.py")
     candidate = _load_module("locomo_story_candidate", benchmark_root / "locomo_story_candidate.py")
     bge = _load_module("locomo_bge_encoder", benchmark_root / "locomo_bge_encoder.py")
-    return protocol, candidate, bge, {**state, "source_sha256": snapshots}
+    return protocol, candidate, bge, {
+        **state,
+        "source_sha256": snapshots,
+        "raw_bm25_control_artifact_sha256": anchor_digest,
+    }
 
 
 def raw_dialogs(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -335,24 +344,108 @@ def produce_rankings(
     return rankings, traces, elapsed
 
 
-def _mean(rows: Iterable[dict[str, Any]], field: str) -> float:
-    values = [float(row[field]) for row in rows]
-    return sum(values) / len(values) if values else 0.0
-
-
-def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def question_metrics(
+    ranked_ids: list[str],
+    resolved_gold_ids: Iterable[str],
+    *,
+    evidence_item_count: int,
+    unresolved_evidence_item_count: int,
+    top_k: int,
+) -> dict[str, Any]:
+    """Match the pinned MemPalace experiment's item-multiplicity scorer at one k."""
+    resolved = tuple(str(value) for value in resolved_gold_ids)
+    if top_k != 10:
+        raise ValueError("the frozen three-way scorer requires top_k=10")
+    if any(not value.strip() for value in resolved):
+        raise ValueError("resolved gold IDs must be non-empty strings")
+    if evidence_item_count < 0 or unresolved_evidence_item_count < 0:
+        raise ValueError("evidence counts must be non-negative")
+    if len(resolved) + unresolved_evidence_item_count != evidence_item_count:
+        raise ValueError("resolved plus unresolved evidence must equal the denominator")
+    if evidence_item_count == 0:
+        return {
+            "scored": False,
+            "evidence_item_count": 0,
+            "resolved_evidence_item_count": 0,
+            "unresolved_evidence_item_count": 0,
+            "retrieved_evidence_count_at_10": 0,
+            "recall_at_10": None,
+            "hit_at_10": None,
+            "all_at_10": None,
+            "ndcg_at_10": None,
+        }
+    cutoff = tuple(ranked_ids[:top_k])
+    cutoff_set = frozenset(cutoff)
+    found = sum(1 for dialog_id in resolved if dialog_id in cutoff_set)
+    resolved_unique = frozenset(resolved)
+    dcg = sum(
+        1.0 / math.log2(rank + 1)
+        for rank, dialog_id in enumerate(cutoff, start=1)
+        if dialog_id in resolved_unique
+    )
+    ideal_count = min(evidence_item_count, top_k)
+    ideal_dcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))
     return {
-        "question_count": len(rows),
-        "hit_at_10": _mean(rows, "hit_at_k"),
-        "recall_at_10": _mean(rows, "recall_at_k"),
-        "all_at_10": _mean(rows, "all_at_k"),
-        "ndcg_at_10": _mean(rows, "ndcg_at_k"),
+        "scored": True,
+        "evidence_item_count": evidence_item_count,
+        "resolved_evidence_item_count": len(resolved),
+        "unresolved_evidence_item_count": unresolved_evidence_item_count,
+        "retrieved_evidence_count_at_10": found,
+        "recall_at_10": found / evidence_item_count,
+        "hit_at_10": float(found > 0),
+        "all_at_10": float(found == evidence_item_count),
+        "ndcg_at_10": dcg / ideal_dcg,
     }
 
 
-def score_rankings(protocol: Any, scorer: Any, rankings: dict[str, dict[str, list[str]]], top_k: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _aggregate_subset(rows: list[dict[str, Any]], column: str, semantics: str) -> dict[str, Any]:
+    scored = [row for row in rows if row["columns"][column][semantics]["scored"]]
+    metrics = [row["columns"][column][semantics] for row in scored]
+    evidence_count = sum(metric["evidence_item_count"] for metric in metrics)
+    by_conversation: dict[str, list[float]] = {}
+    for row in scored:
+        recall = row["columns"][column][semantics]["recall_at_10"]
+        by_conversation.setdefault(row["conversation_id"], []).append(float(recall))
+    return {
+        "question_count": len(rows),
+        "scored_question_count": len(scored),
+        "evidence_item_count": evidence_count,
+        "resolved_evidence_item_count": sum(
+            metric["resolved_evidence_item_count"] for metric in metrics
+        ),
+        "unresolved_evidence_item_count": sum(
+            metric["unresolved_evidence_item_count"] for metric in metrics
+        ),
+        "question_macro_recall_at_10": (
+            sum(float(metric["recall_at_10"]) for metric in metrics) / len(metrics)
+            if metrics else None
+        ),
+        "conversation_macro_recall_at_10": (
+            sum(sum(values) / len(values) for values in by_conversation.values())
+            / len(by_conversation)
+            if by_conversation else None
+        ),
+        "evidence_micro_recall_at_10": (
+            sum(metric["retrieved_evidence_count_at_10"] for metric in metrics)
+            / evidence_count
+            if evidence_count else None
+        ),
+        **{
+            field: (
+                sum(float(metric[field]) for metric in metrics) / len(metrics)
+                if metrics else None
+            )
+            for field in ("hit_at_10", "all_at_10", "ndcg_at_10")
+        },
+    }
+
+
+def score_rankings(
+    scorer: Any,
+    rankings: dict[str, dict[str, list[str]]],
+    top_k: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     question_rows: list[dict[str, Any]] = []
-    metrics_by_column: dict[str, list[dict[str, Any]]] = {column: [] for column in rankings}
     for item_id in sorted(scorer.scorer_items):
         item = scorer.scorer_items[item_id]
         row = {
@@ -360,34 +453,97 @@ def score_rankings(protocol: Any, scorer: Any, rankings: dict[str, dict[str, lis
             "conversation_id": item.opaque_conversation_id,
             "category": item.category,
             "category_name": item.category_name,
-            "gold_dialog_ids": list(item.official_exact.resolved_opaque_dialog_ids),
-            "unresolved_gold_count": item.official_exact.unresolved_evidence_item_count,
+            "gold": {
+                "official_exact": {
+                    "resolved_dialog_ids": list(item.official_exact.resolved_opaque_dialog_ids),
+                    "evidence_item_count": item.official_exact.source_evidence_item_count,
+                    "unresolved_evidence_item_count": item.official_exact.unresolved_evidence_item_count,
+                },
+                "normalized_repaired": {
+                    "resolved_dialog_ids": list(item.normalized_repaired.gold_opaque_dialog_ids),
+                    "evidence_item_count": item.normalized_repaired.unique_dialog_denominator,
+                    "unresolved_evidence_item_count": item.normalized_repaired.unresolved_evidence_item_count,
+                },
+            },
             "columns": {},
         }
         for column, by_item in rankings.items():
-            metric = protocol.evaluate_story_retrieval(
-                by_item[item_id],
+            ranked = by_item[item_id]
+            if (
+                len(ranked) > top_k
+                or len(ranked) != len(set(ranked))
+                or set(ranked) - set(item.corpus_opaque_dialog_ids)
+            ):
+                raise ValueError(f"invalid frozen ranking for {column}:{item_id}")
+            official = question_metrics(
+                ranked,
                 item.official_exact.resolved_opaque_dialog_ids,
-                final_k=top_k,
-                candidate_pool_size=top_k,
-                allowed_ids=item.corpus_opaque_dialog_ids,
+                evidence_item_count=item.official_exact.source_evidence_item_count,
+                unresolved_evidence_item_count=item.official_exact.unresolved_evidence_item_count,
+                top_k=top_k,
             )
-            metric_row = asdict(metric)
-            metric_row["ranked_ids_at_k"] = list(metric.ranked_ids_at_k)
-            metrics_by_column[column].append({**metric_row, "category": item.category})
-            row["columns"][column] = metric_row
+            normalized = question_metrics(
+                ranked,
+                item.normalized_repaired.gold_opaque_dialog_ids,
+                evidence_item_count=item.normalized_repaired.unique_dialog_denominator,
+                unresolved_evidence_item_count=item.normalized_repaired.unresolved_evidence_item_count,
+                top_k=top_k,
+            )
+            row["columns"][column] = {
+                "ranked_ids_at_10": list(ranked),
+                "official_exact": official,
+                "normalized_repaired": normalized,
+            }
         question_rows.append(row)
     aggregate: dict[str, Any] = {}
-    for column, rows in metrics_by_column.items():
+    categories = sorted({int(row["category"]) for row in question_rows})
+    for column in rankings:
         aggregate[column] = {
-            "overall": _summary(rows),
-            "hard_categories_1_2": _summary([row for row in rows if row["category"] in {1, 2}]),
-            "by_category": {
-                str(category): _summary([row for row in rows if row["category"] == category])
-                for category in sorted({int(row["category"]) for row in rows})
-            },
+            semantics: {
+                "overall": _aggregate_subset(question_rows, column, semantics),
+                "hard_categories_1_2": _aggregate_subset(
+                    [row for row in question_rows if row["category"] in {1, 2}],
+                    column,
+                    semantics,
+                ),
+                "by_category": {
+                    str(category): _aggregate_subset(
+                        [row for row in question_rows if row["category"] == category],
+                        column,
+                        semantics,
+                    )
+                    for category in categories
+                },
+            }
+            for semantics in ("official_exact", "normalized_repaired")
         }
     return aggregate, question_rows
+
+
+def validate_raw_bm25_control(aggregate: dict[str, Any], manifest: dict[str, Any]) -> None:
+    anchor = manifest["original_mempalace"]["raw_bm25_control_anchor"]
+    observed = aggregate["raw_dialog_bm25"]
+    pairs = {
+        "official_exact_overall_question_macro_recall_at_10": observed["official_exact"][
+            "overall"
+        ]["question_macro_recall_at_10"],
+        "official_exact_hard_question_macro_recall_at_10": observed["official_exact"][
+            "hard_categories_1_2"
+        ]["question_macro_recall_at_10"],
+        "normalized_repaired_overall_question_macro_recall_at_10": observed[
+            "normalized_repaired"
+        ]["overall"]["question_macro_recall_at_10"],
+        "normalized_repaired_hard_question_macro_recall_at_10": observed[
+            "normalized_repaired"
+        ]["hard_categories_1_2"]["question_macro_recall_at_10"],
+    }
+    mismatches = {
+        name: {"expected": anchor[name], "observed": value}
+        for name, value in pairs.items()
+        if value is None or not math.isclose(float(value), float(anchor[name]), rel_tol=0.0, abs_tol=1e-15)
+    }
+    if mismatches:
+        raise RuntimeError(f"raw-BM25 scorer/control parity failed: {mismatches}")
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -448,9 +604,8 @@ def run(dataset_path: Path, model_dir: Path, original_root: Path, output: Path) 
             db_path=str(Path(directory) / "latest-rpg.sqlite3"),
         )
     model_pair = encoder.finish_snapshot_pair().to_dict()
-    aggregate, questions = score_rankings(
-        protocol, scorer, rankings, manifest["protocol"]["top_k"]
-    )
+    aggregate, questions = score_rankings(scorer, rankings, manifest["protocol"]["top_k"])
+    validate_raw_bm25_control(aggregate, manifest)
     expected_item_ids = set(scorer.scorer_items)
     ranking_item_counts = {column: len(by_item) for column, by_item in rankings.items()}
     if any(set(by_item) != expected_item_ids for by_item in rankings.values()):
@@ -492,6 +647,7 @@ def run(dataset_path: Path, model_dir: Path, original_root: Path, output: Path) 
         },
         "retrieval_contract": {
             "annotation_free": True,
+            "raw_bm25_control_anchor_passed": True,
             "latest_interface": "authorized_evidence(compact product trace) -> _retrieve_memory_items(authorized IDs only)",
             "public_track_scope": "authorization-neutral quality only; ACL safety is gated separately by blind-180",
             "latest_trace_complete": complete_traces,
