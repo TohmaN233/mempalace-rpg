@@ -1,0 +1,17 @@
+{
+  "schema": "aerp2-product-six-view-locomo-manifest",
+  "version": 1,
+  "inputs": {
+    "dataset_sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+    "historical_artifact_sha256": "d949e7a3776df9a962a3c4350f98f63f29682b8b2484a145b639e1f6bacb0e18",
+    "model_manifest_sha256": "454d14761089976b0437135fd70c6da49fc836ad9344d43b0a693d343fc0ea85",
+    "model_onnx_sha256": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+    "embedding_dimension": 384,
+    "session_providers": ["CPUExecutionProvider"]
+  },
+  "historical_source": {"commit": "429e11ced3529a3409509026a62fb3bb5ec43c77", "files": {"locomo_bge_encoder.py": "ffbf915209c83135b34a6f1e4071b746006c671597ba6b8b6cf4842902f1ad51", "locomo_dense_story_candidate.py": "7378564770f898ee9ad93ac3ec49322cb6f7e85754100692cfab49bc05bfd3e9", "locomo_story_candidate.py": "2709c3aa6c8a0220f409320f013651370eaea759ddfde01f7b041428f173a97a", "locomo_story_experiment.py": "2b7355a0fb66d0e8c3c0f9c5e282fd6f794ad805bf5597fc4d5a75f0c9e218bf", "locomo_story_protocol.py": "f0e5b3ec3045b83149d36347435b65c1ff7ee92e9597e74cdf4c0cd636394341"}},
+  "protocol": {"conversations": 10, "sessions": 272, "dialogs": 5882, "questions": 1986, "hard_questions": 603, "top_k": 10, "source_pool": 50, "rrf_k": 60, "bootstrap_seed": 20260726, "bootstrap_resamples": 10000},
+  "anchors": {"raw_bm25": {"overall": 0.5634957788174197, "hard": 0.4495262353078535}, "historical_six_view": {"overall": 0.7227484113462174, "hard": 0.6802297309432684}},
+  "scorer_contract": {"composite_ids_sha256": "a45c03717c0cd553278e06c7a270e22aa1a8abcc9edb40d1e55fc8662d3eb2d5", "scorer_contract_sha256": "3bdab72deee399d79b04e4ceebe5846a0b3510dfe9b17351933fec6a72f5b6eb", "corpus_contract_sha256": "0318740328c2c49dc1d47b704bec6451b08068ceb6e7662265ea0dc8262f9b0f"},
+  "gates": {"p1_delta": 0.05, "p2_delta": -0.01, "hard_categories": [1, 2]}
+}

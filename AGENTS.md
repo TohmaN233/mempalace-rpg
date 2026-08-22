@@ -50,7 +50,10 @@ remaining recall gap.
 Run `python -m pytest -q`, including `tests/test_aerp1_authorized_evidence_audit.py`
 for the deterministic 24-query / 48-call AERP-1 gate and
 `tests/test_aerp2_product_six_view.py` for the authorization-after-ranking
-contract, then `git diff --check`.
+contract. The release-quality retrieval gate is
+`python -m benchmarks.aerp2_product_six_view_locomo` from a clean worktree; its
+JSON output must remain outside both repositories, and both `p1_pass` and
+`p2_pass` (therefore `release_pass`) must be true. Then run `git diff --check`.
 
 ## AERP-1 branch and artifact boundary
 

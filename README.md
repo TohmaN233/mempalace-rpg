@@ -394,6 +394,27 @@ point below the frozen historical Six-View result. Failure of either quality
 gate is reported as a measured gap; it does not authorize graph or clustering
 changes by itself.
 
+Run the frozen six-arm comparison from a clean worktree. It evaluates fresh raw
+BM25, raw dense, their 2:1 weighted RRF control, legacy RPG, Product Six-View,
+and the byte-pinned historical annotation-assisted Six-View stream. The report
+is written atomically outside both repositories and binds the input, scorer,
+corpus, model, runtime, source, Git, ranking-stream, trace, and mapping receipts.
+
+```powershell
+python -m benchmarks.aerp2_product_six_view_locomo `
+  --artifact E:\MemPalaceWorkspace\artifacts\benchmark-runs\locomo_story_dense_v2_full_run1.json `
+  --dataset E:\MemPalaceWorkspace\data\benchmark-data\locomo\main\locomo10.json `
+  --model-dir E:\MemPalaceWorkspace\artifacts\benchmark-runs\models\bge-small-en-v1.5\onnx `
+  --source-repo E:\MemPalaceWorkspace\repos\mempalace `
+  --output C:\outside-repo\aerp2-product-six-view-locomo.json
+```
+
+This is a public, non-blind engineering regression test. It does not use QA
+answers, evidence labels, or historical observation/session-summary annotations
+as Product ranker inputs; captions are treated as upstream dialog metadata. A
+release passes only when both P1 and P2 pass. Split metrics are diagnostic and
+never participate in the frozen gates.
+
 ```bash
 python -m venv .venv
 . .venv/bin/activate
