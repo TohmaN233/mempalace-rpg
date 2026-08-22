@@ -759,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
     if ROOT in output.parents or output == ROOT: raise ValueError("output must be outside repository")
     report = run_quality(dataset_path=Path(args.dataset), artifact_path=Path(args.artifact), model_dir=Path(args.model_dir), source_repo=Path(args.source_repo), output=output, manifest_path=Path(args.manifest))
     print(json.dumps({"status": report["status"], "gates": report["gates"]}, sort_keys=True))
-    return 0
+    return 0 if report["gates"].get("release_pass") is True else 1
 
 
 if __name__ == "__main__":

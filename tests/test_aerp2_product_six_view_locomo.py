@@ -105,7 +105,16 @@ def test_full_corpus_contract_and_manifest_hash_fail_closed(tmp_path):
 
 def test_strict_sixview_trace_rejects_view_and_ranking_key_corruption():
     mapping = {"e": "dialog"}
-    ranking = {"schema": "aerp2-product-six-view-v1", "query_sha256": "a" * 64, "input_sha256": "b" * 64, "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS}, "encoder_identity": "encoder", "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS), "rrf_k": 60, "selected": [{"source_event_id": "e", "ranking_key_sha256": harness._sha256(b"dialog")}]} 
+    ranking = {
+        "schema": "aerp2-product-six-view-v1",
+        "query_sha256": "a" * 64,
+        "input_sha256": "b" * 64,
+        "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS},
+        "encoder_identity": "encoder",
+        "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS),
+        "rrf_k": 60,
+        "selected": [{"source_event_id": "e", "ranking_key_sha256": harness._sha256(b"dialog")}],
+    }
     trace = {"retrieval_ranking": ranking, "selected_evidence_ids": ["e"], "authorized_candidate_ids": ["e"], "denied_partitions": [], "candidate_generation": {"candidate_count": 1}, "candidates": [{"source_event_id": "e", "decision": "allow"}], "returned_spans": []}
     lineage = [{"seed_ledger": {"forbidden_field_counts": {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": "d" * 64, "ranker_texts_sha256": "e" * 64}}]
     summary = harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": ["dialog"]}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=1)
@@ -116,7 +125,16 @@ def test_strict_sixview_trace_rejects_view_and_ranking_key_corruption():
 
 def test_trace_identity_sets_and_empty_selection_fail_closed():
     mapping = {"e": "dialog", "other": "other-dialog"}
-    ranking = {"schema": "aerp2-product-six-view-v1", "query_sha256": "a" * 64, "input_sha256": "b" * 64, "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS}, "encoder_identity": "encoder", "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS), "rrf_k": 60, "selected": [{"source_event_id": "e", "ranking_key_sha256": harness._sha256(b"dialog")}]} 
+    ranking = {
+        "schema": "aerp2-product-six-view-v1",
+        "query_sha256": "a" * 64,
+        "input_sha256": "b" * 64,
+        "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS},
+        "encoder_identity": "encoder",
+        "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS),
+        "rrf_k": 60,
+        "selected": [{"source_event_id": "e", "ranking_key_sha256": harness._sha256(b"dialog")}],
+    }
     trace = {"retrieval_ranking": ranking, "selected_evidence_ids": ["e"], "authorized_candidate_ids": list(mapping), "denied_partitions": [], "candidate_generation": {"candidate_count": 2}, "candidates": [{"source_event_id": "e", "decision": "allow"}], "returned_spans": []}
     lineage = [{"seed_ledger": {"forbidden_field_counts": {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": "d" * 64, "ranker_texts_sha256": "e" * 64}}]
     summary = harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": ["dialog"]}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=2)
@@ -205,6 +223,23 @@ def test_gate_report_has_metrics_deltas_bootstrap_and_failure_reasons():
     assert {"product", "strong", "historical", "deltas", "bootstrap", "thresholds", "p1_pass", "p2_pass", "release_pass", "failure_reasons"} <= set(report)
     assert "p1.overall.delta_below_threshold" in report["failure_reasons"]
     assert "p2.hard.delta_below_threshold" in report["failure_reasons"]
+
+
+@pytest.mark.parametrize(("release_pass", "expected_exit"), [(True, 0), (False, 1)])
+def test_cli_exit_code_follows_release_gate(monkeypatch, tmp_path, release_pass, expected_exit):
+    monkeypatch.setattr(
+        harness,
+        "run_quality",
+        lambda **_kwargs: {"status": "complete", "gates": {"release_pass": release_pass}},
+    )
+    argv = [
+        "--dataset", str(tmp_path / "dataset.json"),
+        "--artifact", str(tmp_path / "artifact.json"),
+        "--model-dir", str(tmp_path / "model"),
+        "--source-repo", str(tmp_path / "source"),
+        "--output", str(tmp_path / "report.json"),
+    ]
+    assert harness.main(argv) == expected_exit
 
 
 def test_frozen_inputs_output_scope_source_pins_snapshots_and_phase_order(tmp_path):
