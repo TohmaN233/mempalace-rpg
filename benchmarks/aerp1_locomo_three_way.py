@@ -70,6 +70,11 @@ def git_state(root: Path) -> dict[str, Any]:
     }
 
 
+def same_git_state(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Compare every Git identity field while allowing provenance added to ``before``."""
+    return all(before.get(key) == value for key, value in after.items())
+
+
 def _load_module(name: str, path: Path) -> Any:
     spec = importlib.util.spec_from_file_location(f"_aerp1_pin_{name}", path)
     if spec is None or spec.loader is None:
@@ -620,10 +625,10 @@ def run(dataset_path: Path, model_dir: Path, original_root: Path, output: Path) 
     if unauthorized_output_count:
         raise RuntimeError("latest RPG emitted unauthorized evidence")
     latest_after = git_state(ROOT)
-    if latest_before != latest_after:
+    if not same_git_state(latest_before, latest_after):
         raise RuntimeError("latest Git state changed during comparison")
     original_after = git_state(original_root)
-    if original_state != original_after:
+    if not same_git_state(original_state, original_after):
         raise RuntimeError("original MemPalace Git state changed during comparison")
     report = {
         "schema": "aerp1-locomo-three-way-report",

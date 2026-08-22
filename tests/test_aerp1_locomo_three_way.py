@@ -11,6 +11,7 @@ from benchmarks.aerp1_locomo_three_way import (
     rank_rpg,
     rank_vectors,
     raw_dialogs,
+    same_git_state,
     seed_rpg_conversation,
 )
 from mempalace_rpg import NullEpisodeAdapter, RpgMemoryKernel
@@ -140,6 +141,13 @@ def test_zero_evidence_questions_are_explicitly_unscored():
 
     assert not metrics["scored"]
     assert metrics["recall_at_10"] is None
+
+
+def test_git_state_comparison_ignores_only_extra_provenance_on_before_state():
+    before = {"git_head": "abc", "git_dirty": False, "source_sha256": {"x": "y"}}
+
+    assert same_git_state(before, {"git_head": "abc", "git_dirty": False})
+    assert not same_git_state(before, {"git_head": "changed", "git_dirty": False})
 
 
 def test_latest_ranker_uses_authorized_universe_and_emits_complete_trace(tmp_path):
