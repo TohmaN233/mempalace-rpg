@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import copy
 import json
+import math
 import os
 import re
 import sqlite3
@@ -32,6 +33,7 @@ from .authorization import (
 )
 from .budget import budget_for_tier
 from .models import MemoryPack, SceneEventInput
+from .retrieval import AuthorizedEventRanker, AuthorizedRetrievalCandidate, RankingResult, structured_observation
 from .settings import (
     belief_write_enabled,
     domain_recall_enabled,
@@ -243,6 +245,21 @@ def _loads(value: str | None, default: Any = None) -> Any:
         return default
 
 
+def _strict_product_json(value: str | None, name: str, expected_type: type[dict[str, Any]] | type[list[Any]]) -> Any:
+    """Decode product-ranker metadata without the legacy reader's fallback."""
+    if not isinstance(value, str):
+        raise ValueError(f"malformed product {name}")
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed product {name}") from exc
+    if not isinstance(decoded, expected_type):
+        raise ValueError(f"malformed product {name}")
+    if expected_type is list and not all(isinstance(item, str) for item in decoded):
+        raise ValueError(f"malformed product {name}")
+    return decoded
+
+
 def _uniq(values: Iterable[str | None]) -> list[str]:
     seen: dict[str, None] = {}
     for value in values:
@@ -308,12 +325,14 @@ class RpgMemoryKernel:
         db_path: str | None = None,
         *,
         episode_adapter: EpisodeAdapter | None = None,
+        retrieval_ranker: AuthorizedEventRanker | None = None,
         memo_settings_path: str | None = None,
         memo_settings: dict[str, Any] | None = None,
     ) -> None:
         self.db_path = os.path.expanduser(db_path or DEFAULT_RPG_MEMORY_DB)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self.episode_adapter = episode_adapter or NullEpisodeAdapter()
+        self.retrieval_ranker = retrieval_ranker
         self.memo_settings, self.memo_settings_path = load_memo_settings(
             memo_settings_path,
             memo_settings,
@@ -1269,6 +1288,7 @@ class RpgMemoryKernel:
                 active_quest_ids=active_quest_ids or [], location_id=location_id,
                 hit_limit=budget.hit_limit, max_chars=max_chars,
                 authorized_event_ids=set(decision.trace["authorized_candidate_ids"]),
+                ranking_trace=decision.trace,
             )
             decision.trace["selected_evidence_ids"] = [item["source_event_id"] for item in evidence]
         self._complete_product_trace(
@@ -1627,7 +1647,14 @@ class RpgMemoryKernel:
         hit_limit: int,
         max_chars: int,
         authorized_event_ids: set[str],
+        ranking_trace: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        if self.retrieval_ranker is not None:
+            return self._retrieve_ranked_authorized_events(
+                campaign_id=campaign_id, query=query, hit_limit=hit_limit,
+                max_chars=max_chars, authorized_event_ids=authorized_event_ids,
+                ranking_trace=ranking_trace,
+            )
         rows = self._projection_candidates(campaign_id)
         scored: list[tuple[float, dict[str, Any]]] = []
         for item in rows:
@@ -1657,6 +1684,116 @@ class RpgMemoryKernel:
             item["rank_score"] = rank_score
             self._attach_joined_scene_context(item)
             packed.append(self._memory_item_from_row(item))
+        return packed
+
+    def _retrieve_ranked_authorized_events(
+        self,
+        *,
+        campaign_id: str,
+        query: str,
+        hit_limit: int,
+        max_chars: int,
+        authorized_event_ids: set[str],
+        ranking_trace: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Pass only ACL-approved source rows to an injected product ranker."""
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        selected_ids = sorted(authorized_event_ids)
+        for start in range(0, len(selected_ids), 900):
+            batch = selected_ids[start:start + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn().execute(
+                "SELECT se.event_id, se.scene_id, se.event_type, se.actor_id, se.target_id, se.summary, se.source_span, se.payload_json, "
+                "se.truth_status, se.visibility, se.branch_id, se.branch_status, "
+                "se.access_owner_id, se.access_scope_id, se.belief_owner_id, se.witness_set_json, se.created_at, "
+                "se.related_entities_json, se.related_quests_json, se.related_locations_json, "
+                "sr.in_world_time, sr.location_id, sr.scene_time_sort FROM scene_event se JOIN scene_record sr ON sr.scene_id=se.scene_id "
+                "WHERE sr.campaign_id=? AND se.event_id IN (" + placeholders + ")",
+                [campaign_id, *batch],
+            ).fetchall()
+            rows_by_id.update({str(row["event_id"]): dict(row) for row in rows})
+        if set(rows_by_id) != authorized_event_ids:
+            raise PermissionError("authorized evidence disappeared before product ranking")
+        candidates: list[AuthorizedRetrievalCandidate] = []
+        for event_id in selected_ids:
+            row = rows_by_id[event_id]
+            payload = _strict_product_json(row["payload_json"], "payload_json", dict)
+            policy_tuple = tuple(row.get(name) for name in (
+                "truth_status", "visibility", "branch_id", "branch_status",
+                "access_owner_id", "access_scope_id", "belief_owner_id", "witness_set_json",
+            ))
+            checkpoint = payload.get("retrieval_checkpoint_id")
+            if not isinstance(checkpoint, str) or not checkpoint.strip():
+                checkpoint = str(row["scene_id"])
+            checkpoint = checkpoint.strip()
+            summary = str(row["summary"] or "")
+            raw = str(row["source_span"] or summary)
+            candidates.append(AuthorizedRetrievalCandidate(
+                source_event_id=event_id, source_scene_id=str(row["scene_id"]), raw_text=raw,
+                observation=structured_observation(
+                    summary=summary, event_type=row["event_type"], actor_id=row["actor_id"],
+                    target_id=row["target_id"],
+                    related_entities=_strict_product_json(row["related_entities_json"], "related_entities_json", list),
+                    related_quests=_strict_product_json(row["related_quests_json"], "related_quests_json", list),
+                    related_locations=_strict_product_json(row["related_locations_json"], "related_locations_json", list),
+                    in_world_time=row["in_world_time"], location_id=row["location_id"],
+                ),
+                checkpoint_key=checkpoint, policy_tuple=policy_tuple,
+                chronological_order_key=(int(row["scene_time_sort"]), event_id),
+            ))
+        result = self.retrieval_ranker.rank(query=query, candidates=candidates)
+        if not isinstance(result, RankingResult):
+            raise TypeError("retrieval ranker must return RankingResult")
+        returned = result.ranked_event_ids
+        if len(returned) != len(set(returned)):
+            raise ValueError("retrieval ranker returned duplicate source_event_id")
+        unknown = set(returned) - authorized_event_ids
+        if unknown:
+            raise PermissionError("retrieval ranker returned an unauthorized source_event_id")
+        if not isinstance(result.scores, dict) or set(result.scores) != set(returned):
+            raise ValueError("retrieval ranker must provide one score for every returned source_event_id")
+        scores: dict[str, float] = {}
+        for event_id in returned:
+            value = result.scores[event_id]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("retrieval ranker score must be finite numeric")
+            scores[event_id] = float(value)
+        if not isinstance(result.trace, dict):
+            raise TypeError("retrieval ranker trace must be a dictionary")
+        selected_trace = result.trace.get("selected")
+        if not isinstance(selected_trace, list):
+            raise ValueError("retrieval ranker trace must contain selected entries")
+        selected_by_id: dict[str, dict[str, Any]] = {}
+        for entry in selected_trace:
+            if not isinstance(entry, dict) or not isinstance(entry.get("source_event_id"), str):
+                raise ValueError("retrieval ranker selected trace entry is malformed")
+            event_id = entry["source_event_id"]
+            if event_id in selected_by_id:
+                raise ValueError("retrieval ranker selected trace has duplicate source_event_id")
+            selected_by_id[event_id] = entry
+        if set(selected_by_id) != set(returned):
+            raise ValueError("retrieval ranker selected trace must match returned source_event_ids")
+        packed: list[dict[str, Any]] = []
+        used = 0
+        for event_id in returned:
+            if len(packed) >= hit_limit:
+                break
+            row = rows_by_id[event_id]
+            text = str(row["summary"] or "")
+            if packed and used + len(text) > max_chars:
+                break
+            used += len(text)
+            packed.append({
+                "memory_id": event_id, "source_event_id": event_id, "source_scene_id": row["scene_id"],
+                "domain": "evidence", "memory_type": "belief" if row["truth_status"] == "belief" else "summary",
+                "text": text, "truth_status": row["truth_status"], "visibility": row["visibility"],
+                "in_world_time": row["in_world_time"], "location_id": row["location_id"],
+                "created_at": row["created_at"], "rank_score": scores[event_id],
+            })
+        if ranking_trace is not None:
+            trace = dict(result.trace)
+            trace["selected"] = [selected_by_id[item["source_event_id"]] for item in packed]
+            ranking_trace["retrieval_ranking"] = trace
         return packed
 
     def _projection_candidates(self, campaign_id: str) -> list[dict[str, Any]]:

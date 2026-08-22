@@ -15,10 +15,38 @@ contradictory security metadata denies. Retconned material is never returned.
 Verbatim access returns only `source_span` values that descend from authorized
 event seeds. A participant or witness is not granted the whole transcript.
 
+## AERP-2 product retrieval boundary
+
+`RpgMemoryKernel` may receive an `AuthorizedEventRanker`, but authorization
+remains the only candidate-universe boundary. The kernel passes that ranker
+only ACL-approved source events and rejects unknown IDs, duplicate IDs,
+missing/non-finite scores, malformed trace rows, and corrupt product metadata.
+Without an injected ranker, the AERP-1 ranking path and product response remain
+unchanged.
+
+`SixViewRanker` is the frozen annotation-free product ranker. It uses raw and
+structured-observation BM25, raw and structured-observation dense retrieval,
+policy-homogeneous checkpoint dense retrieval, and raw-plus-observation dense
+retrieval with weights `2.0/0.5/1.0/2.0/2.0/1.0` and weighted RRF `k=60`.
+Checkpoint roll-ups are chronological and may cross actors only when their
+security-policy identity is the same. A caller may provide
+`payload.retrieval_checkpoint_id`; otherwise the source scene is the checkpoint.
+
+Dense runtimes are injected through separate `encode_query` and
+`encode_passages` methods plus a stable encoder identity. Passage vectors are
+cached by encoder identity, view, and content digest; query vectors are encoded
+once per request and never cached. Retrieval trace payloads contain algorithm
+identity, digests, ranks, scores/contributions, and only the evidence actually
+packed. Do not put transcript text in the ranking trace. Do not add graph or
+clustering retrieval until the frozen annotation-free evaluation identifies a
+remaining recall gap.
+
 ## Verification
 
 Run `python -m pytest -q`, including `tests/test_aerp1_authorized_evidence_audit.py`
-for the deterministic 24-query / 48-call AERP-1 gate, then `git diff --check`.
+for the deterministic 24-query / 48-call AERP-1 gate and
+`tests/test_aerp2_product_six_view.py` for the authorization-after-ranking
+contract, then `git diff --check`.
 
 ## AERP-1 branch and artifact boundary
 

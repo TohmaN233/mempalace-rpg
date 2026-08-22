@@ -353,6 +353,41 @@ evidence only: it does not establish annotation-free productization, graph or
 clustering value, kernel ranking quality, or an improvement claim for the RPG
 product.
 
+### AERP-2 annotation-free product ranker
+
+The product implementation keeps RPG/AERP responsible for authorization,
+isolation, provenance, transactionality, and budgets, then applies retrieval
+only inside the authorized event universe. `RpgMemoryKernel` accepts an optional
+`AuthorizedEventRanker`; omitting it preserves the AERP-1 behavior. The bundled
+`SixViewRanker` uses six label-free views with the historical frozen weights:
+
+| View | Weight |
+|---|---:|
+| Raw event BM25 | 2.0 |
+| Structured event observation BM25 | 0.5 |
+| Raw event dense | 1.0 |
+| Structured event observation dense | 2.0 |
+| Policy-homogeneous checkpoint roll-up dense | 2.0 |
+| Raw + observation dense | 1.0 |
+
+The views are fused with weighted RRF at `k=60`. A checkpoint is
+`payload.retrieval_checkpoint_id` when supplied, otherwise the source scene.
+Roll-ups are chronological and never cross ACL-policy boundaries. The dense
+encoder is injected and must expose distinct query and passage methods plus a
+stable identity; importing the retrieval module does not start ONNX or Chroma.
+The ranking trace contains hashes, ranks, finite scores/contributions, and only
+packed evidence IDs, never transcript text.
+
+The release claim is intentionally gated by a frozen annotation-free LoCoMo
+run. Product Six-View must have zero unauthorized output, complete trace
+coverage, beat the strongest raw-only control by at least 5 percentage points
+on both overall and hard-category Recall@10, and have a paired
+conversation-bootstrap confidence-interval lower bound above zero. Historical
+annotation-assisted parity is a separate P2 target: no worse than 1 percentage
+point below the frozen historical Six-View result. Failure of either quality
+gate is reported as a measured gap; it does not authorize graph or clustering
+changes by itself.
+
 ```bash
 python -m venv .venv
 . .venv/bin/activate
