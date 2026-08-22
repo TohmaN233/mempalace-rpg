@@ -65,8 +65,15 @@ until the evidence selects a mechanism:
 2. FCD-1 must capture a benchmark-only ranking ledger before kernel trace
    compaction and before scorer-label access: every Product view's top-50 IDs and
    scores, fused top-50, checkpoint tie groups, raw-control top-50, and authorization
-   digest. The existing top-10 ranking digests, product traces, safety results, and
-   all 1,986 outputs must remain identical.
+   digest. `SixViewRanker.diagnostic_ledger` is strict-bool and defaults off, so
+   production traces and production ranking cost remain unchanged. The frozen
+   benchmark explicitly enables it and records each view's full authorized ID order
+   only to prove top-50 prefixes and every fused component rank; it must never record
+   query, transcript, observation, checkpoint, policy, or ranking-key plaintext.
+   Checkpoint/policy receipts must bind to the independent pre-ranking seed ledger.
+   The Product top-10 stream must remain exactly
+   `64007282069621bb3e603598938993ebe0907e8e84ebaa65394741ab618e5441`
+   across all 1,986 outputs.
 3. FCD-2 must run, in order, raw-component parity, the six-view source-pool oracle,
    fusion-semantics parity, then fixed add-view/leave-one-view-out diagnostics. It
    must produce exactly one frozen verdict: `FUSION_SUPPORTED`,

@@ -143,8 +143,11 @@ class SixViewRanker:
     }
     rrf_k = 60
 
-    def __init__(self, encoder: DenseEncoder) -> None:
+    def __init__(self, encoder: DenseEncoder, *, diagnostic_ledger: bool = False) -> None:
+        if type(diagnostic_ledger) is not bool:
+            raise ValueError("diagnostic_ledger must be a bool")
         self.encoder = encoder
+        self.diagnostic_ledger = diagnostic_ledger
         self._passage_cache: dict[tuple[str, str, str], tuple[tuple[float, ...], ...]] = {}
 
     def _encoder_identity(self) -> str:
@@ -177,11 +180,125 @@ class SixViewRanker:
             scores[identifier] = score
         return scores
 
+    def _fcd1_diagnostic_ledger(
+        self,
+        *,
+        input_sha256: str,
+        candidates: Sequence[AuthorizedRetrievalCandidate],
+        ranking_key_sha256: dict[str, str],
+        score_views: dict[str, dict[str, float]],
+        ranks: dict[str, dict[str, int]],
+        ranking_keys_by_id: dict[str, str],
+        totals: dict[str, float],
+        ordered: list[str],
+        group_ids: list[str],
+        ordered_groups: list[tuple[tuple[str, tuple[str | None, ...]], list[AuthorizedRetrievalCandidate]]],
+        group_scores: dict[str, float],
+    ) -> dict[str, Any]:
+        """Build the benchmark-only, text-free replay ledger after ranking is frozen."""
+        self._fcd1_validate_score_views(score_views)
+        ranking_key_order = {
+            candidate.source_event_id: index
+            for index, candidate in enumerate(candidates, start=1)
+        }
+        view_orders = {
+            name: [ranking_key_sha256[identifier] for identifier in _ordered(scores, ranking_keys_by_id)]
+            for name, scores in score_views.items()
+        }
+        view_order_sha256 = {
+            name: _digest(order)
+            for name, order in view_orders.items()
+        }
+        checkpoint_groups = [
+            {
+                "checkpoint_sha256": hashlib.sha256(key[0].encode()).hexdigest(),
+                "policy_sha256": _digest(list(key[1])),
+                "checkpoint_score": group_scores[group_id],
+                "member_count": len(members),
+                "chronological_members": [
+                    {
+                        "source_event_id": member.source_event_id,
+                        "ranking_key_sha256": ranking_key_sha256[member.source_event_id],
+                    }
+                    for member in sorted(members, key=lambda member: member.chronological_order_key)
+                ],
+            }
+            for group_id, (key, members) in zip(group_ids, ordered_groups)
+        ]
+        for group in checkpoint_groups:
+            group["group_id"] = "group:" + _digest([
+                group["checkpoint_sha256"], group["policy_sha256"],
+            ])
+        authorization_rows = sorted(
+            (
+                {
+                    "ranking_key_sha256": member["ranking_key_sha256"],
+                    "policy_sha256": group["policy_sha256"],
+                }
+                for group in checkpoint_groups
+                for member in group["chronological_members"]
+            ),
+            key=lambda row: row["ranking_key_sha256"],
+        )
+        view_top_50 = {
+            name: [
+                {
+                    "source_event_id": identifier,
+                    "ranking_key_sha256": ranking_key_sha256[identifier],
+                    "ranking_key_order": ranking_key_order[identifier],
+                    "rank": ranks[name][identifier],
+                    "score": score_views[name][identifier],
+                }
+                for identifier in _ordered(scores, ranking_keys_by_id)[:50]
+            ]
+            for name, scores in score_views.items()
+        }
+        return {
+            "schema": "aerp3-fcd1-replay-ledger-v1",
+            "input_sha256": input_sha256,
+            "authorization_sha256": _digest(authorization_rows),
+            "view_order_sha256": view_order_sha256,
+            "view_top_50_sha256": {name: _digest(rows) for name, rows in view_top_50.items()},
+            "view_full_order": {
+                name: _ordered(scores, ranking_keys_by_id)
+                for name, scores in score_views.items()
+            },
+            "view_top_50": view_top_50,
+            "fused_top_50": [
+                {
+                    "source_event_id": identifier,
+                    "ranking_key_sha256": ranking_key_sha256[identifier],
+                    "ranking_key_order": ranking_key_order[identifier],
+                    "rank": rank,
+                    "final_rrf": totals[identifier],
+                    "component_ranks": {name: ranks[name][identifier] for name in self.weights},
+                    "component_rank_receipts": [
+                        {
+                            "view": name,
+                            "view_order_sha256": view_order_sha256[name],
+                            "ranking_key_sha256": ranking_key_sha256[identifier],
+                            "rank": ranks[name][identifier],
+                        }
+                        for name in self.weights
+                    ],
+                    "contributions": {name: self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights},
+                }
+                for rank, identifier in enumerate(ordered[:50], start=1)
+            ],
+            "checkpoint_tie_group_semantics": "checkpoint_policy_rollup",
+            "checkpoint_tie_groups": checkpoint_groups,
+        }
+
+    @staticmethod
+    def _fcd1_validate_score_views(score_views: dict[str, dict[str, float]]) -> None:
+        if any(not math.isfinite(score) for scores in score_views.values() for score in scores.values()):
+            raise ValueError("six-view diagnostic score is non-finite")
+
     def rank(self, *, query: str, candidates: Sequence[AuthorizedRetrievalCandidate]) -> RankingResult:
         query_sha256 = hashlib.sha256(query.encode()).hexdigest()
         encoder_identity = self._encoder_identity()
         if not candidates:
-            return RankingResult([], {}, {
+            trace = {
                 "schema": "aerp2-product-six-view-v1",
                 "encoder_identity": encoder_identity,
                 "weights": dict(self.weights),
@@ -190,7 +307,21 @@ class SixViewRanker:
                 "query_sha256": query_sha256,
                 "view_digests": {},
                 "selected": [],
-            })
+            }
+            if self.diagnostic_ledger:
+                trace["fcd1_diagnostic_ledger"] = {
+                    "schema": "aerp3-fcd1-replay-ledger-v1",
+                    "input_sha256": _digest([]),
+                    "authorization_sha256": _digest([]),
+                    "view_order_sha256": {name: _digest([]) for name in self.weights},
+                    "view_top_50_sha256": {name: _digest([]) for name in self.weights},
+                    "view_full_order": {name: [] for name in self.weights},
+                    "view_top_50": {name: [] for name in self.weights},
+                    "fused_top_50": [],
+                    "checkpoint_tie_group_semantics": "checkpoint_policy_rollup",
+                    "checkpoint_tie_groups": [],
+                }
+            return RankingResult([], {}, trace)
         ids = [candidate.source_event_id for candidate in candidates]
         if len(ids) != len(set(ids)) or any(not identifier for identifier in ids):
             raise ValueError("ranker candidates must have unique non-empty source_event_id values")
@@ -251,35 +382,49 @@ class SixViewRanker:
         if not all(math.isfinite(score) for score in totals.values()):
             raise ValueError("weighted RRF score is non-finite")
         ordered = _ordered(totals, ranking_keys_by_id)
+        ranking_key_sha256 = {
+            identifier: hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest()
+            for identifier in ids
+        }
+        input_sha256 = _digest([{
+            "ranking_key": candidate.ranking_key,
+            "raw_sha256": hashlib.sha256(candidate.raw_text.encode()).hexdigest(),
+            "observation_sha256": hashlib.sha256(candidate.observation.encode()).hexdigest(),
+            "checkpoint": candidate.checkpoint_key.strip(),
+            "policy": candidate.policy_tuple,
+            "scene_time_sort": candidate.chronological_order_key[0],
+        } for candidate in candidates])
         selected = [
             {
                 "source_event_id": identifier,
-                "ranking_key_sha256": hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest(),
+                "ranking_key_sha256": ranking_key_sha256[identifier],
                 "final_rrf": totals[identifier],
                 "component_ranks": {name: ranks[name][identifier] for name in self.weights},
                 "contributions": {name: self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights},
             }
             for identifier in ordered
         ]
-        return RankingResult(ordered, totals, {
+        trace = {
             "schema": "aerp2-product-six-view-v1",
             "encoder_identity": encoder_identity,
             "weights": dict(self.weights), "rrf_k": self.rrf_k,
             "query_sha256": query_sha256,
-            "input_sha256": _digest([{
-                "ranking_key": candidate.ranking_key,
-                "raw_sha256": hashlib.sha256(candidate.raw_text.encode()).hexdigest(),
-                "observation_sha256": hashlib.sha256(candidate.observation.encode()).hexdigest(),
-                "checkpoint": candidate.checkpoint_key.strip(),
-                "policy": candidate.policy_tuple,
-                "scene_time_sort": candidate.chronological_order_key[0],
-            } for candidate in candidates]),
+            "input_sha256": input_sha256,
             "view_digests": {
                 name: _digest([ranking_keys_by_id[identifier] for identifier in _ordered(scores, ranking_keys_by_id)])
                 for name, scores in score_views.items()
             },
             "selected": selected,
-        })
+        }
+        if self.diagnostic_ledger:
+            trace["fcd1_diagnostic_ledger"] = self._fcd1_diagnostic_ledger(
+                input_sha256=input_sha256, candidates=candidates,
+                ranking_key_sha256=ranking_key_sha256, score_views=score_views,
+                ranks=ranks, ranking_keys_by_id=ranking_keys_by_id, totals=totals,
+                ordered=ordered, group_ids=group_ids, ordered_groups=ordered_groups,
+                group_scores=group_scores,
+            )
+        return RankingResult(ordered, totals, trace)
 
 
 __all__ = ["AuthorizedEventRanker", "AuthorizedRetrievalCandidate", "DenseEncoder", "RankingResult", "SixViewRanker", "structured_observation"]

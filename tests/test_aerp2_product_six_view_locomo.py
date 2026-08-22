@@ -24,6 +24,90 @@ def _thresholds() -> dict:
     return {"p1_delta": .05, "p2_delta": -.01, "hard_categories": [1, 2]}
 
 
+def _fcd1_authorization_mapping_sha256(mapping: dict[str, str]) -> str:
+    policy_sha256 = harness._canonical(["public-policy"])
+    rows = [{
+        "ranking_key_sha256": harness._sha256(dialog_id.encode("utf-8")),
+        "checkpoint_sha256": harness._sha256(f"checkpoint:{event_id}".encode("utf-8")),
+        "policy_sha256": policy_sha256,
+    } for event_id, dialog_id in mapping.items()]
+    return harness._canonical(sorted(rows, key=lambda row: row["ranking_key_sha256"]))
+
+
+def _fcd1_ranking(mapping: dict[str, str], selected_ids: list[str] | None = None) -> dict:
+    identifiers = list(mapping)
+    selected_ids = identifiers[:1] if selected_ids is None else selected_ids
+    ranking_key_order = {event_id: rank for rank, event_id in enumerate(sorted(mapping, key=lambda event_id: mapping[event_id]), start=1)}
+    ranking_key_sha256 = {event_id: harness._sha256(mapping[event_id].encode("utf-8")) for event_id in identifiers}
+    view_order_sha256 = {name: harness._canonical([ranking_key_sha256[event_id] for event_id in identifiers]) for name in harness.FROZEN_SIX_VIEW_WEIGHTS}
+    component_ranks = {
+        event_id: {name: rank for name in harness.FROZEN_SIX_VIEW_WEIGHTS}
+        for rank, event_id in enumerate(identifiers, start=1)
+    }
+    fused = []
+    for rank, event_id in enumerate(identifiers, start=1):
+        contributions = {name: weight / (60 + rank) for name, weight in harness.FROZEN_SIX_VIEW_WEIGHTS.items()}
+        fused.append({
+            "source_event_id": event_id,
+            "ranking_key_sha256": ranking_key_sha256[event_id],
+            "ranking_key_order": ranking_key_order[event_id],
+            "rank": rank,
+            "final_rrf": sum(contributions.values()),
+            "component_ranks": component_ranks[event_id],
+            "component_rank_receipts": [{"view": name, "view_order_sha256": view_order_sha256[name], "ranking_key_sha256": ranking_key_sha256[event_id], "rank": rank} for name in harness.FROZEN_SIX_VIEW_WEIGHTS],
+            "contributions": contributions,
+        })
+    by_id = {row["source_event_id"]: row for row in fused}
+    selected = []
+    for event_id in selected_ids:
+        row = dict(by_id[event_id])
+        for name in ("rank", "ranking_key_order", "component_rank_receipts"):
+            row.pop(name)
+        selected.append(row)
+    input_sha256 = "b" * 64
+    policy_sha256 = harness._canonical(["public-policy"])
+    authorization_rows = [{"ranking_key_sha256": ranking_key_sha256[event_id], "policy_sha256": policy_sha256} for event_id in identifiers]
+    view_top_50 = {
+        name: [{
+            "source_event_id": event_id,
+            "ranking_key_sha256": ranking_key_sha256[event_id],
+            "ranking_key_order": ranking_key_order[event_id],
+            "rank": rank,
+            "score": 1.0 / rank,
+        } for rank, event_id in enumerate(identifiers[:50], start=1)]
+        for name in harness.FROZEN_SIX_VIEW_WEIGHTS
+    }
+    ledger = {
+        "schema": harness.FCD1_LEDGER_SCHEMA,
+        "input_sha256": input_sha256,
+        "authorization_sha256": harness._canonical(sorted(authorization_rows, key=lambda row: row["ranking_key_sha256"])),
+        "view_full_order": {name: list(identifiers) for name in harness.FROZEN_SIX_VIEW_WEIGHTS},
+        "view_order_sha256": view_order_sha256,
+        "view_top_50": view_top_50,
+        "view_top_50_sha256": {name: harness._canonical(rows) for name, rows in view_top_50.items()},
+        "fused_top_50": fused[:50],
+        "checkpoint_tie_group_semantics": "checkpoint_policy_rollup",
+        "checkpoint_tie_groups": [{
+            "group_id": "group:" + harness._canonical([harness._sha256(f"checkpoint:{event_id}".encode("utf-8")), policy_sha256]),
+            "checkpoint_sha256": harness._sha256(f"checkpoint:{event_id}".encode("utf-8")),
+            "policy_sha256": policy_sha256,
+            "checkpoint_score": 1.0 / rank,
+            "member_count": 1,
+            "chronological_members": [{
+                "source_event_id": event_id,
+                "ranking_key_sha256": ranking_key_sha256[event_id],
+            }],
+        } for rank, event_id in enumerate(identifiers, start=1)],
+    }
+    return {
+        "schema": "aerp2-product-six-view-v1", "query_sha256": "a" * 64,
+        "input_sha256": input_sha256,
+        "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS},
+        "encoder_identity": "encoder", "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS),
+        "rrf_k": 60, "selected": selected, "fcd1_diagnostic_ledger": ledger,
+    }
+
+
 def test_seed_uses_only_sanitized_dialog_fields_and_checkpoint_mapping(tmp_path):
     with RpgMemoryKernel(db_path=str(tmp_path / "locomo.sqlite3")) as kernel:
         event_to_dialog, audit = harness.seed_sanitized_conversation(kernel, _conversation(), conversation_id="conv-1")
@@ -33,6 +117,7 @@ def test_seed_uses_only_sanitized_dialog_fields_and_checkpoint_mapping(tmp_path)
     assert row["summary"] == row["source_span"] == "speaker: Ada\ndate: 2024-01-01\ncaption: arrival\ntext: Hello answer word"
     assert json.loads(row["payload_json"]) == {"retrieval_checkpoint_id": "conv-1/session-1", "retrieval_ranking_key": "dialog-1"}
     assert audit["annotation_lineage"]["forbidden_field_counts"] == {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}
+    assert len(audit["annotation_lineage"]["authorization_mapping_sha256"]) == 64
     assert "FORBIDDEN" not in json.dumps(audit)
     assert len(audit["ranker_texts_sha256"]) == 64
 
@@ -105,38 +190,96 @@ def test_full_corpus_contract_and_manifest_hash_fail_closed(tmp_path):
 
 def test_strict_sixview_trace_rejects_view_and_ranking_key_corruption():
     mapping = {"e": "dialog"}
-    ranking = {
-        "schema": "aerp2-product-six-view-v1",
-        "query_sha256": "a" * 64,
-        "input_sha256": "b" * 64,
-        "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS},
-        "encoder_identity": "encoder",
-        "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS),
-        "rrf_k": 60,
-        "selected": [{"source_event_id": "e", "ranking_key_sha256": harness._sha256(b"dialog")}],
-    }
+    ranking = _fcd1_ranking(mapping)
     trace = {"retrieval_ranking": ranking, "selected_evidence_ids": ["e"], "authorized_candidate_ids": ["e"], "denied_partitions": [], "candidate_generation": {"candidate_count": 1}, "candidates": [{"source_event_id": "e", "decision": "allow"}], "returned_spans": []}
-    lineage = [{"seed_ledger": {"forbidden_field_counts": {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": "d" * 64, "ranker_texts_sha256": "e" * 64}}]
+    lineage = [{"conversation_id": "c", "seed_ledger": {"forbidden_field_counts": {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": "d" * 64, "authorization_mapping_sha256": _fcd1_authorization_mapping_sha256(mapping), "ranker_texts_sha256": "e" * 64}}]
     summary = harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": ["dialog"]}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=1)
     assert summary["checks"]["ranking_schema"]
+    assert summary["checks"]["fcd1_ledger"]
     ranking["view_digests"].pop("combo_dense")
     assert not harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": ["dialog"]}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=1)["checks"]["ranking_schema"]
 
 
+def test_fcd1_ledger_replay_rejects_score_identity_and_group_corruption():
+    mapping = {"e": "dialog", "other": "other-dialog"}
+    ranking = _fcd1_ranking(mapping)
+    receipt = harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+    assert receipt["schema"] == harness.FCD1_LEDGER_SCHEMA and len(receipt["sha256"]) == 64
+    assert harness.FCD1_REFERENCE_PRODUCT_TOP10_SHA256 == "64007282069621bb3e603598938993ebe0907e8e84ebaa65394741ab618e5441"
+
+    ranking["fcd1_diagnostic_ledger"]["fused_top_50"][0]["contributions"]["raw_bm25"] += .01
+    with pytest.raises(ValueError, match="contributions"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+    ranking = _fcd1_ranking(mapping)
+    ranking["fcd1_diagnostic_ledger"]["view_top_50"]["raw_dense"][0]["ranking_key_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="identity"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+    ranking = _fcd1_ranking(mapping)
+    ranking["fcd1_diagnostic_ledger"]["checkpoint_tie_groups"].pop()
+    with pytest.raises(ValueError, match="partition"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+    ranking = _fcd1_ranking(mapping)
+    ranking["fcd1_diagnostic_ledger"]["authorization_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="authorization"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+    ranking = _fcd1_ranking(mapping)
+    ranking["fcd1_diagnostic_ledger"]["view_top_50"]["raw_bm25"][0]["score"] = .75
+    with pytest.raises(ValueError, match="score receipt"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+    ranking = _fcd1_ranking(mapping)
+    ranking["fcd1_diagnostic_ledger"]["fused_top_50"][:2] = reversed(ranking["fcd1_diagnostic_ledger"]["fused_top_50"][:2])
+    with pytest.raises(ValueError, match="identity or rank|fused ordering"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+    ranking = _fcd1_ranking(mapping)
+    ranking["fcd1_diagnostic_ledger"]["fused_top_50"][0]["component_ranks"]["raw_dense"] = 2
+    with pytest.raises(ValueError, match="component-rank receipts"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+
+
+def test_fcd1_ledger_rejects_coordinated_receipt_and_top50_boundary_drift():
+    mapping = {f"event-{index:03d}": f"dialog-{index:03d}" for index in range(51)}
+
+    ranking = _fcd1_ranking(mapping)
+    ledger = ranking["fcd1_diagnostic_ledger"]
+    ledger["view_order_sha256"]["raw_dense"] = "0" * 64
+    for row in ledger["fused_top_50"]:
+        next(receipt for receipt in row["component_rank_receipts"] if receipt["view"] == "raw_dense")["view_order_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="full view-order receipt"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+
+    ranking = _fcd1_ranking(mapping)
+    ledger = ranking["fcd1_diagnostic_ledger"]
+    ledger["view_full_order"]["raw_bm25"][49:51] = reversed(ledger["view_full_order"]["raw_bm25"][49:51])
+    ledger["view_order_sha256"]["raw_bm25"] = harness._canonical([harness._sha256(mapping[event_id].encode("utf-8")) for event_id in ledger["view_full_order"]["raw_bm25"]])
+    for row in ledger["fused_top_50"]:
+        next(receipt for receipt in row["component_rank_receipts"] if receipt["view"] == "raw_bm25")["view_order_sha256"] = ledger["view_order_sha256"]["raw_bm25"]
+    with pytest.raises(ValueError, match="full-order prefix"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+
+    ranking = _fcd1_ranking(mapping)
+    ledger = ranking["fcd1_diagnostic_ledger"]
+    boundary = ledger["fused_top_50"][49]
+    boundary["component_ranks"]["raw_dense"] = 51
+    next(receipt for receipt in boundary["component_rank_receipts"] if receipt["view"] == "raw_dense")["rank"] = 51
+    with pytest.raises(ValueError, match="full view order"):
+        harness.validate_fcd1_ledger(ranking, mapping, _fcd1_authorization_mapping_sha256(mapping))
+
+    ranking = _fcd1_ranking({"e": "dialog"})
+    ledger = ranking["fcd1_diagnostic_ledger"]
+    group = ledger["checkpoint_tie_groups"][0]
+    group["policy_sha256"] = "0" * 64
+    group["group_id"] = "group:" + harness._canonical([group["checkpoint_sha256"], group["policy_sha256"]])
+    authorization_rows = [{"ranking_key_sha256": member["ranking_key_sha256"], "policy_sha256": group["policy_sha256"]} for member in group["chronological_members"]]
+    ledger["authorization_sha256"] = harness._canonical(sorted(authorization_rows, key=lambda row: row["ranking_key_sha256"]))
+    with pytest.raises(ValueError, match="pre-ranking seed ledger"):
+        harness.validate_fcd1_ledger(ranking, {"e": "dialog"}, _fcd1_authorization_mapping_sha256({"e": "dialog"}))
+
+
 def test_trace_identity_sets_and_empty_selection_fail_closed():
     mapping = {"e": "dialog", "other": "other-dialog"}
-    ranking = {
-        "schema": "aerp2-product-six-view-v1",
-        "query_sha256": "a" * 64,
-        "input_sha256": "b" * 64,
-        "view_digests": {name: "c" * 64 for name in harness.FROZEN_SIX_VIEW_WEIGHTS},
-        "encoder_identity": "encoder",
-        "weights": dict(harness.FROZEN_SIX_VIEW_WEIGHTS),
-        "rrf_k": 60,
-        "selected": [{"source_event_id": "e", "ranking_key_sha256": harness._sha256(b"dialog")}],
-    }
+    ranking = _fcd1_ranking(mapping)
     trace = {"retrieval_ranking": ranking, "selected_evidence_ids": ["e"], "authorized_candidate_ids": list(mapping), "denied_partitions": [], "candidate_generation": {"candidate_count": 2}, "candidates": [{"source_event_id": "e", "decision": "allow"}], "returned_spans": []}
-    lineage = [{"seed_ledger": {"forbidden_field_counts": {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": "d" * 64, "ranker_texts_sha256": "e" * 64}}]
+    lineage = [{"conversation_id": "c", "seed_ledger": {"forbidden_field_counts": {field: 0 for field in harness.FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": "d" * 64, "authorization_mapping_sha256": _fcd1_authorization_mapping_sha256(mapping), "ranker_texts_sha256": "e" * 64}}]
     summary = harness.summarize_product_safety(traces={"q": trace}, product_rankings={"q": ["dialog"]}, product_event_maps={"c": mapping}, legacy_event_maps={"c": mapping}, question_conversations={"q": "c"}, lineage=lineage, expected_questions=1, expected_dialogs=2)
     assert summary["checks"]["trace_identity_sets"]
     trace["candidates"] = [{"source_event_id": "other", "decision": "allow"}]
@@ -275,13 +418,14 @@ def test_frozen_inputs_output_scope_source_pins_snapshots_and_phase_order(tmp_pa
 def test_per_question_audit_binds_trace_mapping_streams_and_report_shape():
     item = SimpleNamespace(opaque_conversation_id="c", corpus_opaque_dialog_ids=("d",))
     scorer = SimpleNamespace(scorer_items={"q": item})
-    ranking = {"schema": "aerp2-product-six-view-v1", "query_sha256": "a" * 64, "input_sha256": "b" * 64, "view_digests": {"raw": "c" * 64}, "encoder_identity": "encoder", "weights": {}, "rrf_k": 60, "selected": [{"source_event_id": "e"}]}
+    ranking = _fcd1_ranking({"e": "d"})
     trace = {"retrieval_ranking": ranking, "selected_evidence_ids": ["e"], "authorized_candidate_ids": ["e"], "denied_partitions": [], "candidate_generation": {"candidate_count": 1}, "candidates": [{"source_event_id": "e", "decision": "allow"}], "returned_spans": []}
     rankings = {arm: {"q": ["d"]} for arm in harness.ARMS}
     pools = {arm: {"q": [f"{arm}-{index}" for index in range(50)]} for arm in ("raw_bm25", "raw_dense", "raw_bm25_plus_raw_dense")}
-    audits = harness.build_question_audits(question_rows=[{"item_id": "q", "conversation_id": "c", "columns": {"raw_bm25": {}}}], scorer=scorer, rankings=rankings, source_pool_rankings=pools, traces={"q": trace}, product_event_maps={"c": {"e": "d"}}, lineage_by_conversation={"c": {"seed_ledger": {"checkpoint_ranking_mapping_sha256": "d" * 64}}})
+    audits = harness.build_question_audits(question_rows=[{"item_id": "q", "conversation_id": "c", "columns": {"raw_bm25": {}}}], scorer=scorer, rankings=rankings, source_pool_rankings=pools, traces={"q": trace}, product_event_maps={"c": {"e": "d"}}, lineage_by_conversation={"c": {"seed_ledger": {"checkpoint_ranking_mapping_sha256": "d" * 64, "authorization_mapping_sha256": _fcd1_authorization_mapping_sha256({"e": "d"})}}})
     assert audits[0]["composite_id"] == ["c", "q"] and audits[0]["event_dialog_mapping_sha256"]
-    report = {"schema": "aerp2-product-six-view-locomo", **{key: {} for key in ("manifest_sha256", "input_freeze", "model_runtime", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "encoder_sentinels", "encoder_snapshot_pair", "event_dialog_mapping_sha256", "aggregate", "gates")}, "phase_ledger": list(harness.PHASES), "safety_summary": {"expected_trace_count": 1}, "question_audits": audits}
+    acceptance = {"ledger_schema": harness.FCD1_LEDGER_SCHEMA, "top_k": harness.FCD1_TOP_K, "expected_questions": 1, "reference_product_top10_sha256": harness.FCD1_REFERENCE_PRODUCT_TOP10_SHA256, "actual_product_top10_sha256": harness.FCD1_REFERENCE_PRODUCT_TOP10_SHA256, "top10_unchanged": True}
+    report = {"schema": "aerp2-product-six-view-locomo", **{key: {} for key in ("manifest_sha256", "input_freeze", "model_runtime", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "encoder_sentinels", "encoder_snapshot_pair", "event_dialog_mapping_sha256", "aggregate", "gates")}, "phase_ledger": list(harness.PHASES), "fcd1_acceptance": acceptance, "safety_summary": {"expected_trace_count": 1}, "question_audits": audits}
     harness.validate_report_shape(report)
     report["safety_summary"]["expected_trace_count"] = 2
     with pytest.raises(RuntimeError, match="audit shape"):

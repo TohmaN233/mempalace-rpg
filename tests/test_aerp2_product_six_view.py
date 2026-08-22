@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+from copy import deepcopy
 
 import pytest
 
 from mempalace_rpg import RankingResult, RpgMemoryKernel, SceneEventInput, SixViewRanker
 from mempalace_rpg.retrieval import AuthorizedRetrievalCandidate, structured_observation
+
+
+def _ledger_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
 def _event(
@@ -105,6 +112,122 @@ def test_empty_authorized_universe_calls_injected_ranker_and_six_view_binds_quer
     assert "unseen query" not in str(empty_trace)
     assert encoder.queries == []
     assert encoder.passage_batches == []
+
+
+def test_fcd1_diagnostic_ledger_is_text_free_replayable_and_protocol_consistent_for_empty_and_ranked_inputs():
+    encoder = _CountingEncoder()
+    default_ranker = SixViewRanker(encoder)
+    assert "fcd1_diagnostic_ledger" not in default_ranker.rank(query="private empty query", candidates=[]).trace
+    ranker = SixViewRanker(encoder, diagnostic_ledger=True)
+    empty = ranker.rank(query="private empty query", candidates=[])
+    empty_ledger = empty.trace["fcd1_diagnostic_ledger"]
+    assert empty_ledger == {
+        "schema": "aerp3-fcd1-replay-ledger-v1",
+        "input_sha256": empty.trace["input_sha256"],
+        "authorization_sha256": hashlib.sha256(b"[]").hexdigest(),
+        "view_order_sha256": {name: hashlib.sha256(b"[]").hexdigest() for name in SixViewRanker.weights},
+        "view_top_50_sha256": {name: hashlib.sha256(b"[]").hexdigest() for name in SixViewRanker.weights},
+        "view_full_order": {name: [] for name in SixViewRanker.weights},
+        "view_top_50": {name: [] for name in SixViewRanker.weights},
+        "fused_top_50": [],
+        "checkpoint_tie_group_semantics": "checkpoint_policy_rollup",
+        "checkpoint_tie_groups": [],
+    }
+
+    candidates = [
+        _candidate("event-a", ("canonical", "public"), raw="SECRET ALPHA", observation="private_observation_alpha", checkpoint="checkpoint-a", scene_time=2, ranking_key="key-a"),
+        _candidate("event-b", ("canonical", "public"), raw="SECRET BETA", observation="private_observation_beta", checkpoint="checkpoint-a", scene_time=1, ranking_key="key-b"),
+        _candidate("event-c", ("canonical", "private"), raw="SECRET GAMMA", observation="private_observation_gamma", checkpoint="checkpoint-a", scene_time=3, ranking_key="key-c"),
+    ]
+    default_result = SixViewRanker(_CountingEncoder()).rank(query="private ranked query", candidates=candidates)
+    result = ranker.rank(query="private ranked query", candidates=candidates)
+    trace = result.trace
+    ledger = trace["fcd1_diagnostic_ledger"]
+    assert ledger["schema"] == "aerp3-fcd1-replay-ledger-v1"
+    assert result.ranked_event_ids == default_result.ranked_event_ids
+    assert result.scores == default_result.scores
+    assert {key: value for key, value in result.trace.items() if key != "fcd1_diagnostic_ledger"} == default_result.trace
+    assert ledger["input_sha256"] == trace["input_sha256"]
+    assert len(ledger["authorization_sha256"]) == 64
+    assert ledger["checkpoint_tie_group_semantics"] == "checkpoint_policy_rollup"
+    assert set(ledger["view_top_50"]) == set(SixViewRanker.weights)
+    for view, rows in ledger["view_top_50"].items():
+        full_order = ledger["view_full_order"][view]
+        key_hashes_by_id = {candidate.source_event_id: hashlib.sha256(candidate.ranking_key.encode()).hexdigest() for candidate in candidates}
+        assert set(full_order) == {candidate.source_event_id for candidate in candidates}
+        assert [row["source_event_id"] for row in rows] == full_order[:len(rows)]
+        assert [row["rank"] for row in rows] == list(range(1, len(rows) + 1))
+        assert len(rows) == 3
+        assert ledger["view_order_sha256"][view] == _ledger_digest([key_hashes_by_id[identifier] for identifier in full_order])
+        assert ledger["view_top_50_sha256"][view] == _ledger_digest(rows)
+        assert {row["ranking_key_order"] for row in rows} == {1, 2, 3}
+        assert all(set(row) == {"source_event_id", "ranking_key_sha256", "ranking_key_order", "rank", "score"} and len(row["ranking_key_sha256"]) == 64 and math.isfinite(row["score"]) for row in rows)
+        assert [row["source_event_id"] for row in rows] == [entry["source_event_id"] for entry in sorted(trace["selected"], key=lambda entry: entry["component_ranks"][view])]
+    fused = ledger["fused_top_50"]
+    assert [row["source_event_id"] for row in fused] == result.ranked_event_ids
+    assert [row["rank"] for row in fused] == [1, 2, 3]
+    assert all(math.isfinite(row["final_rrf"]) and math.isclose(row["final_rrf"], sum(row["contributions"].values()), rel_tol=0.0, abs_tol=1e-15) for row in fused)
+    assert all(len(row["ranking_key_sha256"]) == 64 and row["ranking_key_order"] in {1, 2, 3} and set(row["component_ranks"]) == set(SixViewRanker.weights) and set(row["contributions"]) == set(SixViewRanker.weights) for row in fused)
+    for row in fused:
+        assert [receipt["view"] for receipt in row["component_rank_receipts"]] == list(SixViewRanker.weights)
+        assert all(receipt["view_order_sha256"] == ledger["view_order_sha256"][receipt["view"]] and receipt["ranking_key_sha256"] == row["ranking_key_sha256"] and receipt["rank"] == row["component_ranks"][receipt["view"]] for receipt in row["component_rank_receipts"])
+    assert sorted([member["source_event_id"] for member in group["chronological_members"]] for group in ledger["checkpoint_tie_groups"]) == [["event-b", "event-a"], ["event-c"]]
+    assert all(set(group) == {"group_id", "checkpoint_sha256", "policy_sha256", "checkpoint_score", "member_count", "chronological_members"} and group["group_id"] == "group:" + _ledger_digest([group["checkpoint_sha256"], group["policy_sha256"]]) and len(group["checkpoint_sha256"]) == len(group["policy_sha256"]) == 64 and math.isfinite(group["checkpoint_score"]) and group["member_count"] == len(group["chronological_members"]) and all(len(member["ranking_key_sha256"]) == 64 for member in group["chronological_members"]) for group in ledger["checkpoint_tie_groups"])
+    authorization_rows = sorted(({"ranking_key_sha256": member["ranking_key_sha256"], "policy_sha256": group["policy_sha256"]} for group in ledger["checkpoint_tie_groups"] for member in group["chronological_members"]), key=lambda row: row["ranking_key_sha256"])
+    assert ledger["authorization_sha256"] == _ledger_digest(authorization_rows)
+    assert all(secret not in str(ledger) for secret in ("SECRET", "private_observation", "private ranked query", "checkpoint-a", "canonical", "public", "private", "key-a"))
+    tampered = deepcopy(ledger)
+    tampered["view_top_50"]["raw_bm25"][0]["score"] += 0.25
+    assert tampered["view_top_50_sha256"]["raw_bm25"] != _ledger_digest(tampered["view_top_50"]["raw_bm25"])
+
+
+def test_fcd1_diagnostic_ledger_is_capped_at_fifty_without_changing_full_ranking():
+    candidates = [
+        _candidate(f"event-{index:03d}", raw=f"raw-{index}", observation=f"observation-{index}", ranking_key=f"key-{index:03d}")
+        for index in range(51)
+    ]
+    result = SixViewRanker(_CountingEncoder(), diagnostic_ledger=True).rank(query="q", candidates=candidates)
+    ledger = result.trace["fcd1_diagnostic_ledger"]
+    assert len(result.ranked_event_ids) == len(result.scores) == 51
+    assert all(len(rows) == 50 for rows in ledger["view_top_50"].values())
+    assert all(len(order) == 51 and [row["source_event_id"] for row in ledger["view_top_50"][view]] == order[:50] for view, order in ledger["view_full_order"].items())
+    assert len(ledger["fused_top_50"]) == 50
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "true"])
+def test_fcd1_diagnostic_ledger_switch_requires_a_strict_bool(value):
+    with pytest.raises(ValueError, match="diagnostic_ledger"):
+        SixViewRanker(_CountingEncoder(), diagnostic_ledger=value)
+
+
+def test_fcd1_default_path_does_not_execute_diagnostic_ledger_builder(monkeypatch):
+    def diagnostic_builder_was_called(**_kwargs):
+        raise AssertionError("diagnostic ledger builder must not run by default")
+
+    candidates = [_candidate("event", ranking_key="key")]
+    default_ranker = SixViewRanker(_CountingEncoder())
+    monkeypatch.setattr(default_ranker, "_fcd1_diagnostic_ledger", diagnostic_builder_was_called)
+    assert default_ranker.rank(query="q", candidates=candidates).ranked_event_ids == ["event"]
+
+    enabled_ranker = SixViewRanker(_CountingEncoder(), diagnostic_ledger=True)
+    monkeypatch.setattr(enabled_ranker, "_fcd1_diagnostic_ledger", diagnostic_builder_was_called)
+    with pytest.raises(AssertionError, match="diagnostic ledger builder"):
+        enabled_ranker.rank(query="q", candidates=candidates)
+
+
+def test_fcd1_default_path_does_not_execute_diagnostic_score_scan(monkeypatch):
+    def diagnostic_score_scan_was_called(_score_views):
+        raise AssertionError("diagnostic score scan must not run by default")
+
+    candidates = [_candidate("event", ranking_key="key")]
+    default_ranker = SixViewRanker(_CountingEncoder())
+    monkeypatch.setattr(default_ranker, "_fcd1_validate_score_views", diagnostic_score_scan_was_called)
+    assert default_ranker.rank(query="q", candidates=candidates).ranked_event_ids == ["event"]
+
+    enabled_ranker = SixViewRanker(_CountingEncoder(), diagnostic_ledger=True)
+    monkeypatch.setattr(enabled_ranker, "_fcd1_validate_score_views", diagnostic_score_scan_was_called)
+    with pytest.raises(AssertionError, match="diagnostic score scan"):
+        enabled_ranker.rank(query="q", candidates=candidates)
 
 
 class _CountingEncoder:

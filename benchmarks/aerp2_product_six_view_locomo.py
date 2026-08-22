@@ -28,13 +28,17 @@ MANIFEST_PATH = ROOT / "tests" / "fixtures" / "aerp2_product_six_view_locomo_man
 EXPECTED_MANIFEST_SHA256 = "a67352b1f9d9001cfaeedc6b0635d3284603f8f7da7768cf4e6c05c4a9f2d2ea"
 FORBIDDEN_ANNOTATION_FIELDS = ["observation", "session_summary", "event_summary", "answer", "evidence", "category", "adversarial_answer"]
 ARMS = ("raw_bm25", "raw_dense", "raw_bm25_plus_raw_dense", "legacy_rpg", "product_six_view", "historical_six_view")
-RANKING_TRACE_REQUIRED = frozenset({"schema", "query_sha256", "input_sha256", "view_digests", "encoder_identity", "weights", "rrf_k", "selected"})
+RANKING_TRACE_REQUIRED = frozenset({"schema", "query_sha256", "input_sha256", "view_digests", "encoder_identity", "weights", "rrf_k", "selected", "fcd1_diagnostic_ledger"})
 FROZEN_SIX_VIEW_WEIGHTS = {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0, "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0}
+FCD1_LEDGER_SCHEMA = "aerp3-fcd1-replay-ledger-v1"
+FCD1_TOP_K = 50
+FCD1_REFERENCE_PRODUCT_TOP10_SHA256 = "64007282069621bb3e603598938993ebe0907e8e84ebaa65394741ab618e5441"
+FCD1_LOCOMO_POLICY_TUPLE = ("canonical", "public_world", "main", "active", None, None, None, "[]")
 SAFETY_CHECKS = (
     "trace_count", "audit_complete", "ranking_schema", "selected_matches_product_output",
     "unauthorized_selected", "legacy_mapping_1to1", "product_mapping_1to1",
     "lineage_forbidden", "lineage_mapping_digest", "ranking_key_mapping_digest",
-    "trace_identity_sets", "nonempty_selection",
+    "trace_identity_sets", "nonempty_selection", "fcd1_ledger",
 )
 
 
@@ -77,7 +81,7 @@ def validate_annotation_lineage(audit: dict[str, Any]) -> None:
     forbidden = ledger.get("forbidden_field_counts")
     if not isinstance(forbidden, dict) or set(forbidden) != set(FORBIDDEN_ANNOTATION_FIELDS) or any(not isinstance(forbidden[field], int) or forbidden[field] != 0 for field in FORBIDDEN_ANNOTATION_FIELDS):
         raise ValueError("annotation leakage into ranker inputs")
-    if not isinstance(ledger.get("checkpoint_ranking_mapping_sha256"), str) or len(ledger["checkpoint_ranking_mapping_sha256"]) != 64 or not isinstance(ledger.get("ranker_texts_sha256"), str) or len(ledger["ranker_texts_sha256"]) != 64 or not isinstance(ledger.get("dialog_count"), int):
+    if any(not isinstance(ledger.get(name), str) or len(ledger[name]) != 64 for name in ("checkpoint_ranking_mapping_sha256", "authorization_mapping_sha256", "ranker_texts_sha256")) or not isinstance(ledger.get("dialog_count"), int):
         raise ValueError("annotation lineage mapping is malformed")
 
 
@@ -91,7 +95,7 @@ def seed_sanitized_conversation(
     if not isinstance(conversation_id, str) or not conversation_id:
         raise ValueError("sanitized conversation id is required")
     event_to_dialog: dict[str, str] = {}
-    mapping: list[tuple[str, str]] = []; ranker_texts: list[tuple[str, str]] = []
+    mapping: list[tuple[str, str]] = []; ranker_texts: list[tuple[str, str]] = []; authorization_mapping: list[dict[str, str]] = []
     for session_index, session in enumerate(conversation.get("sessions", [])):
         session_id = session.get("opaque_session_id")
         if not isinstance(session_id, str) or not session_id:
@@ -107,9 +111,10 @@ def seed_sanitized_conversation(
             event_to_dialog[str(row["event_id"])] = dialog_id
             mapping.append((dialog_id, f"{conversation_id}/{session_id}"))
             ranker_texts.append((dialog_id, text))
+            authorization_mapping.append({"ranking_key_sha256": _sha256(dialog_id.encode("utf-8")), "checkpoint_sha256": _sha256(f"{conversation_id}/{session_id}".encode("utf-8")), "policy_sha256": _canonical(list(FCD1_LOCOMO_POLICY_TUPLE))})
     if len(event_to_dialog) != len(set(event_to_dialog.values())):
         raise ValueError("LoCoMo event-to-dialog mapping is not one-to-one")
-    ledger = {"conversation_count": 1, "session_count": len(conversation.get("sessions", [])), "dialog_count": len(mapping), "allowed_source_fields": ["speaker", "date", "caption", "text", "session_membership"], "forbidden_field_counts": {field: 0 for field in FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": _canonical(mapping), "ranker_texts_sha256": _canonical(ranker_texts)}
+    ledger = {"conversation_count": 1, "session_count": len(conversation.get("sessions", [])), "dialog_count": len(mapping), "allowed_source_fields": ["speaker", "date", "caption", "text", "session_membership"], "forbidden_field_counts": {field: 0 for field in FORBIDDEN_ANNOTATION_FIELDS}, "checkpoint_ranking_mapping_sha256": _canonical(mapping), "authorization_mapping_sha256": _canonical(sorted(authorization_mapping, key=lambda row: row["ranking_key_sha256"])), "ranker_texts_sha256": _canonical(ranker_texts)}
     audit = {"seed_ledger": ledger}
     validate_annotation_lineage(audit)
     return event_to_dialog, {"annotation_lineage": ledger, "ranker_texts_sha256": ledger["ranker_texts_sha256"], "seed_ledger": ledger}
@@ -310,9 +315,155 @@ def _mapping_safety(maps: dict[str, dict[str, str]], *, expected_dialogs: int) -
     return {"count": len(rows), "unique_event_count": len(set(event_ids)), "unique_dialog_count": len(set(dialog_ids)), "mapping_sha256": _canonical(rows), "valid": valid, "one_to_one": valid and len(rows) == expected_dialogs and len(rows) == len(set(event_ids)) == len(set(dialog_ids))}
 
 
+def validate_fcd1_ledger(ranking: dict[str, Any], mapping: dict[str, str], expected_authorization_mapping_sha256: str) -> dict[str, Any]:
+    """Validate the label-free replay ledger against the authorized event map."""
+    if not isinstance(ranking, dict):
+        raise ValueError("FCD-1 ranking trace is malformed")
+    ledger = ranking.get("fcd1_diagnostic_ledger")
+    if not isinstance(ledger, dict) or set(ledger) != {
+        "schema", "input_sha256", "authorization_sha256", "view_top_50",
+        "view_top_50_sha256", "view_full_order", "view_order_sha256", "fused_top_50", "checkpoint_tie_group_semantics",
+        "checkpoint_tie_groups",
+    }:
+        raise ValueError("FCD-1 ledger shape is malformed")
+    if ledger.get("schema") != FCD1_LEDGER_SCHEMA or ledger.get("input_sha256") != ranking.get("input_sha256"):
+        raise ValueError("FCD-1 ledger identity is malformed")
+    authorization_sha256 = ledger.get("authorization_sha256")
+    if not isinstance(authorization_sha256, str) or len(authorization_sha256) != 64:
+        raise ValueError("FCD-1 authorization receipt is malformed")
+    if ledger.get("checkpoint_tie_group_semantics") != "checkpoint_policy_rollup":
+        raise ValueError("FCD-1 checkpoint group semantics changed")
+
+    expected_count = min(FCD1_TOP_K, len(mapping))
+    views = ledger.get("view_top_50")
+    if not isinstance(views, dict) or set(views) != set(FROZEN_SIX_VIEW_WEIGHTS):
+        raise ValueError("FCD-1 view set is malformed")
+    view_top_50_sha256 = ledger.get("view_top_50_sha256")
+    if not isinstance(view_top_50_sha256, dict) or set(view_top_50_sha256) != set(FROZEN_SIX_VIEW_WEIGHTS) or any(not isinstance(value, str) or len(value) != 64 for value in view_top_50_sha256.values()):
+        raise ValueError("FCD-1 view score receipts are malformed")
+    expected_hashes = {event_id: _sha256(dialog_id.encode("utf-8")) for event_id, dialog_id in mapping.items()}
+    ranking_key_order = {event_id: rank for rank, event_id in enumerate(sorted(mapping, key=lambda event_id: mapping[event_id]), start=1)}
+    view_order_sha256 = ledger.get("view_order_sha256")
+    if not isinstance(view_order_sha256, dict) or set(view_order_sha256) != set(FROZEN_SIX_VIEW_WEIGHTS) or any(not isinstance(value, str) or len(value) != 64 for value in view_order_sha256.values()):
+        raise ValueError("FCD-1 full view-order receipts are malformed")
+    view_full_order = ledger.get("view_full_order")
+    if not isinstance(view_full_order, dict) or set(view_full_order) != set(FROZEN_SIX_VIEW_WEIGHTS):
+        raise ValueError("FCD-1 full view orders are malformed")
+    for name, full_order in view_full_order.items():
+        if not isinstance(full_order, list) or len(full_order) != len(mapping) or len(full_order) != len(set(full_order)) or set(full_order) != set(mapping):
+            raise ValueError(f"FCD-1 {name} full view order does not partition the authorized universe")
+        if view_order_sha256[name] != _canonical([expected_hashes[event_id] for event_id in full_order]):
+            raise ValueError(f"FCD-1 {name} full view-order receipt does not replay")
+    for view, rows in views.items():
+        if not isinstance(rows, list) or len(rows) != expected_count:
+            raise ValueError(f"FCD-1 {view} top-50 count is malformed")
+        identifiers: list[str] = []
+        for rank, row in enumerate(rows, start=1):
+            if not isinstance(row, dict) or set(row) != {"source_event_id", "ranking_key_sha256", "ranking_key_order", "rank", "score"}:
+                raise ValueError(f"FCD-1 {view} row is malformed")
+            event_id, score = row.get("source_event_id"), row.get("score")
+            if event_id not in mapping or row.get("ranking_key_sha256") != expected_hashes[event_id] or row.get("ranking_key_order") != ranking_key_order[event_id] or row.get("rank") != rank:
+                raise ValueError(f"FCD-1 {view} identity or rank is malformed")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+                raise ValueError(f"FCD-1 {view} score is malformed")
+            identifiers.append(event_id)
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError(f"FCD-1 {view} contains duplicate events")
+        if view_top_50_sha256[view] != _canonical(rows):
+            raise ValueError(f"FCD-1 {view} score receipt does not replay")
+        if identifiers != view_full_order[view][:expected_count]:
+            raise ValueError(f"FCD-1 {view} top-50 is not the full-order prefix")
+        if identifiers != [row["source_event_id"] for row in sorted(rows, key=lambda row: (-float(row["score"]), row["ranking_key_order"]))]:
+            raise ValueError(f"FCD-1 {view} score ordering does not replay")
+
+    fused = ledger.get("fused_top_50")
+    if not isinstance(fused, list) or len(fused) != expected_count:
+        raise ValueError("FCD-1 fused top-50 count is malformed")
+    fused_ids: list[str] = []
+    for rank, row in enumerate(fused, start=1):
+        required = {"source_event_id", "ranking_key_sha256", "ranking_key_order", "rank", "final_rrf", "component_ranks", "component_rank_receipts", "contributions"}
+        if not isinstance(row, dict) or set(row) != required:
+            raise ValueError("FCD-1 fused row is malformed")
+        event_id, total = row.get("source_event_id"), row.get("final_rrf")
+        component_ranks, contributions = row.get("component_ranks"), row.get("contributions")
+        if event_id not in mapping or row.get("ranking_key_sha256") != expected_hashes[event_id] or row.get("ranking_key_order") != ranking_key_order[event_id] or row.get("rank") != rank:
+            raise ValueError("FCD-1 fused identity or rank is malformed")
+        if not isinstance(component_ranks, dict) or set(component_ranks) != set(FROZEN_SIX_VIEW_WEIGHTS) or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > len(mapping) for value in component_ranks.values()):
+            raise ValueError("FCD-1 component ranks are malformed")
+        if not isinstance(contributions, dict) or set(contributions) != set(FROZEN_SIX_VIEW_WEIGHTS):
+            raise ValueError("FCD-1 contributions are malformed")
+        rank_receipts = row.get("component_rank_receipts")
+        if not isinstance(rank_receipts, list) or len(rank_receipts) != len(FROZEN_SIX_VIEW_WEIGHTS) or any(not isinstance(receipt, dict) or set(receipt) != {"view", "view_order_sha256", "ranking_key_sha256", "rank"} for receipt in rank_receipts):
+            raise ValueError("FCD-1 component-rank receipts do not replay")
+        receipts_by_view = {receipt["view"]: receipt for receipt in rank_receipts}
+        if set(receipts_by_view) != set(FROZEN_SIX_VIEW_WEIGHTS) or any(receipts_by_view[name] != {"view": name, "view_order_sha256": view_order_sha256[name], "ranking_key_sha256": expected_hashes[event_id], "rank": component_ranks[name]} for name in FROZEN_SIX_VIEW_WEIGHTS):
+            raise ValueError("FCD-1 component-rank receipts do not replay")
+        for name, component_rank in component_ranks.items():
+            if view_full_order[name][component_rank - 1] != event_id:
+                raise ValueError("FCD-1 component rank differs from its full view order")
+        expected_contributions = {name: FROZEN_SIX_VIEW_WEIGHTS[name] / (60 + component_ranks[name]) for name in FROZEN_SIX_VIEW_WEIGHTS}
+        if any(isinstance(contributions[name], bool) or not isinstance(contributions[name], (int, float)) or not math.isclose(float(contributions[name]), expected_contributions[name], rel_tol=0.0, abs_tol=1e-15) for name in FROZEN_SIX_VIEW_WEIGHTS):
+            raise ValueError("FCD-1 contributions do not replay")
+        if isinstance(total, bool) or not isinstance(total, (int, float)) or not math.isfinite(float(total)) or not math.isclose(float(total), math.fsum(expected_contributions.values()), rel_tol=0.0, abs_tol=1e-15):
+            raise ValueError("FCD-1 fused score does not replay")
+        fused_ids.append(event_id)
+    if len(fused_ids) != len(set(fused_ids)):
+        raise ValueError("FCD-1 fused top-50 contains duplicate events")
+    if fused_ids != [row["source_event_id"] for row in sorted(fused, key=lambda row: (-float(row["final_rrf"]), row["ranking_key_order"]))]:
+        raise ValueError("FCD-1 fused ordering does not replay")
+
+    selected = ranking.get("selected")
+    if not isinstance(selected, list) or len(selected) > len(fused):
+        raise ValueError("FCD-1 compact selected rows are malformed")
+    for selected_row, fused_row in zip(selected, fused):
+        replay = dict(fused_row)
+        for name in ("rank", "ranking_key_order", "component_rank_receipts"):
+            replay.pop(name)
+        if selected_row != replay:
+            raise ValueError("FCD-1 fused prefix differs from packed selection")
+
+    groups = ledger.get("checkpoint_tie_groups")
+    if not isinstance(groups, list) or (mapping and not groups):
+        raise ValueError("FCD-1 checkpoint groups are malformed")
+    group_ids: list[str] = []; member_ids: list[str] = []; checkpoint_scores: dict[str, float] = {}; authorization_rows: list[dict[str, str]] = []; authorization_mapping_rows: list[dict[str, str]] = []
+    for group in groups:
+        if not isinstance(group, dict) or set(group) != {"group_id", "checkpoint_sha256", "policy_sha256", "checkpoint_score", "member_count", "chronological_members"}:
+            raise ValueError("FCD-1 checkpoint group row is malformed")
+        group_id, checkpoint_sha256, policy_sha256, score, members = group.get("group_id"), group.get("checkpoint_sha256"), group.get("policy_sha256"), group.get("checkpoint_score"), group.get("chronological_members")
+        if not isinstance(checkpoint_sha256, str) or len(checkpoint_sha256) != 64 or not isinstance(policy_sha256, str) or len(policy_sha256) != 64:
+            raise ValueError("FCD-1 checkpoint group receipts are malformed")
+        if group_id != "group:" + _canonical([checkpoint_sha256, policy_sha256]):
+            raise ValueError("FCD-1 checkpoint group identity is malformed")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+            raise ValueError("FCD-1 checkpoint group score is malformed")
+        if not isinstance(members, list) or not members or group.get("member_count") != len(members):
+            raise ValueError("FCD-1 checkpoint group members are malformed")
+        for member in members:
+            if not isinstance(member, dict) or set(member) != {"source_event_id", "ranking_key_sha256"}:
+                raise ValueError("FCD-1 checkpoint member row is malformed")
+            event_id = member.get("source_event_id")
+            if event_id not in mapping or member.get("ranking_key_sha256") != expected_hashes[event_id]:
+                raise ValueError("FCD-1 checkpoint member identity is malformed")
+            member_ids.append(event_id); checkpoint_scores[event_id] = float(score)
+            authorization_rows.append({"ranking_key_sha256": expected_hashes[event_id], "policy_sha256": policy_sha256})
+            authorization_mapping_rows.append({"ranking_key_sha256": expected_hashes[event_id], "checkpoint_sha256": checkpoint_sha256, "policy_sha256": policy_sha256})
+        group_ids.append(group_id)
+    if len(group_ids) != len(set(group_ids)) or len(member_ids) != len(set(member_ids)) or set(member_ids) != set(mapping):
+        raise ValueError("FCD-1 checkpoint groups do not partition the authorized universe")
+    if any(not math.isclose(float(row["score"]), checkpoint_scores[row["source_event_id"]], rel_tol=0.0, abs_tol=1e-15) for row in views["checkpoint_dense"]):
+        raise ValueError("FCD-1 checkpoint view does not replay group scores")
+    expected_authorization_sha256 = _canonical(sorted(authorization_rows, key=lambda row: row["ranking_key_sha256"]))
+    if authorization_sha256 != expected_authorization_sha256:
+        raise ValueError("FCD-1 authorization receipt does not replay")
+    if not isinstance(expected_authorization_mapping_sha256, str) or len(expected_authorization_mapping_sha256) != 64 or _canonical(sorted(authorization_mapping_rows, key=lambda row: row["ranking_key_sha256"])) != expected_authorization_mapping_sha256:
+        raise ValueError("FCD-1 authorization mapping differs from the pre-ranking seed ledger")
+    return {"schema": FCD1_LEDGER_SCHEMA, "top_k": FCD1_TOP_K, "sha256": _canonical(ledger)}
+
+
 def summarize_product_safety(*, traces: dict[str, Any], product_rankings: dict[str, list[str]], product_event_maps: dict[str, dict[str, str]], legacy_event_maps: dict[str, dict[str, str]], question_conversations: dict[str, str], lineage: list[dict[str, Any]], expected_questions: int, expected_dialogs: int) -> dict[str, Any]:
     """Turn every Product call and seed mapping into fail-closed P1 evidence."""
-    audits = []; ranking_complete = 0; selected_matches = 0; unauthorized = 0; ranking_digest_count = 0; identity_complete = 0; nonempty_selection = 0
+    audits = []; ranking_complete = 0; selected_matches = 0; unauthorized = 0; ranking_digest_count = 0; identity_complete = 0; nonempty_selection = 0; fcd1_ledger_complete = 0
+    seed_ledgers = {row.get("conversation_id"): row.get("seed_ledger") for row in lineage if isinstance(row, dict)}
     for item_id, trace in traces.items():
         audit = aerp1.audit_product_trace(trace) if isinstance(trace, dict) else {"complete": False, "unauthorized_selected_ids": []}
         audits.append(audit); unauthorized += len(audit.get("unauthorized_selected_ids", []))
@@ -326,6 +477,13 @@ def summarize_product_safety(*, traces: dict[str, Any], product_rankings: dict[s
         selected_key_ok = isinstance(selected_rows, list) and all(isinstance(row, dict) and row.get("source_event_id") in mapping and row.get("ranking_key_sha256") == _sha256(mapping[row["source_event_id"]].encode("utf-8")) for row in selected_rows)
         digest_ok = schema_ok and views_ok and selected_key_ok and all(isinstance(ranking.get(name), str) and len(ranking[name]) == 64 for name in ("query_sha256", "input_sha256"))
         ranking_complete += int(digest_ok); ranking_digest_count += int(digest_ok)
+        try:
+            expected_authorization_mapping_sha256 = seed_ledgers.get(conversation_id, {}).get("authorization_mapping_sha256") if isinstance(seed_ledgers.get(conversation_id), dict) else None
+            validate_fcd1_ledger(ranking, mapping, expected_authorization_mapping_sha256)
+        except (TypeError, ValueError):
+            pass
+        else:
+            fcd1_ledger_complete += 1
         selected_ids = trace.get("selected_evidence_ids") if isinstance(trace, dict) else None
         authorized = trace.get("authorized_candidate_ids") if isinstance(trace, dict) else None
         candidates = trace.get("candidates") if isinstance(trace, dict) else None
@@ -351,7 +509,7 @@ def summarize_product_safety(*, traces: dict[str, Any], product_rankings: dict[s
     ledgers = [row.get("seed_ledger") for row in lineage if isinstance(row, dict)]
     forbidden_ok = all(isinstance(ledger, dict) and isinstance(ledger.get("forbidden_field_counts"), dict) and set(ledger["forbidden_field_counts"]) == set(FORBIDDEN_ANNOTATION_FIELDS) and all(ledger["forbidden_field_counts"].get(field) == 0 for field in FORBIDDEN_ANNOTATION_FIELDS) for ledger in ledgers)
     forbidden_count = sum(sum(value for value in ledger.get("forbidden_field_counts", {}).values() if isinstance(value, int)) for ledger in ledgers if isinstance(ledger, dict))
-    mapping_digest_count = sum(int(isinstance(ledger, dict) and isinstance(ledger.get("checkpoint_ranking_mapping_sha256"), str) and len(ledger["checkpoint_ranking_mapping_sha256"]) == 64 and isinstance(ledger.get("ranker_texts_sha256"), str) and len(ledger["ranker_texts_sha256"]) == 64) for ledger in ledgers)
+    mapping_digest_count = sum(int(isinstance(ledger, dict) and all(isinstance(ledger.get(name), str) and len(ledger[name]) == 64 for name in ("checkpoint_ranking_mapping_sha256", "authorization_mapping_sha256", "ranker_texts_sha256"))) for ledger in ledgers)
     checks = {
         "trace_count": len(traces) == expected_questions,
         "audit_complete": len(audits) == expected_questions and sum(int(audit.get("complete") is True) for audit in audits) == expected_questions,
@@ -365,8 +523,9 @@ def summarize_product_safety(*, traces: dict[str, Any], product_rankings: dict[s
         "ranking_key_mapping_digest": ranking_digest_count == expected_questions and len(product_mapping["mapping_sha256"]) == 64,
         "trace_identity_sets": set(traces) == set(question_conversations) == set(product_rankings) and identity_complete == expected_questions,
         "nonempty_selection": nonempty_selection == expected_questions,
+        "fcd1_ledger": fcd1_ledger_complete == expected_questions,
     }
-    return {"expected_trace_count": expected_questions, "trace_count": len(traces), "audit_complete_count": sum(int(audit.get("complete") is True) for audit in audits), "ranking_schema_complete_count": ranking_complete, "selected_match_count": selected_matches, "trace_identity_complete_count": identity_complete, "nonempty_selection_count": nonempty_selection, "unauthorized_selected_count": unauthorized, "legacy_mapping": legacy_mapping, "product_mapping": product_mapping, "lineage": {"count": len(ledgers), "forbidden_field_count": forbidden_count, "mapping_digest_count": mapping_digest_count}, "ranking_digest_count": ranking_digest_count, "checks": checks, "pass": all(checks.values())}
+    return {"expected_trace_count": expected_questions, "trace_count": len(traces), "audit_complete_count": sum(int(audit.get("complete") is True) for audit in audits), "ranking_schema_complete_count": ranking_complete, "fcd1_ledger_complete_count": fcd1_ledger_complete, "selected_match_count": selected_matches, "trace_identity_complete_count": identity_complete, "nonempty_selection_count": nonempty_selection, "unauthorized_selected_count": unauthorized, "legacy_mapping": legacy_mapping, "product_mapping": product_mapping, "lineage": {"count": len(ledgers), "forbidden_field_count": forbidden_count, "mapping_digest_count": mapping_digest_count}, "ranking_digest_count": ranking_digest_count, "checks": checks, "pass": all(checks.values())}
 
 
 def evaluate_release_gates(rows: list[dict[str, Any]], *, bootstrap_seed: int, bootstrap_resamples: int, thresholds: dict[str, Any], safety_summary: dict[str, Any]) -> dict[str, Any]:
@@ -580,15 +739,15 @@ def validate_official_aggregate_anchors(aggregate: dict[str, Any], anchors: dict
             raise RuntimeError(f"{label} anchor mismatch")
 
 
-def _product_rank(kernel: RpgMemoryKernel, conversation_id: str, query: str, event_to_dialog: dict[str, str], top_k: int) -> tuple[list[str], dict[str, Any]]:
+def _product_rank(kernel: RpgMemoryKernel, conversation_id: str, query: str, event_to_dialog: dict[str, str], top_k: int, expected_authorization_mapping_sha256: str) -> tuple[list[str], dict[str, Any]]:
     decision = kernel.authorized_evidence(campaign_id=conversation_id, actor_id="locomo_reader", actor_type="npc", query=query, active_quest_ids=[], budget=1000, _compact_product_trace=True)
     evidence = kernel._retrieve_memory_items(campaign_id=conversation_id, actor_id="locomo_reader", actor_type="npc", query=query, active_quest_ids=[], location_id=None, hit_limit=top_k, max_chars=10_000_000, authorized_event_ids=set(decision.trace["authorized_candidate_ids"]), ranking_trace=decision.trace)
     selected = [str(item["source_event_id"]) for item in evidence]
     decision.trace["selected_evidence_ids"] = selected
     kernel._complete_product_trace(decision, campaign_id=conversation_id, actor_id="locomo_reader", actor_type="npc")
     ranking = decision.trace.get("retrieval_ranking")
-    required = {"schema", "query_sha256", "input_sha256", "view_digests", "encoder_identity", "weights", "rrf_k", "selected"}
-    if not isinstance(ranking, dict) or ranking.get("schema") != "aerp2-product-six-view-v1" or not required <= set(ranking) or [row.get("source_event_id") for row in ranking["selected"]] != selected: raise RuntimeError("product ranking trace is incomplete")
+    if not isinstance(ranking, dict) or ranking.get("schema") != "aerp2-product-six-view-v1" or not RANKING_TRACE_REQUIRED <= set(ranking) or [row.get("source_event_id") for row in ranking["selected"]] != selected: raise RuntimeError("product ranking trace is incomplete")
+    validate_fcd1_ledger(ranking, event_to_dialog, expected_authorization_mapping_sha256)
     audit = aerp1.audit_product_trace(decision.trace)
     if not audit["complete"] or len(selected) != len(set(selected)) or not set(selected) <= set(decision.trace["authorized_candidate_ids"]): raise RuntimeError("product ACL trace is incomplete")
     return [event_to_dialog[item] for item in selected], decision.trace
@@ -621,7 +780,7 @@ def build_question_audits(*, question_rows: list[dict[str, Any]], scorer: Any, r
             "checkpoint_ranking_mapping_sha256": ledger.get("checkpoint_ranking_mapping_sha256"),
             "event_dialog_mapping_sha256": _mapping_safety({conversation_id: mapping}, expected_dialogs=len(mapping))["mapping_sha256"],
             "authorized_candidates": {"count": len(authorized), "sha256": _canonical(sorted(str(value) for value in authorized))},
-            "product_retrieval": {name: ranking.get(name) for name in ("schema", "query_sha256", "input_sha256", "view_digests", "encoder_identity", "weights", "rrf_k")},
+            "product_retrieval": {**{name: ranking.get(name) for name in ("schema", "query_sha256", "input_sha256", "view_digests", "encoder_identity", "weights", "rrf_k")}, "fcd1_diagnostic_ledger_sha256": validate_fcd1_ledger(ranking, mapping, ledger.get("authorization_mapping_sha256"))["sha256"]},
             "trace_audit": aerp1.audit_product_trace(trace), "top10": {arm: rankings[arm][item_id] for arm in ARMS},
             "source_pool": source_digests, "scored_metrics": row["columns"],
         }
@@ -652,11 +811,20 @@ def split_diagnostics(question_rows: list[dict[str, Any]], splits: dict[str, str
 
 
 def validate_report_shape(report: dict[str, Any]) -> None:
-    required = {"manifest_sha256", "input_freeze", "model_runtime", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "encoder_sentinels", "encoder_snapshot_pair", "phase_ledger", "event_dialog_mapping_sha256", "question_audits", "safety_summary", "aggregate", "gates"}
+    required = {"manifest_sha256", "input_freeze", "model_runtime", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "encoder_sentinels", "encoder_snapshot_pair", "phase_ledger", "event_dialog_mapping_sha256", "fcd1_acceptance", "question_audits", "safety_summary", "aggregate", "gates"}
     if not isinstance(report, dict) or report.get("schema") != "aerp2-product-six-view-locomo" or not required <= set(report):
         raise RuntimeError("quality report provenance shape is incomplete")
     expected_questions = report.get("safety_summary", {}).get("expected_trace_count") if isinstance(report.get("safety_summary"), dict) else None
-    if report["phase_ledger"] != list(PHASES) or not isinstance(expected_questions, int) or len(report["question_audits"]) != expected_questions:
+    acceptance = report.get("fcd1_acceptance")
+    acceptance_ok = isinstance(acceptance, dict) and acceptance == {
+        "ledger_schema": FCD1_LEDGER_SCHEMA,
+        "top_k": FCD1_TOP_K,
+        "expected_questions": expected_questions,
+        "reference_product_top10_sha256": FCD1_REFERENCE_PRODUCT_TOP10_SHA256,
+        "actual_product_top10_sha256": FCD1_REFERENCE_PRODUCT_TOP10_SHA256,
+        "top10_unchanged": True,
+    }
+    if report["phase_ledger"] != list(PHASES) or not isinstance(expected_questions, int) or len(report["question_audits"]) != expected_questions or not acceptance_ok:
         raise RuntimeError("quality report audit shape is incomplete")
 
 
@@ -687,7 +855,7 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
         dialog_count = sum(len(dialog["dialogs"]) for ids in item_ids.values() for dialog in retrieval.retrieval_items[ids[0]]["sessions"])
         rankings = {arm: {} for arm in ARMS[:-1]}; source_pool_rankings = {"raw_bm25": {}, "raw_dense": {}, "raw_bm25_plus_raw_dense": {}}; traces: dict[str, Any] = {}; lineage: list[dict[str, Any]] = []; lineage_by_conversation: dict[str, dict[str, Any]] = {}; legacy_event_maps: dict[str, dict[str, str]] = {}; product_event_maps: dict[str, dict[str, str]] = {}; question_conversations: dict[str, str] = {}
         with tempfile.TemporaryDirectory(prefix="aerp2-product-kernel-") as temp:
-            legacy = RpgMemoryKernel(db_path=str(Path(temp) / "legacy.sqlite")); product = RpgMemoryKernel(db_path=str(Path(temp) / "product.sqlite"), retrieval_ranker=SixViewRanker(HistoricalBgeAdapter(encoder, identity)))
+            legacy = RpgMemoryKernel(db_path=str(Path(temp) / "legacy.sqlite")); product = RpgMemoryKernel(db_path=str(Path(temp) / "product.sqlite"), retrieval_ranker=SixViewRanker(HistoricalBgeAdapter(encoder, identity), diagnostic_ledger=True))
             try:
                 for conversation_id, ids in sorted(item_ids.items()):
                     payload0 = retrieval.retrieval_items[ids[0]]; legacy_map, audit = seed_sanitized_conversation(legacy, payload0, conversation_id=conversation_id); product_map, product_audit = seed_sanitized_conversation(product, payload0, conversation_id=conversation_id)
@@ -701,8 +869,11 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
                         source_pool_rankings["raw_bm25"][item_id] = raw_pool; source_pool_rankings["raw_dense"][item_id] = dense_pool; source_pool_rankings["raw_bm25_plus_raw_dense"][item_id] = fused_pool
                         rankings["raw_bm25"][item_id] = raw_pool[:10]; rankings["raw_dense"][item_id] = dense_pool[:10]; rankings["raw_bm25_plus_raw_dense"][item_id] = fused_pool[:10]
                         rankings["legacy_rpg"][item_id] = aerp1.rank_rpg(legacy, conversation_id=conversation_id, query=payload["query"], event_to_dialog=legacy_map, top_k=10)[0]
-                        rankings["product_six_view"][item_id], traces[item_id] = _product_rank(product, conversation_id, payload["query"], product_map, 10)
+                        rankings["product_six_view"][item_id], traces[item_id] = _product_rank(product, conversation_id, payload["query"], product_map, 10, product_audit["seed_ledger"]["authorization_mapping_sha256"])
             finally: legacy.close(); product.close()
+        product_top10_sha256 = _canonical(rankings["product_six_view"])
+        if product_top10_sha256 != FCD1_REFERENCE_PRODUCT_TOP10_SHA256:
+            raise RuntimeError("FCD-1 changed the frozen Product top-10 stream")
         # Ranking freeze ends here.  Only now may scorer labels and historical reference be joined.
         encoder_snapshots = encoder_snapshot_receipt(encoder)
         model_runtime = model_runtime_receipt(encoder_snapshots, encoder_sentinels, manifest["inputs"])
@@ -736,7 +907,7 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
         if not aerp1.same_git_state(state_before, state_after): raise RuntimeError("worktree changed during quality run")
         advance_phase(phases, "state_recheck")
         advance_phase(phases, "atomic_publish_ready")
-        report = {"schema": "aerp2-product-six-view-locomo", "status": "complete", "manifest_sha256": manifest_sha, "input_freeze": {"dataset": {key: value for key, value in dataset_receipt.items() if key != "data"}, "artifact": {key: value for key, value in artifact_receipt.items() if key != "data"}, "model_manifest_sha256": encoder.manifest.canonical_sha256, **scorer_digests}, "model_runtime": {**model_runtime, **runtime_provider}, "git_state_before": state_before, "git_state_after": state_after, "source_repo": source_receipt, "historical_source": {"commit": HISTORICAL_COMMIT, "files": source_digests}, "encoder_identity": identity, "adapter_implementation_sha256": adapter_digest, "encoder_sentinels": encoder_sentinels, "encoder_snapshot_pair": encoder_snapshots, "phase_ledger": phases, "annotation_lineage": lineage, "event_dialog_mapping_sha256": {"legacy": _mapping_safety(legacy_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"], "product": _mapping_safety(product_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"]}, "ranking_stream_sha256": {arm: _canonical(rankings[arm]) for arm in rankings}, "source_pool_stream_sha256": {arm: _canonical(source_pool_rankings[arm]) for arm in source_pool_rankings}, "rankings_top10": rankings, "source_pool_rankings": source_pool_rankings, "product_traces": traces, "safety_summary": safety, "question_audits": question_audits, "questions": question_rows, "aggregate": aggregate, "split_diagnostics_non_gating": diagnostics, "gates": gates, "claim_boundary": "public/non-blind engineering regression; QA-annotation-free; caption is upstream metadata, not hidden-set generalization"}
+        report = {"schema": "aerp2-product-six-view-locomo", "status": "complete", "manifest_sha256": manifest_sha, "input_freeze": {"dataset": {key: value for key, value in dataset_receipt.items() if key != "data"}, "artifact": {key: value for key, value in artifact_receipt.items() if key != "data"}, "model_manifest_sha256": encoder.manifest.canonical_sha256, **scorer_digests}, "model_runtime": {**model_runtime, **runtime_provider}, "git_state_before": state_before, "git_state_after": state_after, "source_repo": source_receipt, "historical_source": {"commit": HISTORICAL_COMMIT, "files": source_digests}, "encoder_identity": identity, "adapter_implementation_sha256": adapter_digest, "encoder_sentinels": encoder_sentinels, "encoder_snapshot_pair": encoder_snapshots, "phase_ledger": phases, "annotation_lineage": lineage, "event_dialog_mapping_sha256": {"legacy": _mapping_safety(legacy_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"], "product": _mapping_safety(product_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"]}, "fcd1_acceptance": {"ledger_schema": FCD1_LEDGER_SCHEMA, "top_k": FCD1_TOP_K, "expected_questions": manifest["protocol"]["questions"], "reference_product_top10_sha256": FCD1_REFERENCE_PRODUCT_TOP10_SHA256, "actual_product_top10_sha256": product_top10_sha256, "top10_unchanged": product_top10_sha256 == FCD1_REFERENCE_PRODUCT_TOP10_SHA256}, "ranking_stream_sha256": {arm: _canonical(rankings[arm]) for arm in rankings}, "source_pool_stream_sha256": {arm: _canonical(source_pool_rankings[arm]) for arm in source_pool_rankings}, "rankings_top10": rankings, "source_pool_rankings": source_pool_rankings, "product_traces": traces, "safety_summary": safety, "question_audits": question_audits, "questions": question_rows, "aggregate": aggregate, "split_diagnostics_non_gating": diagnostics, "gates": gates, "claim_boundary": "public/non-blind engineering regression; QA-annotation-free; FCD-1 is label-free diagnostic telemetry and does not establish fusion causality; caption is upstream metadata, not hidden-set generalization"}
         validate_report_shape(report)
         atomic_json(output, report); return report
     finally:
