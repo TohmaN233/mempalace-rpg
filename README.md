@@ -325,6 +325,34 @@ telemetry: denied candidate IDs may appear there, but never in selected evidence
 rendered product text, or returned spans. Keep generated reports outside the
 repository.
 
+### AERP-2 historical six-view replay and ownership ablation
+
+This is a byte-pinned historical LoCoMo retrieval replay, not an RPG kernel
+benchmark or a product-ranking claim. It freezes the historical dataset, model,
+selection decision, scorer, source blobs, and ranking streams; raw BM25 and the
+six-view stream must reproduce rank-for-rank before the two raw-dense arms are
+reported.
+
+```powershell
+python -m benchmarks.aerp2_historical_export `
+  --artifact E:\MemPalaceWorkspace\artifacts\benchmark-runs\locomo_story_dense_v2_full_run1.json `
+  --dataset E:\MemPalaceWorkspace\data\benchmark-data\locomo\main\locomo10.json `
+  --model-dir E:\MemPalaceWorkspace\artifacts\benchmark-runs\models\bge-small-en-v1.5\onnx `
+  --source-repo E:\MemPalaceWorkspace\repos\mempalace `
+  --selection-freeze E:\MemPalaceWorkspace\artifacts\benchmark-runs\locomo_story_dense_v2_selection_freeze.json `
+  --manifest tests\fixtures\aerp2_six_view_replay_manifest.json `
+  --output C:\outside-repo\aerp2-six-view-export.json
+```
+
+The completed 1,986-question / 603-hard-question, official-exact Recall@10
+result is: raw BM25 0.563496 overall / 0.449526 hard; raw dense 0.510819 /
+0.468811; raw BM25 + raw dense RRF 0.624343 / 0.525106; full six-view
+0.722748 / 0.680230. The full six-view method uses historical observation and
+session-summary annotations. Therefore this is annotation-assisted retrieval
+evidence only: it does not establish annotation-free productization, graph or
+clustering value, kernel ranking quality, or an improvement claim for the RPG
+product.
+
 ```bash
 python -m venv .venv
 . .venv/bin/activate

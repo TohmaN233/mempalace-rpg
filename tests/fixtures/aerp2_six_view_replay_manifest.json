@@ -1,0 +1,51 @@
+{
+  "schema": "aerp2-six-view-replay-manifest",
+  "version": 1,
+  "artifact": {
+    "sha256": "d949e7a3776df9a962a3c4350f98f63f29682b8b2484a145b639e1f6bacb0e18",
+    "schema_version": "mempalace.locomo_story_retrieval.v2",
+    "status": "completed_exploratory_public_nonblind_dense_retrieval"
+  },
+  "freeze": {
+    "dataset_sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+    "model_manifest_sha256": "454d14761089976b0437135fd70c6da49fc836ad9344d43b0a693d343fc0ea85",
+    "config_sha256": "d47abbebddff1ea1178793210b1d9c5f3362f5ad1ffc0f960f1d6047d7f1146c",
+    "selection_freeze_sha256": "7b45ca3b18312dbeb2578129fd61542b94236699b697c98e402eed587961462a",
+    "scorer_implementation": {
+      "file": "locomo_story_experiment.py",
+      "sha256": "2b7355a0fb66d0e8c3c0f9c5e282fd6f794ad805bf5597fc4d5a75f0c9e218bf"
+    }
+  },
+  "historical_source": {
+    "repository": "mempalace",
+    "commit": "429e11ced3529a3409509026a62fb3bb5ec43c77",
+    "files": {
+      "locomo_bge_encoder.py": "ffbf915209c83135b34a6f1e4071b746006c671597ba6b8b6cf4842902f1ad51",
+      "locomo_dense_story_candidate.py": "7378564770f898ee9ad93ac3ec49322cb6f7e85754100692cfab49bc05bfd3e9",
+      "locomo_story_candidate.py": "2709c3aa6c8a0220f409320f013651370eaea759ddfde01f7b041428f173a97a",
+      "locomo_story_experiment.py": "2b7355a0fb66d0e8c3c0f9c5e282fd6f794ad805bf5597fc4d5a75f0c9e218bf",
+      "locomo_story_protocol.py": "f0e5b3ec3045b83149d36347435b65c1ff7ee92e9597e74cdf4c0cd636394341"
+    }
+  },
+  "protocol": {
+    "top_k": 10,
+    "candidate_pool_size": 50,
+    "hard_categories": [1, 2],
+    "rrf_k": 60
+  },
+  "anchors": {
+    "raw_bm25": {
+      "overall": 0.5634957788174197,
+      "hard": 0.4495262353078535
+    },
+    "six_view": {
+      "overall": 0.7227484113462174,
+      "hard": 0.6802297309432684
+    }
+  },
+  "asset_locations": {
+    "historical_dataset": "E:/MemPalaceWorkspace/data/benchmark-data/locomo/main/locomo10.json",
+    "historical_model_dir": "E:/MemPalaceWorkspace/artifacts/benchmark-runs/models/bge-small-en-v1.5/onnx",
+    "selection_freeze": "E:/MemPalaceWorkspace/artifacts/benchmark-runs/locomo_story_dense_v2_selection_freeze.json"
+  }
+}
