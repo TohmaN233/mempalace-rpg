@@ -205,6 +205,7 @@ def _configured(module, monkeypatch: pytest.MonkeyPatch, artifact: dict | None =
     monkeypatch.setattr(module, "EXPECTED_POOL", 4)
     monkeypatch.setattr(module, "TOP_K", 2)
     monkeypatch.setattr(module, "PRODUCT_TOP10_SHA256", artifact["fcd1_acceptance"]["actual_product_top10_sha256"])
+    monkeypatch.setattr(module, "_clean_git_head", lambda _path: "a" * 40)
 
 
 def _analyze(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str = "fusion", *, duplicate_gold: bool = False) -> tuple[dict, Path, bytes]:
@@ -415,6 +416,91 @@ def test_atomic_publisher_rejects_mutation_and_preserves_input(module, monkeypat
     artifact.write_bytes(raw)
     module.atomic_json(output, report, artifact_path=artifact, expected_artifact_bytes=raw)
     assert json.loads(output.read_text(encoding="utf-8"))["verdict"] == "FUSION_SUPPORTED"
+
+
+def test_staged_prefreeze_receipt_binds_product_stream_and_both_input_receipts(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from benchmarks import aerp2_product_six_view_locomo as harness
+    artifact = _artifact()
+    _configured(module, monkeypatch, artifact)
+    source_repo = tmp_path / "source-repo"; source_repo.mkdir()
+    artifact["safety_summary"] = {
+        "expected_trace_count": 10, "trace_count": 10, "audit_complete_count": 10, "ranking_schema_complete_count": 10,
+        "fcd1_ledger_complete_count": 10, "selected_match_count": 10, "trace_identity_complete_count": 10,
+        "nonempty_selection_count": 10, "unauthorized_selected_count": 0,
+        "legacy_mapping": {"count": 4, "unique_event_count": 4, "unique_dialog_count": 4, "mapping_sha256": "a" * 64, "valid": True, "one_to_one": True},
+        "product_mapping": {"count": 4, "unique_event_count": 4, "unique_dialog_count": 4, "mapping_sha256": "b" * 64, "valid": True, "one_to_one": True},
+        "lineage": {"count": 10, "forbidden_field_count": 0, "mapping_digest_count": 10}, "ranking_digest_count": 10,
+        "checks": {name: True for name in harness.SAFETY_CHECKS}, "pass": True,
+    }
+    artifact["manifest_sha256"] = "7" * 64
+    artifact["input_freeze"] = {"dataset": {"label": "dataset", "path": str(tmp_path / "dataset"), "sha256": "1" * 64, "bytes": 1}, "model_manifest_sha256": "2" * 64}
+    artifact["historical_source"] = {"commit": harness.HISTORICAL_COMMIT, "files": {"benchmarks/locomo_bge_encoder.py": "9" * 64}}
+    artifact["source_repo"] = {"pinned_commit": harness.HISTORICAL_COMMIT, "path": str(source_repo), "git_state": {"git_head": "a" * 40, "git_tree": "b" * 40, "git_dirty": False, "worktree_status_sha256": "c" * 64, "commit_diff_sha256": "d" * 64, "commit_diff_bytes": 0}}
+    artifact["adapter_implementation_sha256"] = "3" * 64
+    artifact["encoder_identity"] = "4" * 64
+    artifact["model_runtime"] = {"onnx_sha256": "5" * 64, "embedding_dimension": 3, "session_providers": ["CPUExecutionProvider"], "onnxruntime_version": "1"}
+    def sentinel(mode: str, digest: str) -> dict:
+        return {"schema": harness.ENCODER_RECEIPT_SCHEMA, "manifest_sha256": "2" * 64, "mode": mode, "input_count": 1, "input_sha256": digest, "embedding_sha256": digest, "dtype": "float32-little-endian", "shape": [1, 3]}
+    artifact["encoder_sentinels"] = {"query": sentinel("query", "5" * 64), "passage": sentinel("passage", "6" * 64)}
+    snapshot = {"schema": harness.ENCODER_RECEIPT_SCHEMA, "model_dir": "C:/model", "manifest_sha256": "2" * 64, "manifest_variant": "fp32", "files": [{"relative_path": "model.onnx", "sha256": "7" * 64, "stat": {"byte_count": 1, "device": 0, "inode": 0, "modified_ns": 0}}]}
+    artifact["encoder_snapshot_pair"] = {"start": snapshot, "end": dict(snapshot)}
+    streams = {
+        "expected_questions": 10, "top_k": 2, "source_pool": 4,
+        "product_top10_sha256": artifact["fcd1_acceptance"]["actual_product_top10_sha256"],
+        "ranking_stream_sha256": {arm: artifact["ranking_stream_sha256"][arm] for arm in artifact["rankings_top10"] if arm != "historical_six_view"},
+        "source_pool_stream_sha256": artifact["source_pool_stream_sha256"],
+        "product_trace_stream_sha256": "0" * 64, "lineage_stream_sha256": "1" * 64,
+        "authorization_mapping_stream_sha256": "2" * 64, "legacy_event_mapping_sha256": "3" * 64,
+        "product_event_mapping_sha256": "4" * 64, "safety_summary_sha256": harness.stable_safety_receipt(artifact["safety_summary"]),
+        "raw_component_parity": {"pass": True, "arms": {arm: {"top10_order_exact_questions": 10, "top50_order_exact_questions": 10, "top50_set_exact_questions": 10, "overlap_mean": 1.0, "overlap_min": 1.0} for arm in ("raw_bm25", "raw_dense")}},
+    }
+    streams["raw_component_parity"]["sha256"] = _canonical_sha256({"arms": streams["raw_component_parity"]["arms"]})
+    streams["fresh_streams_sha256"] = _canonical_sha256(streams)
+    artifact["event_dialog_mapping_sha256"] = {"legacy": streams["legacy_event_mapping_sha256"], "product": streams["product_event_mapping_sha256"]}
+    prefreeze = {"schema": "aerp2-product-six-view-prefreeze-v1", "version": 1, "status": "complete", "manifest_sha256": "7" * 64, "phase_ledger": ["input_byte_freeze", "source_model_load", "sanitized_retrieval_construction", "fresh_streams_frozen", "prelabel_safety", "state_recheck", "atomic_publish_ready"], "stream_receipts": streams, "input_freeze": artifact["input_freeze"], "historical_source": artifact["historical_source"], "source_repo": artifact["source_repo"], "encoder_identity": artifact["encoder_identity"], "adapter_implementation_sha256": artifact["adapter_implementation_sha256"], "model_runtime": artifact["model_runtime"], "encoder_sentinels": artifact["encoder_sentinels"], "encoder_snapshot_pair": artifact["encoder_snapshot_pair"], "safety_summary": artifact["safety_summary"], "claim_boundary": "bounded", "git_state_before": artifact["git_state_before"], "git_state_after": artifact["git_state_after"], "implementation_sha256": {"harness": hashlib.sha256((module.ROOT / "benchmarks" / "aerp2_product_six_view_locomo.py").read_bytes()).hexdigest(), "ranker": hashlib.sha256((module.ROOT / "mempalace_rpg" / "retrieval.py").read_bytes()).hexdigest(), "prefreeze_cli": hashlib.sha256((module.ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py").read_bytes()).hexdigest()}}
+    prefreeze_raw = json.dumps(prefreeze, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    prefreeze_sha = hashlib.sha256(prefreeze_raw).hexdigest()
+    artifact.pop("fcd1_acceptance")
+    artifact["fcd1_prefreeze_consumption"] = {
+        "schema": "aerp3-fcd1-prefreeze-consumption-v1", "prefreeze_sha256": prefreeze_sha,
+        "prefrozen_product_top10_sha256": streams["product_top10_sha256"], "current_product_top10_sha256": streams["product_top10_sha256"],
+        "fresh_ranking_stream_sha256": streams["ranking_stream_sha256"], "fresh_source_pool_stream_sha256": streams["source_pool_stream_sha256"],
+        "raw_component_parity_sha256": streams["raw_component_parity"]["sha256"], "raw_component_parity_pass": True,
+        **{name: streams[name] for name in ("product_trace_stream_sha256", "lineage_stream_sha256", "authorization_mapping_stream_sha256", "legacy_event_mapping_sha256", "product_event_mapping_sha256", "safety_summary_sha256", "fresh_streams_sha256")},
+    }
+    artifact_raw = json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    artifact_path = tmp_path / "staged-artifact.json"; artifact_path.write_bytes(artifact_raw)
+    prefreeze_path = tmp_path / "prefreeze.json"; prefreeze_path.write_bytes(prefreeze_raw)
+
+    report = module.analyze(artifact_path, expected_artifact_sha256=hashlib.sha256(artifact_raw).hexdigest(), expected_git_head="a" * 40, prefreeze_receipt_path=prefreeze_path, expected_prefreeze_sha256=prefreeze_sha)
+    assert report["input_receipt"]["prefreeze_sha256"] == prefreeze_sha
+    output = tmp_path / "staged-report.json"
+    with pytest.raises(ValueError, match="external"):
+        module.atomic_json(source_repo / "forbidden-report.json", report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
+    assert not (source_repo / "forbidden-report.json").exists()
+    prefreeze_path.write_bytes(prefreeze_raw + b" ")
+    with pytest.raises(RuntimeError):
+        module.atomic_json(output, report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
+    assert not output.exists()
+    prefreeze_path.write_bytes(prefreeze_raw)
+    source_drift = tmp_path / "source-drift.json"
+    monkeypatch.setattr(module, "_clean_git_head", lambda path: "b" * 40 if Path(path).resolve() == source_repo.resolve() else "a" * 40)
+    with pytest.raises(RuntimeError, match="source Git head"):
+        module.atomic_json(source_drift, report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
+    assert not source_drift.exists()
+    monkeypatch.setattr(module, "_clean_git_head", lambda _path: "a" * 40)
+    module.atomic_json(output, report, artifact_path=artifact_path, expected_artifact_bytes=artifact_raw, prefreeze_path=prefreeze_path, expected_prefreeze_bytes=prefreeze_raw)
+    assert output.exists()
+    with pytest.raises(ValueError):
+        module.analyze(artifact_path, expected_artifact_sha256=hashlib.sha256(artifact_raw).hexdigest(), expected_git_head="a" * 40, prefreeze_receipt_path=prefreeze_path)
+
+
+def test_fcd2_publisher_never_clobbers_existing_output(module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    report, artifact, raw = _analyze(module, monkeypatch, tmp_path)
+    output = tmp_path / "existing.json"; output.write_text("immutable", encoding="utf-8")
+    with pytest.raises(ValueError, match="distinct"):
+        module.atomic_json(output, report, artifact_path=artifact, expected_artifact_bytes=raw)
+    assert output.read_text(encoding="utf-8") == "immutable"
 
 
 @pytest.fixture

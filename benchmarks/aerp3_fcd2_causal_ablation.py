@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -15,6 +16,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "aerp3-fcd2-causal-ablation"
 FCD1_SCHEMA = "aerp3-fcd1-replay-ledger-v1"
+PREFREEZE_SCHEMA = "aerp2-product-six-view-prefreeze-v1"
+PREFREEZE_CONSUMPTION_SCHEMA = "aerp3-fcd1-prefreeze-consumption-v1"
 EXPECTED_QUESTIONS = 1986
 EXPECTED_POOL = 50
 TOP_K = 10
@@ -88,31 +91,125 @@ def _load(path: Path, expected_sha: str, raw: bytes | None = None) -> tuple[dict
     return artifact, raw, receipt
 
 
+def _load_prefreeze(path: Path, expected_sha: str) -> tuple[dict[str, Any], bytes, str]:
+    raw = path.read_bytes(); receipt = _sha(raw)
+    if receipt != _digest_value(expected_sha, "expected prefreeze SHA-256"):
+        raise ValueError("prefreeze SHA-256 mismatch")
+    try:
+        value = _mapping(json.loads(raw), "prefreeze receipt")
+    except json.JSONDecodeError as error:
+        raise ValueError("prefreeze receipt is not valid JSON") from error
+    required = {"schema", "version", "status", "manifest_sha256", "phase_ledger", "input_freeze", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "implementation_sha256", "model_runtime", "encoder_sentinels", "encoder_snapshot_pair", "stream_receipts", "safety_summary", "claim_boundary"}
+    prefreeze_phases = ["input_byte_freeze", "source_model_load", "sanitized_retrieval_construction", "fresh_streams_frozen", "prelabel_safety", "state_recheck", "atomic_publish_ready"]
+    if set(value) != required or value.get("version") != 1 or value.get("phase_ledger") != prefreeze_phases:
+        raise ValueError("prefreeze receipt exact provenance shape mismatch")
+    implementation = _mapping(value.get("implementation_sha256"), "prefreeze implementation receipts")
+    if set(implementation) != {"harness", "ranker", "prefreeze_cli"}:
+        raise ValueError("prefreeze implementation receipt shape mismatch")
+    for name, digest in implementation.items():
+        _digest_value(digest, f"prefreeze {name} implementation receipt")
+    streams = _mapping(value.get("stream_receipts"), "prefreeze stream receipts")
+    parity = _mapping(streams.get("raw_component_parity"), "prefreeze raw parity")
+    required_streams = {"expected_questions", "top_k", "source_pool", "product_top10_sha256", "ranking_stream_sha256", "source_pool_stream_sha256", "product_trace_stream_sha256", "lineage_stream_sha256", "authorization_mapping_stream_sha256", "legacy_event_mapping_sha256", "product_event_mapping_sha256", "safety_summary_sha256", "fresh_streams_sha256", "raw_component_parity"}
+    if set(streams) != required_streams or value.get("schema") != PREFREEZE_SCHEMA or value.get("status") != "complete" or parity.get("pass") is not True or streams.get("expected_questions") != EXPECTED_QUESTIONS or streams.get("top_k") != TOP_K or streams.get("source_pool") != EXPECTED_POOL:
+        raise ValueError("prefreeze receipt schema mismatch")
+    for name in required_streams - {"expected_questions", "top_k", "source_pool", "ranking_stream_sha256", "source_pool_stream_sha256", "raw_component_parity"}:
+        _digest_value(streams.get(name), f"prefreeze {name}")
+    if not isinstance(streams["ranking_stream_sha256"], dict) or not isinstance(streams["source_pool_stream_sha256"], dict):
+        raise ValueError("prefreeze stream digest maps are malformed")
+    return value, raw, receipt
+
+
 def _unchanged(path: Path, raw: bytes) -> None:
     if path.read_bytes() != raw:
         raise RuntimeError("artifact bytes changed during analysis")
 
 
-def _validate_header(artifact: dict[str, Any], expected_head: str) -> None:
+def _clean_git_head(path: Path) -> str:
+    try:
+        head = subprocess.run(("git", "-C", str(path), "rev-parse", "HEAD"), check=True, capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(("git", "-C", str(path), "status", "--porcelain"), check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("Git state cannot be rechecked before publication") from error
+    if dirty or len(head) != 40:
+        raise RuntimeError("Git state changed before publication")
+    return head
+
+
+def _validate_header(artifact: dict[str, Any], expected_head: str, *, prefreeze: tuple[dict[str, Any], str] | None = None) -> None:
     expected_head = _git_head(expected_head, "expected Git head")
     before = _mapping(artifact.get("git_state_before"), "artifact Git state before")
     after = _mapping(artifact.get("git_state_after"), "artifact Git state after")
     if before != after or before.get("git_dirty") is not False or _git_head(before.get("git_head"), "artifact Git head") != expected_head:
         raise ValueError("artifact Git receipt mismatch")
-    acceptance = _mapping(artifact.get("fcd1_acceptance"), "artifact FCD-1 acceptance")
-    expected_acceptance = {
-        "ledger_schema": FCD1_SCHEMA, "top_k": EXPECTED_POOL, "expected_questions": EXPECTED_QUESTIONS,
-        "reference_product_top10_sha256": PRODUCT_TOP10_SHA256, "actual_product_top10_sha256": PRODUCT_TOP10_SHA256,
-        "top10_unchanged": True,
-    }
-    if acceptance != expected_acceptance:
-        raise ValueError("artifact FCD-1 acceptance mismatch")
+    if prefreeze is None:
+        acceptance = _mapping(artifact.get("fcd1_acceptance"), "artifact FCD-1 acceptance")
+        expected_acceptance = {
+            "ledger_schema": FCD1_SCHEMA, "top_k": EXPECTED_POOL, "expected_questions": EXPECTED_QUESTIONS,
+            "reference_product_top10_sha256": PRODUCT_TOP10_SHA256, "actual_product_top10_sha256": PRODUCT_TOP10_SHA256,
+            "top10_unchanged": True,
+        }
+        if acceptance != expected_acceptance or "fcd1_prefreeze_consumption" in artifact:
+            raise ValueError("artifact FCD-1 acceptance mismatch")
+    else:
+        if "fcd1_acceptance" in artifact:
+            raise ValueError("staged artifact must use prefreeze acceptance only")
+        receipt, receipt_sha = prefreeze; streams = _mapping(receipt["stream_receipts"], "prefreeze streams")
+        full_input = _mapping(artifact.get("input_freeze"), "artifact input freeze")
+        pre_input = _mapping(receipt.get("input_freeze"), "prefreeze input freeze")
+        full_dataset = _mapping(full_input.get("dataset"), "artifact dataset receipt")
+        pre_dataset = _mapping(pre_input.get("dataset"), "prefreeze dataset receipt")
+        if full_dataset.get("sha256") != pre_dataset.get("sha256") or full_input.get("model_manifest_sha256") != pre_input.get("model_manifest_sha256") or artifact.get("historical_source") != receipt.get("historical_source") or artifact.get("source_repo") != receipt.get("source_repo") or artifact.get("adapter_implementation_sha256") != receipt.get("adapter_implementation_sha256"):
+            raise ValueError("artifact prefreeze source or model pin mismatch")
+        for name in ("encoder_identity", "model_runtime", "encoder_sentinels", "encoder_snapshot_pair"):
+            if artifact.get(name) != receipt.get(name):
+                raise ValueError(f"artifact prefreeze {name} mismatch")
+        implementation = _mapping(receipt.get("implementation_sha256"), "prefreeze implementation receipts")
+        if implementation.get("harness") != _sha((ROOT / "benchmarks" / "aerp2_product_six_view_locomo.py").read_bytes()) or implementation.get("ranker") != _sha((ROOT / "mempalace_rpg" / "retrieval.py").read_bytes()) or implementation.get("prefreeze_cli") != _sha((ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py").read_bytes()):
+            raise ValueError("prefreeze implementation pin mismatch")
+        consumption = _mapping(artifact.get("fcd1_prefreeze_consumption"), "artifact prefreeze consumption")
+        additional_receipts = ("product_trace_stream_sha256", "lineage_stream_sha256", "authorization_mapping_stream_sha256", "legacy_event_mapping_sha256", "product_event_mapping_sha256", "safety_summary_sha256", "fresh_streams_sha256")
+        expected_consumption = {
+            "schema": PREFREEZE_CONSUMPTION_SCHEMA, "prefreeze_sha256": receipt_sha,
+            "prefrozen_product_top10_sha256": streams["product_top10_sha256"], "current_product_top10_sha256": streams["product_top10_sha256"],
+            "fresh_ranking_stream_sha256": streams["ranking_stream_sha256"], "fresh_source_pool_stream_sha256": streams["source_pool_stream_sha256"],
+            "raw_component_parity_sha256": streams["raw_component_parity"]["sha256"], "raw_component_parity_pass": True,
+            **{name: streams[name] for name in additional_receipts},
+        }
+        if consumption != expected_consumption:
+            raise ValueError("artifact prefreeze consumption mismatch")
+        from benchmarks.aerp2_product_six_view_locomo import stable_safety_receipt
+        if streams["safety_summary_sha256"] != stable_safety_receipt(_mapping(receipt["safety_summary"], "prefreeze safety summary")) or streams["safety_summary_sha256"] != stable_safety_receipt(_mapping(artifact.get("safety_summary"), "artifact safety summary")):
+            raise ValueError("prefreeze safety receipt mismatch")
+        event_maps = _mapping(artifact.get("event_dialog_mapping_sha256"), "artifact event mapping receipts")
+        if event_maps != {"legacy": streams["legacy_event_mapping_sha256"], "product": streams["product_event_mapping_sha256"]}:
+            raise ValueError("artifact prefreeze event mapping mismatch")
+        # FCD-2 never maintains a divergent interpretation of the prefreeze
+        # schema, including its small-denominator synthetic tests.
+        from benchmarks.aerp2_product_six_view_locomo import validate_prefreeze_receipt
+        validate_prefreeze_receipt(
+            receipt,
+            manifest_sha256=artifact.get("manifest_sha256"),
+            dataset_sha256=full_dataset.get("sha256"),
+            expected_git_state=before,
+            expected_questions=EXPECTED_QUESTIONS,
+            expected_top_k=TOP_K,
+            expected_source_pool=EXPECTED_POOL,
+            expected_adapter_sha256=artifact.get("adapter_implementation_sha256"),
+            expected_source=artifact.get("source_repo"),
+            expected_historical_source=artifact.get("historical_source"),
+            expected_identity=artifact.get("encoder_identity"),
+            expected_model_runtime=artifact.get("model_runtime"),
+            expected_snapshot_pair=artifact.get("encoder_snapshot_pair"),
+            expected_sentinels=artifact.get("encoder_sentinels"),
+            expected_safety_receipt=stable_safety_receipt(_mapping(artifact.get("safety_summary"), "artifact safety summary")),
+        )
     safety = _mapping(artifact.get("safety_summary"), "artifact safety summary")
     if safety.get("pass") is not True or safety.get("expected_trace_count") != EXPECTED_QUESTIONS or safety.get("trace_count") != EXPECTED_QUESTIONS or safety.get("fcd1_ledger_complete_count") != EXPECTED_QUESTIONS or safety.get("unauthorized_selected_count") != 0:
         raise ValueError("artifact safety receipt mismatch")
 
 
-def _validate_stream_receipts(artifact: dict[str, Any], pools: dict[str, Any], top10: dict[str, Any]) -> None:
+def _validate_stream_receipts(artifact: dict[str, Any], pools: dict[str, Any], top10: dict[str, Any], *, expected_product_digest: str = PRODUCT_TOP10_SHA256) -> None:
     pool_receipts = _mapping(artifact.get("source_pool_stream_sha256"), "source-pool stream receipts")
     ranking_receipts = _mapping(artifact.get("ranking_stream_sha256"), "ranking stream receipts")
     if set(pool_receipts) != set(pools) or set(ranking_receipts) != set(top10):
@@ -123,7 +220,7 @@ def _validate_stream_receipts(artifact: dict[str, Any], pools: dict[str, Any], t
     for arm, stream in top10.items():
         if _digest_value(ranking_receipts[arm], f"{arm} top-10 receipt") != _digest(stream):
             raise ValueError("artifact top-10 receipt mismatch")
-    if _digest(top10[PRODUCT_ARM]) != PRODUCT_TOP10_SHA256:
+    if _digest(top10[PRODUCT_ARM]) != expected_product_digest:
         raise ValueError("artifact Product top-10 stream differs from FCD-1 freeze")
 
 
@@ -404,10 +501,15 @@ def _rrf(views: dict[str, list[dict[str, Any]]]) -> list[str]:
     return [identifier for identifier, _ in sorted(scores.items(), key=lambda item: (-item[1], orders[item[0]]))[:EXPECTED_POOL]]
 
 
-def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expected_git_head: str, _artifact_bytes: bytes | None = None) -> dict[str, Any]:
+def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expected_git_head: str, prefreeze_receipt_path: Path | str | None = None, expected_prefreeze_sha256: str | None = None, _artifact_bytes: bytes | None = None) -> dict[str, Any]:
     artifact_file = Path(artifact_path).resolve()
     artifact, raw, receipt = _load(artifact_file, expected_artifact_sha256, _artifact_bytes)
-    _validate_header(artifact, expected_git_head)
+    if (prefreeze_receipt_path is None) != (expected_prefreeze_sha256 is None):
+        raise ValueError("prefreeze receipt path and expected SHA-256 must be provided together")
+    prefreeze_value: dict[str, Any] | None = None; prefreeze_raw: bytes | None = None; prefreeze_sha: str | None = None
+    if prefreeze_receipt_path is not None and expected_prefreeze_sha256 is not None:
+        prefreeze_value, prefreeze_raw, prefreeze_sha = _load_prefreeze(Path(prefreeze_receipt_path).resolve(), expected_prefreeze_sha256)
+    _validate_header(artifact, expected_git_head, prefreeze=(prefreeze_value, prefreeze_sha) if prefreeze_value is not None and prefreeze_sha is not None else None)
     questions = artifact.get("questions")
     traces = _mapping(artifact.get("product_traces"), "artifact product traces")
     pools = _mapping(artifact.get("source_pool_rankings"), "artifact source pools")
@@ -419,7 +521,7 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
         raise ValueError("artifact item identities are malformed")
     if set(traces) != set(item_ids) or any(set(stream) != set(item_ids) for stream in pools.values()) or any(set(stream) != set(item_ids) for stream in top10.values()):
         raise ValueError("artifact trace or stream identities mismatch")
-    _validate_stream_receipts(artifact, pools, top10)
+    _validate_stream_receipts(artifact, pools, top10, expected_product_digest=_mapping(prefreeze_value["stream_receipts"], "prefreeze streams")["product_top10_sha256"] if prefreeze_value is not None else PRODUCT_TOP10_SHA256)
     _validate_question_audits(artifact, questions, pools, top10, traces)
 
     parity: dict[str, Any] = {"arms": {}}
@@ -474,17 +576,19 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
             "expected_conversations": EXPECTED_CONVERSATIONS,
             "min_recovery_conversations": MIN_RECOVERY_CONVERSATIONS,
         },
-        "input_receipt": {"artifact_sha256": receipt, "git_head": expected_git_head, "analyzer_implementation_sha256": _sha(Path(__file__).read_bytes())},
+        "input_receipt": {"artifact_sha256": receipt, **({"prefreeze_sha256": prefreeze_sha} if prefreeze_sha is not None else {}), "git_head": expected_git_head, "analyzer_implementation_sha256": _sha(Path(__file__).read_bytes())},
         "raw_component_parity": parity,
         "fusion_semantics_parity": semantics,
     }
     if not raw_structural_ok:
         report = {**base, "verdict": "COMPONENT_PARITY_FAILED", "later_stages": "not_run_due_to_component_parity", "claim_boundary": "No label-derived causal conclusion is made when raw component parity fails."}
         _unchanged(artifact_file, raw)
+        if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
         return report
     if not semantics_ok:
         report = {**base, "verdict": "FUSION_SEMANTICS_PARITY_FAILED", "later_stages": "not_run_due_to_fusion_semantics_parity", "claim_boundary": "No label-derived causal conclusion is made when frozen fusion semantics do not replay."}
         _unchanged(artifact_file, raw)
+        if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
         return report
 
     # The only permitted labels before oracle/ablation now establish the
@@ -511,6 +615,7 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
     if not raw_metric_ok:
         report = {**base, "verdict": "COMPONENT_PARITY_FAILED", "later_stages": "not_run_due_to_component_parity", "claim_boundary": "No oracle or ablation conclusion is made when raw component metric parity fails."}
         _unchanged(artifact_file, raw)
+        if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
         return report
 
     oracle_rows: list[tuple[int, list[str], int, set[str]]] = []
@@ -563,6 +668,7 @@ def analyze(artifact_path: Path | str, *, expected_artifact_sha256: str, expecte
     fusion = p1 and p2 and strict_majority and concentration
     report = {**base, "verdict": "FUSION_SUPPORTED" if fusion else "REPRESENTATION_SUPPORTED", "stages": {"oracle": oracle, "raw_fusion": baseline, "product": product, "deltas": deltas, "view_metrics": {view: _aggregate(values) for view, values in view_rows.items()}, "ablations": ablations, "gates": {"p1": p1, "p2": p2, "strict_majority": strict_majority, "recovery_conversation_count": concentration_count, "recovery_conversation_pass": concentration}, "hashed_conversation_recovery": {key: {"recoverable": value[0], "nonrecoverable": value[1]} for key, value in sorted(recoverable.items())}}, "claim_boundary": "Frozen ranking analysis only; it does not establish causal behavior outside this artifact."}
     _unchanged(artifact_file, raw)
+    if prefreeze_raw is not None: _unchanged(Path(prefreeze_receipt_path).resolve(), prefreeze_raw)
     return report
 
 
@@ -578,9 +684,18 @@ def _safe_output(value: Any) -> None:
         raise ValueError("report contains forbidden content")
 
 
-def atomic_json(output: Path | str, report: dict[str, Any], *, artifact_path: Path | str, expected_artifact_bytes: bytes) -> None:
+def atomic_json(output: Path | str, report: dict[str, Any], *, artifact_path: Path | str, expected_artifact_bytes: bytes, prefreeze_path: Path | str | None = None, expected_prefreeze_bytes: bytes | None = None) -> None:
     output, artifact = Path(output).resolve(), Path(artifact_path).resolve()
-    if output == artifact or output == ROOT or ROOT in output.parents:
+    prefreeze = Path(prefreeze_path).resolve() if prefreeze_path is not None else None
+    source_repo: Path | None = None; expected_source_head: str | None = None
+    if prefreeze is not None and expected_prefreeze_bytes is not None:
+        try:
+            source_receipt = _mapping(_mapping(json.loads(expected_prefreeze_bytes), "prefreeze receipt").get("source_repo"), "prefreeze source receipt")
+            source_repo = Path(source_receipt.get("path")).resolve()
+            expected_source_head = _git_head(_mapping(source_receipt.get("git_state"), "prefreeze source Git state").get("git_head"), "prefreeze source Git head")
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise RuntimeError("prefreeze source receipt cannot be rechecked") from error
+    if output.exists() or output == artifact or output == prefreeze or output == ROOT or ROOT in output.parents or source_repo is not None and (output == source_repo or source_repo in output.parents):
         raise ValueError("output must be external and distinct from artifact")
     if report.get("schema") != SCHEMA or report.get("status") != "complete":
         raise ValueError("report schema or status mismatch")
@@ -589,6 +704,10 @@ def atomic_json(output: Path | str, report: dict[str, Any], *, artifact_path: Pa
         raise ValueError("report artifact receipt mismatch")
     if _digest_value(report_receipt.get("analyzer_implementation_sha256"), "report analyzer receipt") != _sha(Path(__file__).read_bytes()):
         raise ValueError("report analyzer receipt mismatch")
+    if (prefreeze_path is None) != (expected_prefreeze_bytes is None):
+        raise ValueError("prefreeze publication binding is incomplete")
+    if prefreeze_path is not None and expected_prefreeze_bytes is not None and _sha(expected_prefreeze_bytes) != _digest_value(report_receipt.get("prefreeze_sha256"), "report prefreeze receipt"):
+        raise ValueError("report prefreeze receipt mismatch")
     _safe_output(report); output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="wb", dir=output.parent, prefix=f".{output.name}.", delete=False) as handle:
         temporary = Path(handle.name)
@@ -597,19 +716,31 @@ def atomic_json(output: Path | str, report: dict[str, Any], *, artifact_path: Pa
         except BaseException:
             temporary.unlink(missing_ok=True); raise
     try:
-        _unchanged(artifact, expected_artifact_bytes); os.replace(temporary, output)
+        _unchanged(artifact, expected_artifact_bytes)
+        if prefreeze is not None and expected_prefreeze_bytes is not None: _unchanged(prefreeze, expected_prefreeze_bytes)
+        if _clean_git_head(ROOT) != report_receipt.get("git_head"):
+            raise RuntimeError("root Git head changed before publication")
+        if prefreeze is not None:
+            if source_repo is None or not source_repo.exists():
+                raise RuntimeError("prefreeze source repository is unavailable")
+            if _clean_git_head(source_repo) != expected_source_head:
+                raise RuntimeError("prefreeze source Git head changed before publication")
+        os.link(temporary, output)
+        temporary.unlink()
     except BaseException:
         temporary.unlink(missing_ok=True); raise
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact", required=True); parser.add_argument("--expected-artifact-sha256", required=True); parser.add_argument("--expected-git-head", required=True); parser.add_argument("--output", required=True)
+    parser.add_argument("--artifact", required=True); parser.add_argument("--expected-artifact-sha256", required=True); parser.add_argument("--expected-git-head", required=True); parser.add_argument("--output", required=True); parser.add_argument("--prefreeze-receipt"); parser.add_argument("--expected-prefreeze-sha256")
     args = parser.parse_args(argv)
     try:
         artifact = Path(args.artifact).resolve(); raw = artifact.read_bytes()
-        report = analyze(artifact, expected_artifact_sha256=args.expected_artifact_sha256, expected_git_head=args.expected_git_head, _artifact_bytes=raw)
-        atomic_json(args.output, report, artifact_path=artifact, expected_artifact_bytes=raw)
+        prefreeze = Path(args.prefreeze_receipt).resolve() if args.prefreeze_receipt else None
+        prefreeze_raw = prefreeze.read_bytes() if prefreeze is not None else None
+        report = analyze(artifact, expected_artifact_sha256=args.expected_artifact_sha256, expected_git_head=args.expected_git_head, prefreeze_receipt_path=prefreeze, expected_prefreeze_sha256=args.expected_prefreeze_sha256, _artifact_bytes=raw)
+        atomic_json(args.output, report, artifact_path=artifact, expected_artifact_bytes=raw, prefreeze_path=prefreeze, expected_prefreeze_bytes=prefreeze_raw)
     except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps({"status": "failed", "error": str(error)}, sort_keys=True), file=sys.stderr); return 2
     print(json.dumps({"status": report["status"], "verdict": report["verdict"]}, sort_keys=True)); return 0

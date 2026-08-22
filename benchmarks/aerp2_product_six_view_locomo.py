@@ -7,6 +7,7 @@ ONNX setup, or scorer implementation is duplicated here.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import inspect
 import json
@@ -33,6 +34,11 @@ FROZEN_SIX_VIEW_WEIGHTS = {"raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense"
 FCD1_LEDGER_SCHEMA = "aerp3-fcd1-replay-ledger-v1"
 FCD1_TOP_K = 50
 FCD1_REFERENCE_PRODUCT_TOP10_SHA256 = "64007282069621bb3e603598938993ebe0907e8e84ebaa65394741ab618e5441"
+PREFREEZE_SCHEMA = "aerp2-product-six-view-prefreeze-v1"
+PREFREEZE_CONSUMPTION_SCHEMA = "aerp3-fcd1-prefreeze-consumption-v1"
+SENTINEL_INPUT_TEXT = "aerp2 product query sentinel"
+SENTINEL_PASSAGE_TEXT = "aerp2 product passage sentinel"
+ENCODER_RECEIPT_SCHEMA = "mempalace.locomo_bge_encoder.v1"
 FCD1_LOCOMO_POLICY_TUPLE = ("canonical", "public_world", "main", "active", None, None, None, "[]")
 SAFETY_CHECKS = (
     "trace_count", "audit_complete", "ranking_schema", "selected_matches_product_output",
@@ -565,10 +571,12 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 PHASES = ("input_byte_freeze", "source_model_load", "sanitized_retrieval_construction", "fresh_streams_frozen", "artifact_parse_scorer_contract", "score_gate", "state_recheck", "atomic_publish_ready")
+PREFREEZE_PHASES = ("input_byte_freeze", "source_model_load", "sanitized_retrieval_construction", "fresh_streams_frozen", "prelabel_safety", "state_recheck", "atomic_publish_ready")
+STAGED_PHASES = ("input_byte_freeze", "prefreeze_receipt_frozen", "source_model_load", "sanitized_retrieval_construction", "fresh_streams_frozen", "prelabel_safety", "prefreeze_receipt_verified", "artifact_parse_scorer_contract", "score_gate", "state_recheck", "atomic_publish_ready")
 
 
-def advance_phase(ledger: list[str], phase: str) -> None:
-    if phase not in PHASES or len(ledger) >= len(PHASES) or PHASES[len(ledger)] != phase:
+def advance_phase(ledger: list[str], phase: str, *, contract: tuple[str, ...] = PHASES) -> None:
+    if phase not in contract or len(ledger) >= len(contract) or contract[len(ledger)] != phase:
         raise RuntimeError("quality phase order is invalid")
     ledger.append(phase)
 
@@ -593,6 +601,55 @@ def require_external_output(output: Path, source_repo: Path) -> Path:
         if resolved == repository or repository in resolved.parents:
             raise ValueError("output must be outside source repositories")
     return resolved
+
+
+def atomic_json_no_clobber(path: Path, value: dict[str, Any], *, frozen_inputs: tuple[dict[str, Any], ...], git_states: tuple[tuple[Path, dict[str, Any]], ...], implementation_digests: dict[Path, str], forbidden_paths: tuple[Path, ...] = ()) -> None:
+    """Publish a receipt once, without replacing an existing result or input.
+
+    The final checks deliberately happen after fsync and immediately before the
+    hard-link publication.  This makes programmatic callers subject to the same
+    immutable-input contract as the CLIs.
+    """
+    output = path.resolve()
+    if output.exists() or any(output == candidate.resolve() for candidate in (*forbidden_paths, *(Path(receipt["path"]) for receipt in frozen_inputs))):
+        raise ValueError("receipt output must be new and distinct from every frozen input")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            stream.flush(); os.fsync(stream.fileno())
+        for receipt in frozen_inputs:
+            verify_frozen_input(receipt)
+        for root, before in git_states:
+            now = aerp1.git_state(root)
+            if not aerp1.same_git_state(before, now):
+                raise RuntimeError("Git state changed before immutable receipt publication")
+        for implementation, expected_digest in implementation_digests.items():
+            if not implementation.is_file() or _sha256(implementation.read_bytes()) != expected_digest:
+                raise RuntimeError("implementation bytes changed before receipt publication")
+        # os.link is a no-clobber atomic create on one filesystem.
+        os.link(temporary, output)
+        temporary.unlink(); temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def validate_prefreeze_output_safety(value: Any) -> None:
+    """The small prefreeze receipt is deliberately ID/text/label free."""
+    forbidden = {"query", "transcript", "answer", "text", "gold", "category", "evidence", "question", "conversation", "event", "dialog"}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str) or key.casefold() in forbidden:
+                raise ValueError("prefreeze receipt contains forbidden content")
+            validate_prefreeze_output_safety(child)
+    elif isinstance(value, list):
+        for child in value:
+            validate_prefreeze_output_safety(child)
+    elif isinstance(value, str) and any(token in value.casefold() for token in forbidden):
+        raise ValueError("prefreeze receipt contains forbidden content")
 
 
 def validate_historical_source_pins(manifest: dict[str, Any], observed: dict[str, str]) -> None:
@@ -655,6 +712,26 @@ def encoder_runtime_provider_receipt(encoder: Any, inputs: dict[str, Any]) -> di
     if not isinstance(version, str) or not version:
         raise RuntimeError("onnxruntime version is malformed")
     return {"session_providers": list(providers), "onnxruntime_version": version}
+
+
+def encoder_sentinel_receipts(encoder: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One frozen probe for both prefreeze publication and staged replay."""
+    def json_native(receipt: Any) -> Any:
+        if not isinstance(receipt, dict):
+            return receipt
+        # Historical dataclass serialization preserves tuple shape.  JSON does
+        # not; normalize only this known field and leave all schema checking to
+        # the exact validator below.
+        if isinstance(receipt.get("shape"), tuple):
+            return {**receipt, "shape": list(receipt["shape"])}
+        return receipt
+    runtime = {
+        "query": json_native(encoder.sentinel_embedding_hash([SENTINEL_INPUT_TEXT], mode="query").to_dict()),
+        "passage": json_native(encoder.sentinel_embedding_hash([SENTINEL_PASSAGE_TEXT], mode="passage").to_dict()),
+    }
+    # These names and probes are the legacy report contract.  Prefreeze only
+    # shares the receipt; it must not rename an established report field.
+    return runtime, {"query": runtime["query"], "passage": runtime["passage"]}
 
 
 class HistoricalBgeAdapter:
@@ -753,6 +830,149 @@ def _product_rank(kernel: RpgMemoryKernel, conversation_id: str, query: str, eve
     return [event_to_dialog[item] for item in selected], decision.trace
 
 
+@dataclass(frozen=True)
+class FreshStreams:
+    """Ranker/control outputs made before historical parsing or scorer use."""
+    rankings: dict[str, dict[str, list[str]]]
+    source_pool_rankings: dict[str, dict[str, list[str]]]
+    traces: dict[str, dict[str, Any]]
+    lineage: list[dict[str, Any]]
+    lineage_by_conversation: dict[str, dict[str, Any]]
+    legacy_event_maps: dict[str, dict[str, str]]
+    product_event_maps: dict[str, dict[str, str]]
+    question_conversations: dict[str, str]
+
+
+def freeze_fresh_streams(*, retrieval: Any, candidate: Any, encoder: Any, identity: str, source_pool: int, top_k: int = 10) -> FreshStreams:
+    """Build deterministic streams from sanitized retrieval without a scorer.
+
+    A caller's retrieval builder may parse labels; this function neither
+    receives labels nor performs an artifact/scorer join.
+    """
+    item_ids = aerp1._conversation_items(retrieval)
+    if len(item_ids) != 10: raise ValueError("conversation denominator mismatch")
+    rankings = {arm: {} for arm in ARMS[:-1]}; source_pool_rankings = {"raw_bm25": {}, "raw_dense": {}, "raw_bm25_plus_raw_dense": {}}
+    traces: dict[str, dict[str, Any]] = {}; lineage: list[dict[str, Any]] = []; lineage_by_conversation: dict[str, dict[str, Any]] = {}
+    legacy_event_maps: dict[str, dict[str, str]] = {}; product_event_maps: dict[str, dict[str, str]] = {}; question_conversations: dict[str, str] = {}
+    with tempfile.TemporaryDirectory(prefix="aerp2-product-kernel-") as temp:
+        legacy = RpgMemoryKernel(db_path=str(Path(temp) / "legacy.sqlite")); product = RpgMemoryKernel(db_path=str(Path(temp) / "product.sqlite"), retrieval_ranker=SixViewRanker(HistoricalBgeAdapter(encoder, identity), diagnostic_ledger=True))
+        try:
+            for conversation_id, ids in sorted(item_ids.items()):
+                payload0 = retrieval.retrieval_items[ids[0]]; legacy_map, audit = seed_sanitized_conversation(legacy, payload0, conversation_id=conversation_id); product_map, product_audit = seed_sanitized_conversation(product, payload0, conversation_id=conversation_id)
+                if audit["seed_ledger"] != product_audit["seed_ledger"]: raise RuntimeError("legacy/product seed lineage differs")
+                audit = {"conversation_id": conversation_id, **audit}; lineage.append(audit); lineage_by_conversation[conversation_id] = audit; legacy_event_maps[conversation_id] = legacy_map; product_event_maps[conversation_id] = product_map
+                dialogs = aerp1.raw_dialogs(payload0); dialog_ids = [row["id"] for row in dialogs]; passages = encoder.encode_passages([row["text"] for row in dialogs]); queries = encoder.encode_queries([retrieval.retrieval_items[item]["query"] for item in ids])
+                for index, item_id in enumerate(ids):
+                    question_conversations[item_id] = conversation_id
+                    payload = retrieval.retrieval_items[item_id]; raw_pool = _raw_bm25_pool(candidate, payload, source_pool); dense_pool = aerp1.rank_vectors(dialog_ids, passages, queries[index], source_pool); fused_pool = _rrf(raw_pool, dense_pool)[:source_pool]
+                    validate_source_pool(raw_pool, pool=source_pool, name="raw BM25"); validate_source_pool(dense_pool, pool=source_pool, name="raw dense"); validate_source_pool(fused_pool, pool=source_pool, name="raw BM25+dense RRF")
+                    source_pool_rankings["raw_bm25"][item_id] = raw_pool; source_pool_rankings["raw_dense"][item_id] = dense_pool; source_pool_rankings["raw_bm25_plus_raw_dense"][item_id] = fused_pool
+                    rankings["raw_bm25"][item_id] = raw_pool[:top_k]; rankings["raw_dense"][item_id] = dense_pool[:top_k]; rankings["raw_bm25_plus_raw_dense"][item_id] = fused_pool[:top_k]
+                    rankings["legacy_rpg"][item_id] = aerp1.rank_rpg(legacy, conversation_id=conversation_id, query=payload["query"], event_to_dialog=legacy_map, top_k=top_k)[0]
+                    rankings["product_six_view"][item_id], traces[item_id] = _product_rank(product, conversation_id, payload["query"], product_map, top_k, product_audit["seed_ledger"]["authorization_mapping_sha256"])
+        finally:
+            legacy.close(); product.close()
+    return FreshStreams(rankings, source_pool_rankings, traces, lineage, lineage_by_conversation, legacy_event_maps, product_event_maps, question_conversations)
+
+
+def stable_mapping_receipt(maps: dict[str, dict[str, str]]) -> str:
+    """UUID-independent map receipt: conversations and ranking-key hashes only."""
+    projection = {
+        conversation: sorted(_sha256(dialog_id.encode("utf-8")) for dialog_id in mapping.values())
+        for conversation, mapping in sorted(maps.items())
+    }
+    return _canonical(projection)
+
+
+def stable_safety_receipt(safety: dict[str, Any]) -> str:
+    """Retain strict counts/checks but exclude volatile event-ID map digests."""
+    if not isinstance(safety, dict):
+        raise RuntimeError("fresh safety receipt is malformed")
+    projection = {name: safety.get(name) for name in (
+        "expected_trace_count", "trace_count", "audit_complete_count", "ranking_schema_complete_count",
+        "fcd1_ledger_complete_count", "selected_match_count", "trace_identity_complete_count",
+        "nonempty_selection_count", "unauthorized_selected_count", "lineage", "ranking_digest_count", "checks", "pass",
+    )}
+    for name in ("legacy_mapping", "product_mapping"):
+        mapping = safety.get(name)
+        if not isinstance(mapping, dict):
+            raise RuntimeError("fresh safety mapping receipt is malformed")
+        projection[name] = {key: mapping.get(key) for key in ("count", "unique_event_count", "unique_dialog_count", "valid", "one_to_one")}
+    return _canonical(projection)
+
+
+def stable_trace_receipt(fresh: FreshStreams) -> str:
+    """Bind replay semantics without run-local source event UUIDs."""
+    projection: dict[str, Any] = {}
+    for item, trace in sorted(fresh.traces.items()):
+        ledger = trace.get("retrieval_ranking", {}).get("fcd1_diagnostic_ledger") if isinstance(trace, dict) else None
+        if not isinstance(ledger, dict):
+            raise RuntimeError("fresh FCD-1 ledger is unavailable")
+        views = ledger.get("view_top_50"); fused = ledger.get("fused_top_50"); groups = ledger.get("checkpoint_tie_groups")
+        if not isinstance(views, dict) or not isinstance(fused, list) or not isinstance(groups, list):
+            raise RuntimeError("fresh FCD-1 trace is malformed")
+        view_projection = {name: [{key: row.get(key) for key in ("ranking_key_sha256", "ranking_key_order", "rank", "score")} for row in rows] for name, rows in sorted(views.items())}
+        projection[item] = {
+            "schema": ledger.get("schema"), "input_sha256": ledger.get("input_sha256"), "authorization_sha256": ledger.get("authorization_sha256"),
+            "view_top_50": view_projection,
+            # The producer's native receipt includes source_event_id and is
+            # therefore intentionally not cross-run stable. Rebind it to the
+            # projected UUID-free rows instead.
+            "view_top_50_sha256": {name: _canonical(rows) for name, rows in sorted(view_projection.items())}, "view_order_sha256": ledger.get("view_order_sha256"),
+            "fused_top_50": [{key: row.get(key) for key in ("ranking_key_sha256", "ranking_key_order", "rank", "final_rrf", "component_ranks", "component_rank_receipts", "contributions")} for row in fused],
+            "checkpoint_tie_groups": [{key: group.get(key) for key in ("policy_sha256", "checkpoint_score", "member_count")} | {"members": [member.get("ranking_key_sha256") for member in group.get("chronological_members", [])]} for group in groups],
+        }
+    return _canonical(projection)
+
+
+def fresh_stream_receipts(fresh: FreshStreams, *, top_k: int, source_pool: int, safety_summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Aggregate, ID-free stream receipts and independent raw-component parity."""
+    items = set(fresh.rankings["product_six_view"])
+    if not items or any(set(stream) != items for stream in fresh.rankings.values()) or any(set(stream) != items for stream in fresh.source_pool_rankings.values()) or set(fresh.traces) != items:
+        raise RuntimeError("fresh stream identities are incomplete")
+    parity: dict[str, Any] = {"arms": {}}
+    passed = True
+    for arm in ("raw_bm25", "raw_dense"):
+        top10_order = top50_order = top50_set = 0; overlaps: list[float] = []
+        for item in items:
+            ledger = fresh.traces[item].get("retrieval_ranking", {}).get("fcd1_diagnostic_ledger")
+            if not isinstance(ledger, dict): raise RuntimeError("fresh FCD-1 ledger is unavailable")
+            rows = ledger.get("view_top_50", {}).get(arm)
+            if not isinstance(rows, list) or len(rows) != source_pool: raise RuntimeError("fresh raw FCD-1 top-50 is malformed")
+            internal = [row.get("ranking_key_sha256") for row in rows]
+            external = [hashlib.sha256(identifier.encode("utf-8")).hexdigest() for identifier in fresh.source_pool_rankings[arm][item]]
+            if any(not isinstance(value, str) or len(value) != 64 for value in internal) or len(external) != source_pool: raise RuntimeError("fresh raw component identity is malformed")
+            top50_order += internal == external; top10_order += internal[:top_k] == external[:top_k]; top50_set += set(internal) == set(external)
+            overlaps.append(len(set(internal) & set(external)) / source_pool)
+        parity["arms"][arm] = {"top10_order_exact_questions": top10_order, "top50_order_exact_questions": top50_order, "top50_set_exact_questions": top50_set, "overlap_mean": math.fsum(overlaps) / len(overlaps), "overlap_min": min(overlaps)}
+        passed = passed and top10_order == len(items) and top50_set == len(items)
+    ranking_digests = {arm: _canonical(stream) for arm, stream in fresh.rankings.items()}
+    pool_digests = {arm: _canonical(stream) for arm, stream in fresh.source_pool_rankings.items()}
+    authorization_mapping = {
+        conversation: audit.get("seed_ledger", {}).get("authorization_mapping_sha256")
+        for conversation, audit in sorted(fresh.lineage_by_conversation.items())
+    }
+    if any(not _sha256_hex(value) for value in authorization_mapping.values()):
+        raise RuntimeError("fresh authorization mapping receipt is malformed")
+    mapping_receipts = {"legacy": stable_mapping_receipt(fresh.legacy_event_maps), "product": stable_mapping_receipt(fresh.product_event_maps)}
+    result = {
+        "expected_questions": len(items), "top_k": top_k, "source_pool": source_pool,
+        "product_top10_sha256": ranking_digests["product_six_view"], "ranking_stream_sha256": ranking_digests,
+        "source_pool_stream_sha256": pool_digests,
+        "product_trace_stream_sha256": stable_trace_receipt(fresh),
+        "lineage_stream_sha256": _canonical([{name: row.get("seed_ledger", {}).get(name) for name in ("authorization_mapping_sha256", "checkpoint_ranking_mapping_sha256", "ranker_texts_sha256")} for row in sorted(fresh.lineage, key=lambda row: str(row.get("conversation_id")))]),
+        "authorization_mapping_stream_sha256": _canonical(authorization_mapping),
+        "legacy_event_mapping_sha256": mapping_receipts["legacy"], "product_event_mapping_sha256": mapping_receipts["product"],
+        "raw_component_parity": {**parity, "pass": passed, "sha256": _canonical(parity)},
+    }
+    if safety_summary is not None:
+        if not isinstance(safety_summary, dict) or safety_summary.get("pass") is not True:
+            raise RuntimeError("fresh safety receipt is malformed")
+        result["safety_summary_sha256"] = stable_safety_receipt(safety_summary)
+    result["fresh_streams_sha256"] = _canonical(result)
+    return result
+
+
 def build_question_audits(*, question_rows: list[dict[str, Any]], scorer: Any, rankings: dict[str, dict[str, list[str]]], source_pool_rankings: dict[str, dict[str, list[str]]], traces: dict[str, Any], product_event_maps: dict[str, dict[str, str]], lineage_by_conversation: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """Bind each scored question to frozen streams and non-transcript trace receipts."""
     audits: list[dict[str, Any]] = []
@@ -811,7 +1031,7 @@ def split_diagnostics(question_rows: list[dict[str, Any]], splits: dict[str, str
 
 
 def validate_report_shape(report: dict[str, Any]) -> None:
-    required = {"manifest_sha256", "input_freeze", "model_runtime", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "encoder_sentinels", "encoder_snapshot_pair", "phase_ledger", "event_dialog_mapping_sha256", "fcd1_acceptance", "question_audits", "safety_summary", "aggregate", "gates"}
+    required = {"manifest_sha256", "input_freeze", "model_runtime", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "encoder_sentinels", "encoder_snapshot_pair", "phase_ledger", "event_dialog_mapping_sha256", "question_audits", "safety_summary", "aggregate", "gates"}
     if not isinstance(report, dict) or report.get("schema") != "aerp2-product-six-view-locomo" or not required <= set(report):
         raise RuntimeError("quality report provenance shape is incomplete")
     expected_questions = report.get("safety_summary", {}).get("expected_trace_count") if isinstance(report.get("safety_summary"), dict) else None
@@ -824,66 +1044,225 @@ def validate_report_shape(report: dict[str, Any]) -> None:
         "actual_product_top10_sha256": FCD1_REFERENCE_PRODUCT_TOP10_SHA256,
         "top10_unchanged": True,
     }
-    if report["phase_ledger"] != list(PHASES) or not isinstance(expected_questions, int) or len(report["question_audits"]) != expected_questions or not acceptance_ok:
+    staged = report.get("fcd1_prefreeze_consumption")
+    if staged is not None:
+        expected_staged = {"schema", "prefreeze_sha256", "prefrozen_product_top10_sha256", "current_product_top10_sha256", "fresh_ranking_stream_sha256", "fresh_source_pool_stream_sha256", "raw_component_parity_sha256", "raw_component_parity_pass", "product_trace_stream_sha256", "lineage_stream_sha256", "authorization_mapping_stream_sha256", "legacy_event_mapping_sha256", "product_event_mapping_sha256", "safety_summary_sha256", "fresh_streams_sha256"}
+        digest_fields = expected_staged - {"schema", "raw_component_parity_pass", "fresh_ranking_stream_sha256", "fresh_source_pool_stream_sha256"}
+        if not isinstance(staged, dict) or set(staged) != expected_staged or staged.get("schema") != PREFREEZE_CONSUMPTION_SCHEMA or staged.get("raw_component_parity_pass") is not True or any(not isinstance(staged.get(name), str) or len(staged[name]) != 64 for name in digest_fields) or not isinstance(staged.get("fresh_ranking_stream_sha256"), dict) or not isinstance(staged.get("fresh_source_pool_stream_sha256"), dict) or staged["prefrozen_product_top10_sha256"] != staged["current_product_top10_sha256"]:
+            raise RuntimeError("staged prefreeze acceptance shape is incomplete")
+        if acceptance is not None or not isinstance(report.get("input_freeze"), dict) or not isinstance(report["input_freeze"].get("prefreeze"), dict):
+            raise RuntimeError("staged report acceptance dispatch is malformed")
+    elif isinstance(report.get("input_freeze"), dict) and "prefreeze" in report["input_freeze"]:
+        raise RuntimeError("legacy report cannot carry a prefreeze input")
+    elif not acceptance_ok:
+        raise RuntimeError("quality report audit shape is incomplete")
+    expected_phases = STAGED_PHASES if staged is not None else PHASES
+    if report["phase_ledger"] != list(expected_phases) or not isinstance(expected_questions, int) or len(report["question_audits"]) != expected_questions:
         raise RuntimeError("quality report audit shape is incomplete")
 
 
-def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, source_repo: Path, output: Path, manifest_path: Path = MANIFEST_PATH) -> dict[str, Any]:
-    """Execute all six frozen arms; scorer labels are accessed only after streams freeze."""
-    manifest, manifest_sha = load_manifest(manifest_path)
+def run_prefreeze(*, dataset_path: Path, model_dir: Path, source_repo: Path, output: Path, manifest_path: Path = MANIFEST_PATH) -> dict[str, Any]:
+    """Publish only ID-free receipts for a fresh deterministic ranking freeze."""
+    manifest, manifest_sha = load_manifest(manifest_path); phases: list[str] = []
     state_before = aerp1.git_state(ROOT); require_clean_git_state(state_before)
     output = require_external_output(output, source_repo)
-    phases: list[str] = []
     dataset_receipt = freeze_input_bytes(dataset_path, label="dataset", expected_sha256=manifest["inputs"]["dataset_sha256"])
-    artifact_receipt = freeze_input_bytes(artifact_path, label="artifact", expected_sha256=manifest["inputs"]["historical_artifact_sha256"])
-    artifact_bytes = artifact_receipt["data"]  # Parse only after fresh streams freeze.
-    advance_phase(phases, "input_byte_freeze")
+    advance_phase(phases, "input_byte_freeze", contract=PREFREEZE_PHASES)
     source_receipt = source_repo_receipt(source_repo, manifest)
     protocol, candidate, encoder, source_digests, directory, saved_modules = _historical_modules(source_repo, model_dir, manifest)
     try:
         adapter_digest = adapter_implementation_digest()
         runtime_provider = encoder_runtime_provider_receipt(encoder, manifest["inputs"])
         identity = _canonical({"model": encoder.manifest.canonical_sha256, "historical_encoder": source_digests["benchmarks/locomo_bge_encoder.py"], "adapter": adapter_digest, "runtime_provider": runtime_provider})
-        encoder_sentinels = {"query": encoder.sentinel_embedding_hash(["aerp2 product query sentinel"], mode="query").to_dict(), "passage": encoder.sentinel_embedding_hash(["aerp2 product passage sentinel"], mode="passage").to_dict()}
-        advance_phase(phases, "source_model_load")
+        runtime_sentinels, encoder_sentinels = encoder_sentinel_receipts(encoder)
+        advance_phase(phases, "source_model_load", contract=PREFREEZE_PHASES)
+        dataset = protocol.load_official_locomo10(dataset_path)
+        retrieval, _builder_scorer = protocol.prepare_hard_story_track(dataset, candidate_pool_size=manifest["protocol"]["source_pool"], require_official_counts=True)
+        advance_phase(phases, "sanitized_retrieval_construction", contract=PREFREEZE_PHASES)
+        fresh = freeze_fresh_streams(retrieval=retrieval, candidate=candidate, encoder=encoder, identity=identity, source_pool=manifest["protocol"]["source_pool"], top_k=manifest["protocol"]["top_k"])
+        advance_phase(phases, "fresh_streams_frozen", contract=PREFREEZE_PHASES)
+        safety = summarize_product_safety(traces=fresh.traces, product_rankings=fresh.rankings["product_six_view"], product_event_maps=fresh.product_event_maps, legacy_event_maps=fresh.legacy_event_maps, question_conversations=fresh.question_conversations, lineage=fresh.lineage, expected_questions=manifest["protocol"]["questions"], expected_dialogs=manifest["protocol"]["dialogs"])
+        if safety["pass"] is not True: raise RuntimeError("prefreeze product safety failed")
+        advance_phase(phases, "prelabel_safety", contract=PREFREEZE_PHASES)
+        streams = fresh_stream_receipts(fresh, top_k=manifest["protocol"]["top_k"], source_pool=manifest["protocol"]["source_pool"], safety_summary=safety)
+        if streams["expected_questions"] != manifest["protocol"]["questions"] or streams["raw_component_parity"]["pass"] is not True:
+            raise RuntimeError("fresh raw component parity did not pass")
+        snapshot_pair = encoder_snapshot_receipt(encoder); model_runtime = model_runtime_receipt(snapshot_pair, runtime_sentinels, manifest["inputs"])
+        verify_frozen_input(dataset_receipt)
+        state_after = aerp1.git_state(ROOT)
+        if not aerp1.same_git_state(state_before, state_after): raise RuntimeError("worktree changed during prefreeze")
+        advance_phase(phases, "state_recheck", contract=PREFREEZE_PHASES)
+        advance_phase(phases, "atomic_publish_ready", contract=PREFREEZE_PHASES)
+        receipt = {
+            "schema": PREFREEZE_SCHEMA, "version": 1, "status": "complete", "manifest_sha256": manifest_sha, "phase_ledger": phases,
+            "input_freeze": {"dataset": {key: value for key, value in dataset_receipt.items() if key != "data"}, "model_manifest_sha256": encoder.manifest.canonical_sha256},
+            "git_state_before": state_before, "git_state_after": state_after, "source_repo": source_receipt,
+            "historical_source": {"commit": HISTORICAL_COMMIT, "files": source_digests}, "encoder_identity": identity,
+            "adapter_implementation_sha256": adapter_digest,
+            "implementation_sha256": {"harness": _sha256(Path(__file__).read_bytes()), "ranker": _sha256((ROOT / "mempalace_rpg" / "retrieval.py").read_bytes()), "prefreeze_cli": _sha256((ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py").read_bytes())},
+            "model_runtime": {**model_runtime, **runtime_provider}, "encoder_sentinels": encoder_sentinels, "encoder_snapshot_pair": snapshot_pair,
+            "stream_receipts": streams, "safety_summary": safety,
+            "claim_boundary": "Frozen rankings are QA-annotation-free; an upstream builder may parse labels, and no claim is made that this receipt never parsed annotations.",
+        }
+        validate_prefreeze_receipt(receipt, manifest_sha256=manifest_sha, dataset_sha256=dataset_receipt["sha256"], expected_git_state=state_before, expected_adapter_sha256=adapter_digest, expected_source=source_receipt, expected_historical_source={"commit": HISTORICAL_COMMIT, "files": source_digests}, expected_identity=identity, expected_model_runtime={**model_runtime, **runtime_provider}, expected_snapshot_pair=snapshot_pair, expected_sentinels=encoder_sentinels, expected_safety_receipt=stable_safety_receipt(safety), expected_streams=streams)
+        validate_prefreeze_output_safety(receipt)
+        atomic_json_no_clobber(output, receipt, frozen_inputs=(dataset_receipt,), git_states=((ROOT, state_before), (source_repo.resolve(), source_receipt["git_state"])), implementation_digests={Path(__file__): receipt["implementation_sha256"]["harness"], ROOT / "mempalace_rpg" / "retrieval.py": receipt["implementation_sha256"]["ranker"], ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py": receipt["implementation_sha256"]["prefreeze_cli"]}, forbidden_paths=(source_repo, ROOT, model_dir, manifest_path))
+        return receipt
+    finally:
+        sys.path.pop(0)
+        for name in _HISTORICAL_MODULES: sys.modules.pop(name, None)
+        sys.modules.update({name: module for name, module in saved_modules.items() if module is not None})
+        directory.cleanup()
+
+
+def _sha256_hex(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _git_oid40(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(character in "0123456789abcdef" for character in value)
+
+
+def _validate_encoder_sentinel_shape(value: Any, *, mode: str, manifest_sha256: str, embedding_dimension: int) -> bool:
+    required = {"schema", "manifest_sha256", "mode", "input_count", "input_sha256", "embedding_sha256", "dtype", "shape"}
+    return isinstance(value, dict) and set(value) == required and value.get("schema") == ENCODER_RECEIPT_SCHEMA and value.get("manifest_sha256") == manifest_sha256 and value.get("mode") == mode and value.get("input_count") == 1 and not isinstance(value["input_count"], bool) and _sha256_hex(value.get("input_sha256")) and _sha256_hex(value.get("embedding_sha256")) and value.get("dtype") == "float32-little-endian" and value.get("shape") == [1, embedding_dimension]
+
+
+def _validate_snapshot_shape(value: Any, *, manifest_sha256: str) -> bool:
+    required = {"schema", "model_dir", "manifest_sha256", "manifest_variant", "files"}
+    if not isinstance(value, dict) or set(value) != required or value.get("schema") != ENCODER_RECEIPT_SCHEMA or not isinstance(value.get("model_dir"), str) or not value["model_dir"] or value.get("manifest_sha256") != manifest_sha256 or not isinstance(value.get("manifest_variant"), str) or not value["manifest_variant"] or not isinstance(value.get("files"), list) or not value["files"]:
+        return False
+    return len({row.get("relative_path") for row in value["files"] if isinstance(row, dict)}) == len(value["files"]) and all(isinstance(row, dict) and set(row) == {"relative_path", "sha256", "stat"} and isinstance(row.get("relative_path"), str) and bool(row["relative_path"]) and _sha256_hex(row.get("sha256")) and isinstance(row.get("stat"), dict) and set(row["stat"]) == {"byte_count", "device", "inode", "modified_ns"} and all(isinstance(row["stat"].get(name), int) and not isinstance(row["stat"][name], bool) and row["stat"][name] >= 0 for name in ("byte_count", "device", "inode", "modified_ns")) for row in value["files"])
+
+
+def validate_prefreeze_receipt(receipt: dict[str, Any], *, manifest_sha256: str, dataset_sha256: str, expected_git_state: dict[str, Any], expected_questions: int = 1986, expected_top_k: int = 10, expected_source_pool: int = 50, expected_adapter_sha256: str | None = None, expected_source: dict[str, Any] | None = None, expected_historical_source: dict[str, Any] | None = None, expected_identity: str | None = None, expected_model_runtime: dict[str, Any] | None = None, expected_snapshot_pair: dict[str, Any] | None = None, expected_sentinels: dict[str, Any] | None = None, expected_safety_receipt: str | None = None, expected_streams: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Fail closed on the small prefreeze contract before artifact/scorer use."""
+    required = {"schema", "version", "status", "manifest_sha256", "phase_ledger", "input_freeze", "git_state_before", "git_state_after", "source_repo", "historical_source", "encoder_identity", "adapter_implementation_sha256", "implementation_sha256", "model_runtime", "encoder_sentinels", "encoder_snapshot_pair", "stream_receipts", "safety_summary", "claim_boundary"}
+    if not _sha256_hex(manifest_sha256) or not _sha256_hex(dataset_sha256) or not isinstance(receipt, dict) or set(receipt) != required or receipt.get("schema") != PREFREEZE_SCHEMA or receipt.get("version") != 1 or receipt.get("status") != "complete" or receipt.get("manifest_sha256") != manifest_sha256 or receipt.get("phase_ledger") != list(PREFREEZE_PHASES):
+        raise ValueError("prefreeze receipt schema or manifest mismatch")
+    if receipt.get("git_state_before") != receipt.get("git_state_after") or receipt.get("git_state_before") != expected_git_state or expected_git_state.get("git_dirty") is not False:
+        raise ValueError("prefreeze receipt Git receipt mismatch")
+    dataset = receipt.get("input_freeze", {}).get("dataset") if isinstance(receipt.get("input_freeze"), dict) else None
+    input_freeze = receipt.get("input_freeze")
+    if not isinstance(input_freeze, dict) or set(input_freeze) != {"dataset", "model_manifest_sha256"} or not isinstance(dataset, dict) or set(dataset) != {"label", "path", "sha256", "bytes"} or dataset.get("label") != "dataset" or dataset.get("sha256") != dataset_sha256 or not isinstance(dataset.get("bytes"), int) or dataset["bytes"] < 1 or not _sha256_hex(input_freeze.get("model_manifest_sha256")):
+        raise ValueError("prefreeze receipt dataset mismatch")
+    implementation = receipt.get("implementation_sha256")
+    if not isinstance(implementation, dict) or set(implementation) != {"harness", "ranker", "prefreeze_cli"} or implementation.get("harness") != _sha256(Path(__file__).read_bytes()) or implementation.get("ranker") != _sha256((ROOT / "mempalace_rpg" / "retrieval.py").read_bytes()) or implementation.get("prefreeze_cli") != _sha256((ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py").read_bytes()):
+        raise ValueError("prefreeze receipt implementation mismatch")
+    if expected_adapter_sha256 is not None and receipt.get("adapter_implementation_sha256") != expected_adapter_sha256:
+        raise ValueError("prefreeze receipt adapter mismatch")
+    for name in ("encoder_identity", "adapter_implementation_sha256"):
+        if not _sha256_hex(receipt.get(name)):
+            raise ValueError("prefreeze receipt identity digest is malformed")
+    source = receipt.get("source_repo"); historical = receipt.get("historical_source")
+    source_git = source.get("git_state") if isinstance(source, dict) else None
+    git_keys = {"git_head", "git_tree", "git_dirty", "worktree_status_sha256", "commit_diff_sha256", "commit_diff_bytes"}
+    if not isinstance(source, dict) or set(source) != {"path", "pinned_commit", "git_state"} or source.get("pinned_commit") != HISTORICAL_COMMIT or not isinstance(source.get("path"), str) or not source["path"] or not isinstance(source_git, dict) or set(source_git) != git_keys or source_git.get("git_dirty") is not False or not _git_oid40(source_git.get("git_head")) or not _git_oid40(source_git.get("git_tree")) or not _sha256_hex(source_git.get("worktree_status_sha256")) or not _sha256_hex(source_git.get("commit_diff_sha256")) or not isinstance(source_git.get("commit_diff_bytes"), int) or isinstance(source_git["commit_diff_bytes"], bool) or source_git["commit_diff_bytes"] < 0 or not isinstance(historical, dict) or set(historical) != {"commit", "files"} or historical.get("commit") != HISTORICAL_COMMIT or not isinstance(historical.get("files"), dict) or not historical["files"] or any(not _sha256_hex(value) for value in historical["files"].values()):
+        raise ValueError("prefreeze receipt source provenance is malformed")
+    runtime = receipt.get("model_runtime"); sentinels = receipt.get("encoder_sentinels"); snapshots = receipt.get("encoder_snapshot_pair")
+    if not isinstance(runtime, dict) or set(runtime) != {"onnx_sha256", "embedding_dimension", "session_providers", "onnxruntime_version"} or not _sha256_hex(runtime.get("onnx_sha256")) or not isinstance(runtime.get("embedding_dimension"), int) or runtime["embedding_dimension"] < 1 or not isinstance(runtime.get("session_providers"), list) or not runtime["session_providers"] or not isinstance(runtime.get("onnxruntime_version"), str) or not runtime["onnxruntime_version"] or not isinstance(sentinels, dict) or set(sentinels) != {"query", "passage"} or not _validate_encoder_sentinel_shape(sentinels["query"], mode="query", manifest_sha256=input_freeze["model_manifest_sha256"], embedding_dimension=runtime["embedding_dimension"]) or not _validate_encoder_sentinel_shape(sentinels["passage"], mode="passage", manifest_sha256=input_freeze["model_manifest_sha256"], embedding_dimension=runtime["embedding_dimension"]) or not isinstance(snapshots, dict) or set(snapshots) != {"start", "end"} or snapshots["start"] != snapshots["end"] or not _validate_snapshot_shape(snapshots["start"], manifest_sha256=input_freeze["model_manifest_sha256"]):
+        raise ValueError("prefreeze receipt model provenance is malformed")
+    safety = receipt.get("safety_summary")
+    safety_keys = {"expected_trace_count", "trace_count", "audit_complete_count", "ranking_schema_complete_count", "fcd1_ledger_complete_count", "selected_match_count", "trace_identity_complete_count", "nonempty_selection_count", "unauthorized_selected_count", "legacy_mapping", "product_mapping", "lineage", "ranking_digest_count", "checks", "pass"}
+    mappings_ok = all(isinstance(safety.get(name), dict) and set(safety[name]) == {"count", "unique_event_count", "unique_dialog_count", "mapping_sha256", "valid", "one_to_one"} and all(isinstance(safety[name].get(key), int) and not isinstance(safety[name][key], bool) and safety[name][key] >= 0 for key in ("count", "unique_event_count", "unique_dialog_count")) and _sha256_hex(safety[name].get("mapping_sha256")) and safety[name].get("valid") is True and safety[name].get("one_to_one") is True for name in ("legacy_mapping", "product_mapping"))
+    if not isinstance(safety, dict) or set(safety) != safety_keys or safety.get("pass") is not True or not isinstance(safety.get("checks"), dict) or set(safety["checks"]) != set(SAFETY_CHECKS) or any(safety["checks"].get(name) is not True for name in SAFETY_CHECKS) or not mappings_ok or not isinstance(safety.get("lineage"), dict) or set(safety["lineage"]) != {"count", "forbidden_field_count", "mapping_digest_count"} or any(not isinstance(safety["lineage"].get(name), int) or isinstance(safety["lineage"][name], bool) or safety["lineage"][name] < 0 for name in safety["lineage"]) or any(not isinstance(safety.get(name), int) or isinstance(safety[name], bool) or safety[name] < 0 for name in safety_keys - {"legacy_mapping", "product_mapping", "lineage", "checks", "pass"}) or safety["expected_trace_count"] != expected_questions or safety["trace_count"] != expected_questions:
+        raise ValueError("prefreeze receipt safety shape is malformed")
+    streams = receipt.get("stream_receipts")
+    stream_digests = {"product_top10_sha256", "product_trace_stream_sha256", "lineage_stream_sha256", "authorization_mapping_stream_sha256", "legacy_event_mapping_sha256", "product_event_mapping_sha256", "safety_summary_sha256", "fresh_streams_sha256"}
+    expected_stream_keys = {"expected_questions", "top_k", "source_pool", "product_top10_sha256", "ranking_stream_sha256", "source_pool_stream_sha256", "product_trace_stream_sha256", "lineage_stream_sha256", "authorization_mapping_stream_sha256", "legacy_event_mapping_sha256", "product_event_mapping_sha256", "safety_summary_sha256", "fresh_streams_sha256", "raw_component_parity"}
+    if not isinstance(streams, dict) or set(streams) != expected_stream_keys or streams.get("expected_questions") != expected_questions or streams.get("top_k") != expected_top_k or streams.get("source_pool") != expected_source_pool or any(not _sha256_hex(streams.get(name)) for name in stream_digests) or not isinstance(streams.get("ranking_stream_sha256"), dict) or not isinstance(streams.get("source_pool_stream_sha256"), dict):
+        raise ValueError("prefreeze receipt stream schema mismatch")
+    parity = streams.get("raw_component_parity")
+    if not isinstance(parity, dict) or parity.get("pass") is not True or not isinstance(parity.get("sha256"), str) or len(parity["sha256"]) != 64:
+        raise ValueError("prefreeze receipt raw parity mismatch")
+    if set(streams["ranking_stream_sha256"]) != set(ARMS[:-1]) or set(streams["source_pool_stream_sha256"]) != {"raw_bm25", "raw_dense", "raw_bm25_plus_raw_dense"} or any(not _sha256_hex(value) for stream in (streams["ranking_stream_sha256"], streams["source_pool_stream_sha256"]) for value in stream.values()) or set(parity) != {"arms", "pass", "sha256"} or set(parity.get("arms", {})) != {"raw_bm25", "raw_dense"}:
+        raise ValueError("prefreeze receipt stream-arm shape mismatch")
+    for arm in ("raw_bm25", "raw_dense"):
+        values = parity.get("arms", {}).get(arm) if isinstance(parity.get("arms"), dict) else None
+        if not isinstance(values, dict) or set(values) != {"top10_order_exact_questions", "top50_order_exact_questions", "top50_set_exact_questions", "overlap_mean", "overlap_min"} or values.get("top10_order_exact_questions") != expected_questions or values.get("top50_set_exact_questions") != expected_questions or any(isinstance(values.get(name), bool) or not isinstance(values.get(name), (int, float)) or not math.isfinite(float(values[name])) for name in ("overlap_mean", "overlap_min")):
+            raise ValueError("prefreeze receipt raw parity counts mismatch")
+    if parity["sha256"] != _canonical({"arms": parity["arms"]}) or streams["fresh_streams_sha256"] != _canonical({key: value for key, value in streams.items() if key != "fresh_streams_sha256"}):
+        raise ValueError("prefreeze receipt aggregate digest mismatch")
+    if expected_source is not None and receipt.get("source_repo") != expected_source: raise ValueError("prefreeze receipt source-repository mismatch")
+    if expected_historical_source is not None and receipt.get("historical_source") != expected_historical_source: raise ValueError("prefreeze receipt historical-source mismatch")
+    if expected_identity is not None and receipt.get("encoder_identity") != expected_identity: raise ValueError("prefreeze receipt encoder identity mismatch")
+    if expected_model_runtime is not None and receipt.get("model_runtime") != expected_model_runtime: raise ValueError("prefreeze receipt model runtime mismatch")
+    if expected_snapshot_pair is not None and receipt.get("encoder_snapshot_pair") != expected_snapshot_pair: raise ValueError("prefreeze receipt model snapshot mismatch")
+    if expected_sentinels is not None and receipt.get("encoder_sentinels") != expected_sentinels: raise ValueError("prefreeze receipt sentinel mismatch")
+    if expected_safety_receipt is not None and stable_safety_receipt(safety) != expected_safety_receipt: raise ValueError("prefreeze receipt safety mismatch")
+    if expected_streams is not None and streams != expected_streams: raise ValueError("prefreeze receipt fresh-stream mismatch")
+    return streams
+
+
+def verify_prefreeze_replay(receipt: dict[str, Any], *, fresh_streams: dict[str, Any], safety_summary: dict[str, Any], **contract: Any) -> dict[str, Any]:
+    """The sole pre-label staged gate: exact receipt plus fresh semantic replay."""
+    if not isinstance(fresh_streams, dict) or safety_summary.get("pass") is not True:
+        raise RuntimeError("fresh staged prelabel inputs are malformed")
+    return validate_prefreeze_receipt(receipt, expected_safety_receipt=stable_safety_receipt(safety_summary), expected_streams=fresh_streams, **contract)
+
+
+def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, source_repo: Path, output: Path, manifest_path: Path = MANIFEST_PATH, prefreeze_receipt_path: Path | None = None, expected_prefreeze_sha256: str | None = None) -> dict[str, Any]:
+    """Execute all six frozen arms; scorer labels are accessed only after streams freeze."""
+    manifest, manifest_sha = load_manifest(manifest_path)
+    state_before = aerp1.git_state(ROOT); require_clean_git_state(state_before)
+    output = require_external_output(output, source_repo)
+    if (prefreeze_receipt_path is None) != (expected_prefreeze_sha256 is None):
+        raise ValueError("prefreeze receipt path and expected SHA-256 must be provided together")
+    phases: list[str] = []
+    phase_contract = STAGED_PHASES if prefreeze_receipt_path is not None else PHASES
+    dataset_receipt = freeze_input_bytes(dataset_path, label="dataset", expected_sha256=manifest["inputs"]["dataset_sha256"])
+    artifact_receipt = freeze_input_bytes(artifact_path, label="artifact", expected_sha256=manifest["inputs"]["historical_artifact_sha256"])
+    prefreeze_input = freeze_input_bytes(prefreeze_receipt_path, label="prefreeze", expected_sha256=expected_prefreeze_sha256) if prefreeze_receipt_path is not None and expected_prefreeze_sha256 is not None else None
+    artifact_bytes = artifact_receipt["data"]  # Parse only after fresh streams freeze.
+    advance_phase(phases, "input_byte_freeze", contract=phase_contract)
+    if prefreeze_input is not None:
+        advance_phase(phases, "prefreeze_receipt_frozen", contract=phase_contract)
+    prefreeze_streams = validate_prefreeze_receipt(json.loads(prefreeze_input["data"]), manifest_sha256=manifest_sha, dataset_sha256=dataset_receipt["sha256"], expected_git_state=state_before) if prefreeze_input is not None else None
+    source_receipt = source_repo_receipt(source_repo, manifest)
+    protocol, candidate, encoder, source_digests, directory, saved_modules = _historical_modules(source_repo, model_dir, manifest)
+    try:
+        adapter_digest = adapter_implementation_digest()
+        runtime_provider = encoder_runtime_provider_receipt(encoder, manifest["inputs"])
+        identity = _canonical({"model": encoder.manifest.canonical_sha256, "historical_encoder": source_digests["benchmarks/locomo_bge_encoder.py"], "adapter": adapter_digest, "runtime_provider": runtime_provider})
+        runtime_sentinels, encoder_sentinels = encoder_sentinel_receipts(encoder)
+        advance_phase(phases, "source_model_load", contract=phase_contract)
         dataset = protocol.load_official_locomo10(dataset_path)
         retrieval, scorer = protocol.prepare_hard_story_track(dataset, candidate_pool_size=manifest["protocol"]["source_pool"], require_official_counts=True)
-        advance_phase(phases, "sanitized_retrieval_construction")
+        advance_phase(phases, "sanitized_retrieval_construction", contract=phase_contract)
         item_ids = aerp1._conversation_items(retrieval)
         if len(item_ids) != 10: raise ValueError("conversation denominator mismatch")
         session_count = sum(len(retrieval.retrieval_items[ids[0]]["sessions"]) for ids in item_ids.values())
         dialog_count = sum(len(dialog["dialogs"]) for ids in item_ids.values() for dialog in retrieval.retrieval_items[ids[0]]["sessions"])
-        rankings = {arm: {} for arm in ARMS[:-1]}; source_pool_rankings = {"raw_bm25": {}, "raw_dense": {}, "raw_bm25_plus_raw_dense": {}}; traces: dict[str, Any] = {}; lineage: list[dict[str, Any]] = []; lineage_by_conversation: dict[str, dict[str, Any]] = {}; legacy_event_maps: dict[str, dict[str, str]] = {}; product_event_maps: dict[str, dict[str, str]] = {}; question_conversations: dict[str, str] = {}
-        with tempfile.TemporaryDirectory(prefix="aerp2-product-kernel-") as temp:
-            legacy = RpgMemoryKernel(db_path=str(Path(temp) / "legacy.sqlite")); product = RpgMemoryKernel(db_path=str(Path(temp) / "product.sqlite"), retrieval_ranker=SixViewRanker(HistoricalBgeAdapter(encoder, identity), diagnostic_ledger=True))
-            try:
-                for conversation_id, ids in sorted(item_ids.items()):
-                    payload0 = retrieval.retrieval_items[ids[0]]; legacy_map, audit = seed_sanitized_conversation(legacy, payload0, conversation_id=conversation_id); product_map, product_audit = seed_sanitized_conversation(product, payload0, conversation_id=conversation_id)
-                    if audit["seed_ledger"] != product_audit["seed_ledger"]: raise RuntimeError("legacy/product seed lineage differs")
-                    audit = {"conversation_id": conversation_id, **audit}; lineage.append(audit); lineage_by_conversation[conversation_id] = audit; legacy_event_maps[conversation_id] = legacy_map; product_event_maps[conversation_id] = product_map
-                    dialogs = aerp1.raw_dialogs(payload0); dialog_ids = [row["id"] for row in dialogs]; passages = encoder.encode_passages([row["text"] for row in dialogs]); queries = encoder.encode_queries([retrieval.retrieval_items[item]["query"] for item in ids])
-                    for index, item_id in enumerate(ids):
-                        question_conversations[item_id] = conversation_id
-                        payload = retrieval.retrieval_items[item_id]; raw_pool = _raw_bm25_pool(candidate, payload, manifest["protocol"]["source_pool"]); dense_pool = aerp1.rank_vectors(dialog_ids, passages, queries[index], manifest["protocol"]["source_pool"]); fused_pool = _rrf(raw_pool, dense_pool)[:manifest["protocol"]["source_pool"]]
-                        validate_source_pool(raw_pool, pool=manifest["protocol"]["source_pool"], name="raw BM25"); validate_source_pool(dense_pool, pool=manifest["protocol"]["source_pool"], name="raw dense"); validate_source_pool(fused_pool, pool=manifest["protocol"]["source_pool"], name="raw BM25+dense RRF")
-                        source_pool_rankings["raw_bm25"][item_id] = raw_pool; source_pool_rankings["raw_dense"][item_id] = dense_pool; source_pool_rankings["raw_bm25_plus_raw_dense"][item_id] = fused_pool
-                        rankings["raw_bm25"][item_id] = raw_pool[:10]; rankings["raw_dense"][item_id] = dense_pool[:10]; rankings["raw_bm25_plus_raw_dense"][item_id] = fused_pool[:10]
-                        rankings["legacy_rpg"][item_id] = aerp1.rank_rpg(legacy, conversation_id=conversation_id, query=payload["query"], event_to_dialog=legacy_map, top_k=10)[0]
-                        rankings["product_six_view"][item_id], traces[item_id] = _product_rank(product, conversation_id, payload["query"], product_map, 10, product_audit["seed_ledger"]["authorization_mapping_sha256"])
-            finally: legacy.close(); product.close()
+        fresh = freeze_fresh_streams(retrieval=retrieval, candidate=candidate, encoder=encoder, identity=identity, source_pool=manifest["protocol"]["source_pool"], top_k=10)
+        rankings = fresh.rankings; source_pool_rankings = fresh.source_pool_rankings; traces = fresh.traces; lineage = fresh.lineage; lineage_by_conversation = fresh.lineage_by_conversation
+        legacy_event_maps = fresh.legacy_event_maps; product_event_maps = fresh.product_event_maps; question_conversations = fresh.question_conversations
         product_top10_sha256 = _canonical(rankings["product_six_view"])
-        if product_top10_sha256 != FCD1_REFERENCE_PRODUCT_TOP10_SHA256:
+        advance_phase(phases, "fresh_streams_frozen", contract=phase_contract)
+        safety = summarize_product_safety(traces=traces, product_rankings=rankings["product_six_view"], product_event_maps=product_event_maps, legacy_event_maps=legacy_event_maps, question_conversations=question_conversations, lineage=lineage, expected_questions=manifest["protocol"]["questions"], expected_dialogs=manifest["protocol"]["dialogs"])
+        fresh_receipts = fresh_stream_receipts(fresh, top_k=manifest["protocol"]["top_k"], source_pool=manifest["protocol"]["source_pool"], safety_summary=safety)
+        if not safety["pass"]:
+            raise RuntimeError("product safety failed before prefreeze verification")
+        if prefreeze_input is not None:
+            advance_phase(phases, "prelabel_safety", contract=phase_contract)
+            encoder_snapshots = encoder_snapshot_receipt(encoder)
+            model_runtime = model_runtime_receipt(encoder_snapshots, runtime_sentinels, manifest["inputs"])
+            prefreeze_streams = verify_prefreeze_replay(json.loads(prefreeze_input["data"]), fresh_streams=fresh_receipts, safety_summary=safety, manifest_sha256=manifest_sha, dataset_sha256=dataset_receipt["sha256"], expected_git_state=state_before, expected_adapter_sha256=adapter_digest, expected_source=source_receipt, expected_historical_source={"commit": HISTORICAL_COMMIT, "files": source_digests}, expected_identity=identity, expected_model_runtime={**model_runtime, **runtime_provider}, expected_snapshot_pair=encoder_snapshots, expected_sentinels=encoder_sentinels)
+        if prefreeze_streams is not None and fresh_receipts != prefreeze_streams:
+            raise RuntimeError("prefreeze receipt differs from freshly replayed streams")
+        if prefreeze_input is None and product_top10_sha256 != FCD1_REFERENCE_PRODUCT_TOP10_SHA256:
             raise RuntimeError("FCD-1 changed the frozen Product top-10 stream")
-        # Ranking freeze ends here.  Only now may scorer labels and historical reference be joined.
-        encoder_snapshots = encoder_snapshot_receipt(encoder)
-        model_runtime = model_runtime_receipt(encoder_snapshots, encoder_sentinels, manifest["inputs"])
-        advance_phase(phases, "fresh_streams_frozen")
+        # Ranking freeze ends here. Only after verification may labels/artifact join.
+        if prefreeze_input is None:
+            encoder_snapshots = encoder_snapshot_receipt(encoder)
+            model_runtime = model_runtime_receipt(encoder_snapshots, runtime_sentinels, manifest["inputs"])
+        if prefreeze_input is not None:
+            advance_phase(phases, "prefreeze_receipt_verified", contract=phase_contract)
         published = json.loads(artifact_bytes)
         historical_by_key = {(row["opaque_conversation_id"], row["opaque_question_id"]): row for row in published["questions"]}
         scorer_splits = scorer_bundle_conversation_splits(scorer)
         scorer_digests = {**validate_scorer_contract(scorer.scorer_items, published["questions"], scorer_splits), **validate_corpus_contract(scorer.scorer_items, published.get("corpora"))}
         _enforce_scorer_contract_digests(scorer_digests, manifest.get("scorer_contract"), enforce_expected=True)
-        advance_phase(phases, "artifact_parse_scorer_contract")
+        advance_phase(phases, "artifact_parse_scorer_contract", contract=phase_contract)
         key_to_item = {(scorer.scorer_items[item].opaque_conversation_id, item): item for item in scorer.scorer_items}
         if set(key_to_item) != set(historical_by_key): raise ValueError("historical scorer join identities differ")
         rankings["historical_six_view"] = {item: extract_historical_ranking(historical_by_key[key]["methods"]["six_view_story_dense_rrf_v2"]["ranking"], set(scorer.scorer_items[item].corpus_opaque_dialog_ids))[:10] for key, item in key_to_item.items()}
@@ -894,22 +1273,27 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
         validate_denominators(conversations=len(item_ids), sessions=session_count, dialogs=dialog_count, questions=len(question_rows), hard_questions=sum(row["category"] in {1, 2} for row in question_rows), evidence_bearing=sum(row["columns"]["raw_bm25"]["official_exact"]["scored"] for row in question_rows))
         validate_official_aggregate_anchors(aggregate, manifest["anchors"])
         compact = [{"conversation_id": row["conversation_id"], "category": row["category"], "product": row["columns"]["product_six_view"]["official_exact"]["recall_at_10"], "strong": row["columns"]["raw_bm25_plus_raw_dense"]["official_exact"]["recall_at_10"], "historical": row["columns"]["historical_six_view"]["official_exact"]["recall_at_10"]} for row in question_rows if row["columns"]["product_six_view"]["official_exact"]["scored"]]
-        safety = summarize_product_safety(traces=traces, product_rankings=rankings["product_six_view"], product_event_maps=product_event_maps, legacy_event_maps=legacy_event_maps, question_conversations=question_conversations, lineage=lineage, expected_questions=manifest["protocol"]["questions"], expected_dialogs=manifest["protocol"]["dialogs"])
         gates = evaluate_release_gates(compact, bootstrap_seed=manifest["protocol"]["bootstrap_seed"], bootstrap_resamples=manifest["protocol"]["bootstrap_resamples"], thresholds=manifest["gates"], safety_summary=safety)
         question_audits = build_question_audits(question_rows=question_rows, scorer=scorer, rankings=rankings, source_pool_rankings=source_pool_rankings, traces=traces, product_event_maps=product_event_maps, lineage_by_conversation=lineage_by_conversation)
         diagnostics = split_diagnostics(question_rows, scorer_splits)
-        advance_phase(phases, "score_gate")
+        advance_phase(phases, "score_gate", contract=phase_contract)
         if not safety["pass"]:
             failed = sorted(name for name, passed in safety["checks"].items() if passed is not True)
             raise RuntimeError(f"product safety/trace summary failed: {failed}")
         verify_frozen_input(dataset_receipt); verify_frozen_input(artifact_receipt)
+        if prefreeze_input is not None: verify_frozen_input(prefreeze_input)
         state_after = aerp1.git_state(ROOT)
         if not aerp1.same_git_state(state_before, state_after): raise RuntimeError("worktree changed during quality run")
-        advance_phase(phases, "state_recheck")
-        advance_phase(phases, "atomic_publish_ready")
-        report = {"schema": "aerp2-product-six-view-locomo", "status": "complete", "manifest_sha256": manifest_sha, "input_freeze": {"dataset": {key: value for key, value in dataset_receipt.items() if key != "data"}, "artifact": {key: value for key, value in artifact_receipt.items() if key != "data"}, "model_manifest_sha256": encoder.manifest.canonical_sha256, **scorer_digests}, "model_runtime": {**model_runtime, **runtime_provider}, "git_state_before": state_before, "git_state_after": state_after, "source_repo": source_receipt, "historical_source": {"commit": HISTORICAL_COMMIT, "files": source_digests}, "encoder_identity": identity, "adapter_implementation_sha256": adapter_digest, "encoder_sentinels": encoder_sentinels, "encoder_snapshot_pair": encoder_snapshots, "phase_ledger": phases, "annotation_lineage": lineage, "event_dialog_mapping_sha256": {"legacy": _mapping_safety(legacy_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"], "product": _mapping_safety(product_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"]}, "fcd1_acceptance": {"ledger_schema": FCD1_LEDGER_SCHEMA, "top_k": FCD1_TOP_K, "expected_questions": manifest["protocol"]["questions"], "reference_product_top10_sha256": FCD1_REFERENCE_PRODUCT_TOP10_SHA256, "actual_product_top10_sha256": product_top10_sha256, "top10_unchanged": product_top10_sha256 == FCD1_REFERENCE_PRODUCT_TOP10_SHA256}, "ranking_stream_sha256": {arm: _canonical(rankings[arm]) for arm in rankings}, "source_pool_stream_sha256": {arm: _canonical(source_pool_rankings[arm]) for arm in source_pool_rankings}, "rankings_top10": rankings, "source_pool_rankings": source_pool_rankings, "product_traces": traces, "safety_summary": safety, "question_audits": question_audits, "questions": question_rows, "aggregate": aggregate, "split_diagnostics_non_gating": diagnostics, "gates": gates, "claim_boundary": "public/non-blind engineering regression; QA-annotation-free; FCD-1 is label-free diagnostic telemetry and does not establish fusion causality; caption is upstream metadata, not hidden-set generalization"}
+        advance_phase(phases, "state_recheck", contract=phase_contract)
+        advance_phase(phases, "atomic_publish_ready", contract=phase_contract)
+        acceptance = ({"fcd1_prefreeze_consumption": {"schema": PREFREEZE_CONSUMPTION_SCHEMA, "prefreeze_sha256": prefreeze_input["sha256"], "prefrozen_product_top10_sha256": prefreeze_streams["product_top10_sha256"], "current_product_top10_sha256": fresh_receipts["product_top10_sha256"], "fresh_ranking_stream_sha256": fresh_receipts["ranking_stream_sha256"], "fresh_source_pool_stream_sha256": fresh_receipts["source_pool_stream_sha256"], "raw_component_parity_sha256": fresh_receipts["raw_component_parity"]["sha256"], "raw_component_parity_pass": fresh_receipts["raw_component_parity"]["pass"], **{name: fresh_receipts[name] for name in ("product_trace_stream_sha256", "lineage_stream_sha256", "authorization_mapping_stream_sha256", "legacy_event_mapping_sha256", "product_event_mapping_sha256", "safety_summary_sha256", "fresh_streams_sha256")}}} if prefreeze_input is not None else {"fcd1_acceptance": {"ledger_schema": FCD1_LEDGER_SCHEMA, "top_k": FCD1_TOP_K, "expected_questions": manifest["protocol"]["questions"], "reference_product_top10_sha256": FCD1_REFERENCE_PRODUCT_TOP10_SHA256, "actual_product_top10_sha256": product_top10_sha256, "top10_unchanged": product_top10_sha256 == FCD1_REFERENCE_PRODUCT_TOP10_SHA256}})
+        report = {"schema": "aerp2-product-six-view-locomo", "status": "complete", "manifest_sha256": manifest_sha, "input_freeze": {"dataset": {key: value for key, value in dataset_receipt.items() if key != "data"}, "artifact": {key: value for key, value in artifact_receipt.items() if key != "data"}, **({"prefreeze": {key: value for key, value in prefreeze_input.items() if key != "data"}} if prefreeze_input is not None else {}), "model_manifest_sha256": encoder.manifest.canonical_sha256, **scorer_digests}, "model_runtime": {**model_runtime, **runtime_provider}, "git_state_before": state_before, "git_state_after": state_after, "source_repo": source_receipt, "historical_source": {"commit": HISTORICAL_COMMIT, "files": source_digests}, "encoder_identity": identity, "adapter_implementation_sha256": adapter_digest, "encoder_sentinels": encoder_sentinels, "encoder_snapshot_pair": encoder_snapshots, "phase_ledger": phases, "annotation_lineage": lineage, "event_dialog_mapping_sha256": {"legacy": _mapping_safety(legacy_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"], "product": _mapping_safety(product_event_maps, expected_dialogs=manifest["protocol"]["dialogs"])["mapping_sha256"]}, **acceptance, "ranking_stream_sha256": {arm: _canonical(rankings[arm]) for arm in rankings}, "source_pool_stream_sha256": {arm: _canonical(source_pool_rankings[arm]) for arm in source_pool_rankings}, "rankings_top10": rankings, "source_pool_rankings": source_pool_rankings, "product_traces": traces, "safety_summary": safety, "question_audits": question_audits, "questions": question_rows, "aggregate": aggregate, "split_diagnostics_non_gating": diagnostics, "gates": gates, "claim_boundary": "Frozen rankings are QA-annotation-free; quality labels are joined only after verification. FCD-1 is non-causal diagnostic telemetry."}
         validate_report_shape(report)
-        atomic_json(output, report); return report
+        if prefreeze_input is None:
+            atomic_json(output, report)
+        else:
+            atomic_json_no_clobber(output, report, frozen_inputs=(dataset_receipt, artifact_receipt, prefreeze_input), git_states=((ROOT, state_before), (source_repo.resolve(), source_receipt["git_state"])), implementation_digests={Path(__file__): _sha256(Path(__file__).read_bytes()), ROOT / "mempalace_rpg" / "retrieval.py": _sha256((ROOT / "mempalace_rpg" / "retrieval.py").read_bytes()), ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py": _sha256((ROOT / "benchmarks" / "aerp2_product_six_view_prefreeze.py").read_bytes())}, forbidden_paths=(source_repo, ROOT, model_dir, manifest_path))
+        return report
     finally:
         sys.path.pop(0)
         for name in _HISTORICAL_MODULES: sys.modules.pop(name, None)
@@ -919,7 +1303,7 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", required=True); parser.add_argument("--artifact", required=True); parser.add_argument("--model-dir"); parser.add_argument("--source-repo", required=True); parser.add_argument("--output"); parser.add_argument("--manifest", default=str(MANIFEST_PATH)); parser.add_argument("--metadata-only", action="store_true")
+    parser.add_argument("--dataset", required=True); parser.add_argument("--artifact", required=True); parser.add_argument("--model-dir"); parser.add_argument("--source-repo", required=True); parser.add_argument("--output"); parser.add_argument("--manifest", default=str(MANIFEST_PATH)); parser.add_argument("--metadata-only", action="store_true"); parser.add_argument("--prefreeze-receipt"); parser.add_argument("--expected-prefreeze-sha256")
     args = parser.parse_args(argv)
     if args.metadata_only:
         print(json.dumps(run_metadata_validation(dataset_path=Path(args.dataset), artifact_path=Path(args.artifact), source_repo=Path(args.source_repo), manifest_path=Path(args.manifest)), sort_keys=True))
@@ -928,7 +1312,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--model-dir and --output are required unless --metadata-only is used")
     output = Path(args.output).resolve()
     if ROOT in output.parents or output == ROOT: raise ValueError("output must be outside repository")
-    report = run_quality(dataset_path=Path(args.dataset), artifact_path=Path(args.artifact), model_dir=Path(args.model_dir), source_repo=Path(args.source_repo), output=output, manifest_path=Path(args.manifest))
+    report = run_quality(dataset_path=Path(args.dataset), artifact_path=Path(args.artifact), model_dir=Path(args.model_dir), source_repo=Path(args.source_repo), output=output, manifest_path=Path(args.manifest), prefreeze_receipt_path=Path(args.prefreeze_receipt) if args.prefreeze_receipt else None, expected_prefreeze_sha256=args.expected_prefreeze_sha256)
     print(json.dumps({"status": report["status"], "gates": report["gates"]}, sort_keys=True))
     return 0 if report["gates"].get("release_pass") is True else 1
 
