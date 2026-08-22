@@ -81,8 +81,13 @@ def validate_annotation_lineage(audit: dict[str, Any]) -> None:
         raise ValueError("annotation lineage mapping is malformed")
 
 
-def seed_sanitized_conversation(kernel: RpgMemoryKernel, conversation: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any]]:
-    conversation_id = conversation.get("opaque_conversation_id")
+def seed_sanitized_conversation(
+    kernel: RpgMemoryKernel,
+    conversation: dict[str, Any],
+    *,
+    conversation_id: str,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Seed one retrieval payload using its bundle-owned conversation identity."""
     if not isinstance(conversation_id, str) or not conversation_id:
         raise ValueError("sanitized conversation id is required")
     event_to_dialog: dict[str, str] = {}
@@ -676,7 +681,7 @@ def run_quality(*, dataset_path: Path, artifact_path: Path, model_dir: Path, sou
             legacy = RpgMemoryKernel(db_path=str(Path(temp) / "legacy.sqlite")); product = RpgMemoryKernel(db_path=str(Path(temp) / "product.sqlite"), retrieval_ranker=SixViewRanker(HistoricalBgeAdapter(encoder, identity)))
             try:
                 for conversation_id, ids in sorted(item_ids.items()):
-                    payload0 = retrieval.retrieval_items[ids[0]]; legacy_map, audit = seed_sanitized_conversation(legacy, payload0); product_map, product_audit = seed_sanitized_conversation(product, payload0)
+                    payload0 = retrieval.retrieval_items[ids[0]]; legacy_map, audit = seed_sanitized_conversation(legacy, payload0, conversation_id=conversation_id); product_map, product_audit = seed_sanitized_conversation(product, payload0, conversation_id=conversation_id)
                     if audit["seed_ledger"] != product_audit["seed_ledger"]: raise RuntimeError("legacy/product seed lineage differs")
                     audit = {"conversation_id": conversation_id, **audit}; lineage.append(audit); lineage_by_conversation[conversation_id] = audit; legacy_event_maps[conversation_id] = legacy_map; product_event_maps[conversation_id] = product_map
                     dialogs = aerp1.raw_dialogs(payload0); dialog_ids = [row["id"] for row in dialogs]; passages = encoder.encode_passages([row["text"] for row in dialogs]); queries = encoder.encode_queries([retrieval.retrieval_items[item]["query"] for item in ids])

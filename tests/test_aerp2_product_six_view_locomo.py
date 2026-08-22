@@ -11,7 +11,9 @@ from mempalace_rpg import RpgMemoryKernel
 
 
 def _conversation() -> dict:
-    return {"opaque_conversation_id": "conv-1", "sessions": [{"opaque_session_id": "session-1", "dialogs": [{"opaque_dialog_id": "dialog-1", "speaker": "Ada", "date": "2024-01-01", "caption": "arrival", "text": "Hello answer word", "observation": "FORBIDDEN OBSERVATION", "answer": "excluded"}]}]}
+    # Real RetrievalBundle payloads contain only query/sessions. Conversation
+    # identity lives in RetrievalBundle.item_to_conversation.
+    return {"sessions": [{"opaque_session_id": "session-1", "dialogs": [{"opaque_dialog_id": "dialog-1", "speaker": "Ada", "date": "2024-01-01", "caption": "arrival", "text": "Hello answer word", "observation": "FORBIDDEN OBSERVATION", "answer": "excluded"}]}]}
 
 
 def _safety() -> dict:
@@ -24,7 +26,7 @@ def _thresholds() -> dict:
 
 def test_seed_uses_only_sanitized_dialog_fields_and_checkpoint_mapping(tmp_path):
     with RpgMemoryKernel(db_path=str(tmp_path / "locomo.sqlite3")) as kernel:
-        event_to_dialog, audit = harness.seed_sanitized_conversation(kernel, _conversation())
+        event_to_dialog, audit = harness.seed_sanitized_conversation(kernel, _conversation(), conversation_id="conv-1")
         row = kernel._conn().execute("SELECT summary, source_span, payload_json FROM scene_event").fetchone()
 
     assert event_to_dialog and list(event_to_dialog.values()) == ["dialog-1"]
