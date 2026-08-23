@@ -288,6 +288,20 @@ other.
   least-privilege mounts, then cross-checks those claims against normalized raw
   Docker inspect output.
 
+  The next synthetic-only checkpoint now freezes a deterministic nine-worker
+  manifest: four current roles and five original builds have one closed role
+  mapping, common image/runtime limits, role-private config/output roots, and
+  sibling/private/staging mount denials.  Its host output observer requires an
+  empty directory before release and exactly one nonempty, non-symlink,
+  single-link `RELEASE` plus `packet.json` after exit, with repeated file and
+  directory identity checks.  This plans and validates the capability layout;
+  it still neither writes launch configs nor invokes Docker, and it cannot
+  defend against an actively malicious same-user host process.  Before a live
+  rehearsal, a separate exclusive writer/observer must still prove every role
+  config and writable palace/output directory was freshly materialized with
+  exactly the intended contents; the planner only validates directory identity
+  and topology.
+
   This checkpoint is not a ConvoMem result.  The public MiniLM model has passed
   a direct native-adapter smoke check without changing its model-file tree, but
   the formal current workers are not yet wired through the live isolated runner.
@@ -298,10 +312,18 @@ other.
   supervisor supplies sampled process-tree RSS and records any descendants it
   observes, but its polling is explicitly non-exhaustive and cannot prove that a
   short-lived descendant never existed.  It is therefore rehearsal evidence
-  only: formal original resource finalization requires OS-enforced complete
-  process-group accounting (or an equivalent inclusive per-query CPU source),
-  zero descendants, and a positive process-tree RSS peak.  That formal telemetry
-  gate and the pinned live original smoke remain open.
+  only.  The current interim finalizer remains closed unless supplied with
+  OS-enforced complete process-group evidence and zero descendants, but the
+  selected formal design replaces that temporary restriction with the same
+  descendant-inclusive cgroup-v2 accounting for current and original workers.
+  A synthetic-tested meter now binds each query to cgroup identity and before/
+  after `cpu.stat` snapshots, so cumulative CPU includes exited children.  It
+  records query-boundary `memory.current` values and a container-lifetime
+  `memory.peak`, both explicitly as cgroup charged memory rather than RSS; exact
+  per-query peak memory is unavailable in the one-container/many-query topology.
+  Its formal factory remains disabled, and the meter is not yet wired into the
+  worker image or READY/packet identity chain.  That formal telemetry gate and
+  the pinned live original smoke remain open.
   The local Docker daemon, fixed worker image/helpers, and real container denial
   probe have also not yet passed a live run.
   Therefore formal ConvoMem data remains unopened, unenumerated, and unhashed

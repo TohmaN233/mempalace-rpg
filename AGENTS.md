@@ -115,6 +115,15 @@ text-only.  Exact evidence mapping is `(speaker, text)` within the custody-only
 evidence-conversation set; ambiguity or absence fails closed without fuzzy
 fallback.
 
+Formal AERP-7 resource comparisons must use the same descendant-inclusive Linux
+cgroup-v2 CPU accounting for current and original workers.  Host-side PID/RSS
+polling is rehearsal diagnostics only and cannot prove that a short-lived child
+did not run.  Report `memory.current` only as query-boundary charged-memory
+snapshots and `memory.peak` only as a container-lifetime charged-memory peak;
+neither may be relabeled as per-query peak RSS.  On Windows Docker Desktop,
+Docker `State.Pid` is daemon/VM evidence and must not be treated as a Windows
+host PID for formal resource attribution.
+
 ## Verification
 
 Run `python -m pytest -q`, including `tests/test_aerp1_authorized_evidence_audit.py`
