@@ -299,13 +299,19 @@ def freeze_current_worker(*, encoder: Any, protocol: Mapping[str, Any], worker_c
     """Candidate-only current worker: exactly three arms and a byte-identical P5 repeat."""
     frozen_protocol = validate_formal_protocol(protocol)
     frozen_projection = load_candidate_worker_projection(worker_config=worker_config, protocol=frozen_protocol, candidate_bundle_root=candidate_bundle_root, staging_parent=staging_parent)
-    artifacts = rank.freeze_current_rankings(projection=frozen_projection, encoder=encoder, model_receipt=frozen_protocol["model_receipt"], code_receipt=frozen_protocol["current_code_receipt"])
+    # Do not use ``freeze_current_rankings`` here: it performs an internal P5
+    # repeat, which would make the formal worker's explicit repeat a third
+    # execution while its receipt claimed two.  Every ranking invocation below
+    # is therefore accounted for by this receipt and its matching resource row.
+    raw = rank.rank_projection(projection=frozen_projection, encoder=encoder, arm_id="strong_raw", model_receipt=frozen_protocol["model_receipt"], code_receipt=frozen_protocol["current_code_receipt"])
+    p5_primary = rank.rank_projection(projection=frozen_projection, encoder=encoder, arm_id="static_p5", model_receipt=frozen_protocol["model_receipt"], code_receipt=frozen_protocol["current_code_receipt"])
+    p5_repeat = rank.rank_projection(projection=frozen_projection, encoder=encoder, arm_id="static_p5", model_receipt=frozen_protocol["model_receipt"], code_receipt=frozen_protocol["current_code_receipt"])
+    six = rank.rank_projection(projection=frozen_projection, encoder=encoder, arm_id="six_view_secondary", model_receipt=frozen_protocol["model_receipt"], code_receipt=frozen_protocol["current_code_receipt"])
+    artifacts = [raw, p5_primary, six]
     if tuple(artifact["arm_id"] for artifact in artifacts) != ("strong_raw", "static_p5", "six_view_secondary"):
         raise CustodyError("current_worker_arm_coverage_invalid")
     for artifact in artifacts:
         rank.validate_frozen_ranking(artifact, projection=frozen_projection)
-    p5_primary = next(artifact for artifact in artifacts if artifact["arm_id"] == "static_p5")
-    p5_repeat = rank.rank_projection(projection=frozen_projection, encoder=encoder, arm_id="static_p5", model_receipt=frozen_protocol["model_receipt"], code_receipt=frozen_protocol["current_code_receipt"])
     if rank._bytes(p5_primary) != rank._bytes(p5_repeat): raise CustodyError("static_p5_repeat_nondeterministic")
     receipt = {"schema": CURRENT_WORKER_SCHEMA, "lifecycle": list(CURRENT_LIFECYCLE), "projection_sha256": canonical_sha256(frozen_projection), "artifact_sha256": {artifact["arm_id"]: artifact["artifact_sha256"] for artifact in artifacts}, "static_p5_primary_sha256": p5_primary["artifact_sha256"], "static_p5_repeat_sha256": p5_repeat["artifact_sha256"], "static_p5_byte_identical": True, "static_p5_execution_count": 2}
     receipt["worker_sha256"] = _digest(receipt)

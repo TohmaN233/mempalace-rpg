@@ -1,0 +1,198 @@
+import hashlib
+import hmac
+import os
+import time
+import runpy
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
+
+from benchmarks import aerp7_convomem_executor as executor
+from benchmarks.aerp7_convomem_confirmation import CustodyError
+
+
+def _digest(value):
+    return executor._digest(value)
+
+
+def _authorization(protocol, output, receipt, capability=b"x" * 32, *, expires_at_unix=None):
+    unsigned = {
+        "schema": executor.AUTH_SCHEMA,
+        "mode": "synthetic_rehearsal",
+        "synthetic_test_mode": True,
+        "protocol_sha256": protocol["protocol_sha256"],
+        "executor_code_receipt": receipt,
+        "output_dir": str(output.resolve()),
+        "nonce": "n" * 32,
+        "expires_at_unix": int(time.time()) + 60 if expires_at_unix is None else expires_at_unix,
+        "output_absent": True,
+    }
+    authorization_sha256 = _digest(unsigned)
+    return {**unsigned, "authorization_sha256": authorization_sha256, "operator_hmac": hmac.new(capability, executor._bytes({**unsigned, "authorization_sha256": authorization_sha256}), hashlib.sha256).hexdigest()}
+
+
+def _coordinator_inputs(tmp_path, monkeypatch):
+    """Build a label-free synthetic execution only; never a custody fixture."""
+    fixture = runpy.run_path("tests/test_aerp7_convomem_formal.py")
+    projection = fixture["projection"]()
+    candidate_root, _staging, candidate = fixture["bundle"](tmp_path, projection)
+    protocol = fixture["protocol"](projection, candidate)
+    protocol_path = tmp_path / "protocol.json"
+    protocol_path.write_bytes(executor._bytes(protocol))
+    output = tmp_path / "public-output"
+    secret = "z" * 40
+    authorization = _authorization(protocol, output, executor.live_executor_code_receipt(), secret.encode())
+    authorization_path = tmp_path / "authorization.json"
+    authorization_path.write_bytes(executor._bytes(authorization))
+    monkeypatch.setenv("AERP7_OPERATOR_AUTH_CAPABILITY", secret)
+    return (
+        {
+            "schema": executor.SCHEMA, "synthetic_test_mode": True,
+            "protocol_path": str(protocol_path), "candidate_bundle": str(candidate_root),
+            "output_dir": str(output), "authorization_path": str(authorization_path),
+            "python_executable": sys.executable,
+        },
+        output,
+    )
+
+
+def _assert_no_incomplete_generation(tmp_path, output):
+    assert not output.exists()
+    assert not list(tmp_path.glob(f".{output.name}.aerp7-staging-*"))
+
+
+def test_public_environment_is_an_explicit_allowlist(monkeypatch):
+    monkeypatch.setenv("AERP7_CUSTODY_PATH", "canary-custody")
+    monkeypatch.setenv("AERP7_BINDING_SECRET", "canary-binding")
+    monkeypatch.setenv("OPENAI_API_KEY", "canary-api")
+    env = executor._sanitized_env()
+    assert "AERP7_CUSTODY_PATH" not in env
+    assert "AERP7_BINDING_SECRET" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert env["AERP7_EXECUTOR_PUBLIC_ROLE"] == "1"
+    with pytest.raises(CustodyError):
+        executor.assert_public_command(["python", "custody.json"], env)
+
+
+def test_authorization_requires_live_hmac_expiry_and_single_consume(tmp_path, monkeypatch):
+    receipt = {"head": "a" * 64, "tree": "b" * 64, "diff_digest": "c" * 64, "dirty_policy": "clean_required"}
+    protocol = {"protocol_sha256": "d" * 64}; output = tmp_path / "out"; secret = b"x" * 32
+    monkeypatch.setattr(executor, "live_executor_code_receipt", lambda: receipt)
+    auth = _authorization(protocol, output, receipt, secret)
+    checked = executor._authorization(auth, protocol=protocol, output_dir=output, capability=secret)
+    marker = executor._consume_authorization(authorization=checked, output_dir=output)
+    assert marker.is_file()
+    with pytest.raises(CustodyError, match="already_consumed"):
+        executor._consume_authorization(authorization=checked, output_dir=output)
+    bad = dict(auth); bad["operator_hmac"] = "0" * 64
+    with pytest.raises(CustodyError, match="hmac"):
+        executor._authorization(bad, protocol=protocol, output_dir=output, capability=secret)
+    expired = _authorization(protocol, output, receipt, secret, expires_at_unix=int(time.time()) - 1)
+    with pytest.raises(CustodyError, match="expired"):
+        executor._authorization(expired, protocol=protocol, output_dir=output, capability=secret)
+
+
+def test_concurrent_same_nonce_has_exactly_one_authorization_consumer(tmp_path):
+    authorization = {"nonce": "r" * 32, "authorization_sha256": "a" * 64, "protocol_sha256": "b" * 64}
+    output = tmp_path / "out"
+    def consume():
+        try:
+            return executor._consume_authorization(authorization=authorization, output_dir=output)
+        except CustodyError:
+            return None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: consume(), range(2)))
+    assert sum(result is not None for result in results) == 1
+
+
+def test_exclusive_publication_does_not_replace_conflicting_output(tmp_path):
+    path = tmp_path / "packet.json"
+    executor._write_bytes_new(path, b'{"one":1}')
+    assert path.read_bytes() == b'{"one":1}'
+    assert executor.formal.publish_nonreplace(path, b'{"one":1}', fsync_parent=executor._sync_parent)["retry_idempotent"] is True
+    with pytest.raises(CustodyError, match="conflict"):
+        executor._write_bytes_new(path, b'{"two":2}')
+
+
+def test_exact_original_worker_packet_requires_cross_process_draft_and_coordinator_reaudit(tmp_path, monkeypatch):
+    draft_path = tmp_path / "draft.json"; draft_bytes = b'{"canonical":"draft"}'; draft_path.write_bytes(draft_bytes)
+    palace_path = tmp_path / "palace"; palace_path.mkdir()
+    worker_index_sha256 = "b" * 64
+    opaque_draft = SimpleNamespace(replicate_without_coordinator_audit={"build_id": "build-0", "index_sha256": worker_index_sha256}); projection = {"label_free": True}
+    replicate = {"build_id": "build-0", "index_sha256": "a" * 64}
+    resource = {"build_id": "build-0", "index_sha256": worker_index_sha256, "resource_sha256": "worker-digest"}
+    calls = []
+    monkeypatch.setattr(executor.original_product, "load_worker_draft", lambda payload: opaque_draft if payload == draft_bytes else None)
+    monkeypatch.setattr(
+        executor.original_product, "coordinator_reaudit_replicate",
+        lambda **kwargs: calls.append(kwargs) or replicate,
+    )
+    packet = {
+        "schema": executor.ORIGINAL_PACKET_SCHEMA,
+        "execution_mode": "exact_public_product_worker_draft",
+        "draft_file_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+        "palace_path": str(palace_path.resolve()),
+        "resource_receipt": resource,
+        "process_id": 123,
+        "packet_sha256": "",
+    }
+    packet["packet_sha256"] = _digest({key: value for key, value in packet.items() if key != "packet_sha256"})
+    checked_replicate, checked_resource = executor.coordinator_reaudit_original_worker_packet(
+        packet=packet, draft_path=draft_path, palace_path=palace_path, projection=projection,
+    )
+    assert checked_replicate == replicate
+    assert checked_resource["index_sha256"] == replicate["index_sha256"]
+    assert checked_resource["resource_sha256"] == executor.formal.resource_digest(checked_resource)
+    assert calls == [{"draft": opaque_draft, "palace_path": palace_path, "projection": projection}]
+    tampered = dict(packet); tampered["draft_file_sha256"] = "0" * 64
+    with pytest.raises(CustodyError, match="packet_invalid"):
+        executor.coordinator_reaudit_original_worker_packet(
+            packet=tampered, draft_path=draft_path, palace_path=palace_path, projection=projection,
+        )
+
+
+def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, monkeypatch):
+    # Reuse the established candidate/protocol fixture without importing any
+    # canonical or custody source; this test creates only label-free synthetic
+    # projection bytes.
+    config, output = _coordinator_inputs(tmp_path, monkeypatch)
+    monkeypatch.setenv("AERP7_CUSTODY_CANARY", "never-in-child")
+    monkeypatch.setenv("AERP7_BINDING_SECRET_CANARY", "never-in-child")
+    packet = executor.public_coordinator(config)
+    assert packet["formal_eligible"] is False
+    assert set(packet["supervisors"]) == {"current-raw", "current-p5_primary", "current-p5_repeat", "current-six", "original-0", "original-1", "original-2", "original-3", "original-4"}
+    assert len({row["pid"] for row in packet["supervisors"].values()}) == 9
+    assert packet["current_worker_receipt"]["static_p5_execution_count"] == 2
+    assert packet["current_worker_receipt"]["static_p5_primary_sha256"] == packet["current_worker_receipt"]["static_p5_repeat_sha256"]
+    assert (output / "public-freeze.json").is_file()
+    assert all("CUSTODY" not in key and "BINDING" not in key for row in packet["supervisors"].values() for key in [])
+    with pytest.raises(CustodyError, match="output_present"):
+        executor.public_coordinator(config)
+
+
+def test_worker_failure_discards_staging_and_consumes_authorization(tmp_path, monkeypatch):
+    config, output = _coordinator_inputs(tmp_path, monkeypatch)
+    monkeypatch.setattr(executor, "_run_subprocess", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected_worker_failure")))
+    with pytest.raises(RuntimeError, match="injected_worker_failure"):
+        executor.public_coordinator(config)
+    _assert_no_incomplete_generation(tmp_path, output)
+    with pytest.raises(CustodyError, match="already_consumed"):
+        executor.public_coordinator(config)
+
+
+def test_validation_failure_discards_staging_before_publication(tmp_path, monkeypatch):
+    config, output = _coordinator_inputs(tmp_path, monkeypatch)
+    monkeypatch.setattr(executor.formal, "freeze_endpoint_manifest", lambda **_kwargs: (_ for _ in ()).throw(CustodyError("injected_validation_failure")))
+    with pytest.raises(CustodyError, match="injected_validation_failure"):
+        executor.public_coordinator(config)
+    _assert_no_incomplete_generation(tmp_path, output)
+
+
+def test_publish_failure_discards_completed_staging_before_final_name(tmp_path, monkeypatch):
+    config, output = _coordinator_inputs(tmp_path, monkeypatch)
+    monkeypatch.setattr(executor, "_rename_generation_no_replace", lambda *_args: (_ for _ in ()).throw(CustodyError("injected_publish_failure")))
+    with pytest.raises(CustodyError, match="injected_publish_failure"):
+        executor.public_coordinator(config)
+    _assert_no_incomplete_generation(tmp_path, output)

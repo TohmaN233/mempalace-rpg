@@ -132,6 +132,20 @@ def test_formal_protocol_candidate_boundary_and_current_repeat_are_fail_closed(t
         formal.load_candidate_worker_projection(worker_config=worker_config(p, forged_protocol), protocol=forged_protocol, candidate_bundle_root=root, staging_parent=tmp_path)
 
 
+def test_current_worker_executes_p5_exactly_twice_without_hidden_helper_repeat(tmp_path, monkeypatch):
+    p = projection(); root, staging, candidate = bundle(tmp_path, p); proto = protocol(p, candidate); config = worker_config(p, proto)
+    original = rank.rank_projection; calls = []
+    def counted(*args, **kwargs):
+        calls.append(kwargs["arm_id"])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(rank, "rank_projection", counted)
+    formal.freeze_current_worker(encoder=Encoder(), protocol=proto, worker_config=config, candidate_bundle_root=root, staging_parent=tmp_path)
+    assert calls.count("strong_raw") == 1
+    assert calls.count("static_p5") == 2
+    assert calls.count("six_view_secondary") == 1
+    assert calls == ["strong_raw", "static_p5", "static_p5", "six_view_secondary"]
+
+
 def test_original_lifecycle_endpoint_and_release_cross_bind_everything(tmp_path, monkeypatch):
     p = projection(); root, staging, candidate = bundle(tmp_path, p); proto = protocol(p, candidate); current, current_receipt = formal.freeze_current_worker(encoder=Encoder(), protocol=proto, worker_config=worker_config(p, proto), candidate_bundle_root=root, staging_parent=tmp_path)
     original = original_replicates(p); sealed = {"replicates": original, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": proto["original_code_receipt"], "original_code_after": proto["original_code_receipt"]}; sealed["worker_sha256"] = formal._digest({key: sealed[key] for key in ("replicates", "lifecycle", "original_code_before", "original_code_after")})

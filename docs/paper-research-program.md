@@ -230,12 +230,35 @@ other.
   a separately digested resource receipt; the release HMAC collectively binds
   both receipts, while the current-worker receipt binds their identical
   artifact digest and exactly two P5 executions.
-  The gate is protocol-only: it contains no approved formal subprocess runner and therefore
-  cannot authorize or execute a ConvoMem run.  It is not a completed ConvoMem
-  result.  Its publication helper is a synthetic-tested filesystem scaffold:
-  it assumes the output directory is controlled by the coordinator between its
-  exclusive-link and durability operations; hostile concurrent filesystem
-  mutation requires a platform-specific publication primitive before formal use.
+  `benchmarks.aerp7_convomem_executor` now proves the public coordinator, four
+  isolated current-arm processes, five original-worker processes, label-free
+  candidate copy, a closed environment allowlist, HMAC-and-nonce operator
+  authorization, and exclusive publication using synthetic fixtures.  All nine
+  worker outputs are built and validated inside a sibling staging generation;
+  worker, validation, or publish failure verifies the staging root identity,
+  removes that unpublished generation, and leaves the final path absent, while success uses a platform
+  no-replace atomic directory move.  A failed consumed authorization requires a
+  newly signed authorization, so two worker populations can never be mixed.  The
+  exact original-product route is separately wired to the unchanged public
+  `upsert -> reset/close -> cold reopen -> search` lifecycle: each worker emits
+  only a canonical, digest-bound, non-publishable draft and leaves its palace in
+  place; only the coordinator's independent physical-index re-audit can produce
+  a publishable replicate.  Native internal embedding calls are not observable
+  behind the upstream cached callable, so the resource evidence truthfully uses
+  a cross-checked public upsert/search request ledger and preserves that
+  limitation out of band.  The custodian authorization binds packet/file/output,
+  nonce and expiry; a successful replay authenticates the existing result and
+  never opens custody or scores again.
+  The executor deliberately retains `FORMAL_EXECUTION_ENABLED = False` and
+  `FORMAL_CURRENT_EXECUTION_ENABLED = False`: it does not read, enumerate, or
+  hash ConvoMem, and no formal run may flip either constant without a fresh
+  review.  The synthetic resource shape uses a test-only encoder and cannot be
+  reported as a resource result.  Formal use still requires exact current-arm
+  phase measurements, an OS-enforced worker capability boundary, and a Windows
+  durable parent-directory publication primitive.  A blank cwd and environment
+  allowlist are defense in depth, not that OS boundary; the same boundary is
+  required before path-based recursive staging cleanup can be treated as safe
+  against an actively hostile same-user process.
 - MemBench is the second retrieval confirmation dataset.  Split by `tid` because
   a `tid` recurs across task files.  `target_step_id`, answers, choices, and
   ground truth belong only to the label custodian.  Items with more than ten
