@@ -5,6 +5,9 @@ import hashlib
 import inspect
 import json
 import os
+from pathlib import Path
+import sqlite3
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +18,11 @@ from mempalace_rpg.retrieval import AuthorizedRetrievalCandidate
 
 def _token(number: int) -> str:
     return f"{number:064x}"
+
+
+def _expected_identity_namespace() -> dict:
+    rows = [{"physical_id": f"conversation::aerp5::dialog_{index:06d}"} for index in range(5882)]
+    return {"expected_unique_count": 5882, "mapping_sha256": "n" * 64, "rows": rows}
 
 
 def _row(number: int) -> dict:
@@ -66,6 +74,27 @@ def _valid_worker_freeze(arm: str) -> tuple[dict, tuple[str, ...]]:
         }
         policies = {}
         policy_sha = unsupported
+        expected_namespace = _expected_identity_namespace()
+        identity_namespace = {
+            "schema": "aerp5-original-identity-namespace-v1",
+            "scheme": runner.IDENTITY_NAMESPACE_SCHEME,
+            "expected_unique_count": 5882,
+            "actual_collection_count": 5882,
+            "mapping_sha256": expected_namespace["mapping_sha256"],
+        }
+        index_receipt = {
+            "schema": "aerp5-original-index-build-receipt-v1", "physical_id_count": 5882,
+            "physical_id_sha256": runner.canonical_sha256(sorted(row["physical_id"] for row in expected_namespace["rows"])),
+            "embedding_count": 5882, "embedding_dimension": 384, "embedding_float32_sha256": "e" * 64,
+            "immutable_backend_sha256": "a" * 64, "sqlite_semantic_sha256": "b" * 64,
+            "sqlite_operational_delta": {
+                "schema": "aerp5-chroma-operational-delta-v1", "excluded_table": "acquire_write",
+                "permitted_transition": "unchanged_or_append_next_integer_id_lock_status_1", "validation": "passed",
+            },
+            "hnsw_configuration": runner._sqlite_hnsw_configuration_expected(),
+            "hnsw_graph_files": [{"name": name, "bytes": 1, "sha256": f"{index + 1:064x}"} for index, name in enumerate(("data_level0.bin", "header.bin", "length.bin", "link_lists.bin"))],
+        }
+        cold_reopen_cleanup = {"verified_system_released": True}
     else:
         traces = {}
         for index, token in enumerate(tokens):
@@ -110,6 +139,9 @@ def _valid_worker_freeze(arm: str) -> tuple[dict, tuple[str, ...]]:
             if arm == runner.ARM_P5:
                 policies[token]["final_ranking_sha256"] = traces[token]["policy_final_ranking_sha256"]
         policy_sha = runner.canonical_sha256(policies)
+        identity_namespace = "not_applicable"
+        cold_reopen_cleanup = "not_applicable"
+        index_receipt = "not_applicable"
     value = {
         "schema": runner.SCHEMA + "-worker",
         "arm": arm,
@@ -139,6 +171,10 @@ def _valid_worker_freeze(arm: str) -> tuple[dict, tuple[str, ...]]:
             "model_file_tree_sha256": "m" * 64,
             "same_cached_embedding_object_for_both_arms": True,
         },
+        "identity_namespace_receipt": identity_namespace,
+        "original_index_build_receipt": index_receipt,
+        "cold_reopen_cleanup": cold_reopen_cleanup,
+        "lifecycle_receipt": {"all_ingest_before_query": True, "cold_reopen_before_query": True, "query_latency_boundary": "public_search_return_through_namespace_validation" if arm == runner.ARM_ORIGINAL else "current_product_rank_return_only"},
     }
     return value, tokens
 
@@ -147,7 +183,7 @@ def test_manifest_freezes_public_known_inputs_and_rejects_tunable_surface():
     manifest = runner.load_manifest()
     assert manifest["dataset"]["sha256"] == "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
     assert manifest["original"]["commit"] == runner.v1.ORIGINAL_PIN
-    assert manifest["run"]["repeats"] == 2 and manifest["run"]["top_k"] == 10
+    assert manifest["run"]["repeats_by_arm"] == runner.REPEATS_BY_ARM and manifest["run"]["top_k"] == 10
     with pytest.raises(ValueError, match="tau/router"):
         runner.main(["--tau", "0.1"])
 
@@ -353,6 +389,101 @@ def test_projection_parser_rejects_item_corpus_duplication_or_membership_drift()
         runner._validate_public_projection(projection)
 
 
+def test_original_identity_namespace_prevents_local_dialog_id_overwrite_and_binds_5882_total():
+    counts = (419, 369, 663, 629, 680, 675, 689, 681, 509, 568)
+    conversations = {
+        f"conversation-{index}": {"sessions": [{"opaque_session_id": str(index), "dialogs": [{"opaque_dialog_id": f"dialog_{dialog:06d}", "speaker": "s", "date": "d", "caption": "c", "text": "x"} for dialog in range(count)]}]}
+        for index, count in enumerate(counts)
+    }
+    namespace = runner.original_identity_namespace(conversations)
+    assert namespace["expected_unique_count"] == 5882
+    assert len({row["physical_id"] for row in namespace["rows"]}) == 5882
+    same_local = [row for row in namespace["rows"] if row["local_dialog_id"] == "dialog_000000"]
+    assert len(same_local) == 10 and len({row["physical_id"] for row in same_local}) == 10
+
+
+@pytest.mark.parametrize("returned", ["other::aerp5::dialog_000000", "conversation::aerp5::unknown"])
+def test_original_public_query_rejects_wrong_or_unknown_physical_ids(monkeypatch, returned):
+    conversation = "conversation"; local = [f"dialog_{index:06d}" for index in range(10)]
+    physical = {identifier: conversation + runner.IDENTITY_NAMESPACE_SEPARATOR + identifier for identifier in local}
+    monkeypatch.setattr(runner.v1, "original_product_query", lambda **_: [returned] * 10)
+    with pytest.raises(RuntimeError, match="outside|unknown"):
+        runner.original_product_query_namespaced(
+            searcher=object(), palace_path=Path("unused"), conversation_id=conversation,
+            local_corpus_ids=local, physical_by_local=physical,
+            local_by_physical={value: key for key, value in physical.items()}, query="q", item_id="i",
+        )
+
+
+def test_original_index_receipt_fails_closed_on_id_embedding_or_config_drift_and_allows_graph_variation():
+    value, _tokens = _valid_worker_freeze(runner.ARM_ORIGINAL)
+    expected = _expected_identity_namespace()
+    runner.validate_original_index_build_receipt(value["original_index_build_receipt"], expected_namespace=expected)
+    for field, replacement in (("physical_id_sha256", "0" * 64), ("hnsw_configuration", {})):
+        corrupted = copy.deepcopy(value["original_index_build_receipt"]); corrupted[field] = replacement
+        with pytest.raises(ValueError, match="physical-ID|embedding|HNSW"):
+            runner.validate_original_index_build_receipt(corrupted, expected_namespace=expected)
+    repeats = [copy.deepcopy(value) for _ in range(runner.ORIGINAL_REPEATS)]
+    repeats[1]["original_index_build_receipt"]["hnsw_graph_files"][0]["sha256"] = "f" * 64
+    runner.validate_repeat_identity(runner.ARM_ORIGINAL, repeats)
+    repeats[1]["original_index_build_receipt"]["embedding_float32_sha256"] = "f" * 64
+    with pytest.raises(RuntimeError, match="index-build corpus/configuration"):
+        runner.validate_repeat_identity(runner.ARM_ORIGINAL, repeats)
+
+
+def test_original_identity_namespace_requires_exact_fixed_dialog_count():
+    with pytest.raises(RuntimeError, match="exactly 5882"):
+        runner.original_identity_namespace({"conversation": {"sessions": [{"dialogs": [{"opaque_dialog_id": "dialog_000000", "speaker": "s", "date": "d", "caption": "c", "text": "x"}]}]}})
+
+
+def test_direct_index_audit_never_loads_product_and_rejects_persisted_byte_mutation(monkeypatch, tmp_path):
+    expected = _expected_identity_namespace(); ids = [row["physical_id"] for row in expected["rows"]]
+    closed = []
+    schema = {"keys": {"#embedding": {"float_list": {"vector_index": {"config": {"space": "cosine", "hnsw": {"ef_construction": 100, "ef_search": 100, "max_neighbors": 16, "num_threads": 1, "batch_size": 2, "sync_threshold": 2, "resize_factor": 1.2}}}}}}}
+    database = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE collections (name TEXT, schema_str TEXT)")
+        connection.execute("INSERT INTO collections VALUES (?, ?)", (runner.v1.ORIGINAL_COLLECTION, json.dumps(schema)))
+        connection.execute("CREATE TABLE acquire_write (id INTEGER PRIMARY KEY, lock_status INTEGER NOT NULL)")
+        connection.execute("INSERT INTO acquire_write VALUES (10, 1)")
+    segment = tmp_path / "only-segment"; segment.mkdir()
+    for name in ("data_level0.bin", "header.bin", "length.bin", "link_lists.bin"):
+        (segment / name).write_bytes(name.encode("ascii"))
+    append_lock = [True]; mutate_file = [False]
+    class Collection:
+        def get(self, *, include):
+            assert include == ["embeddings"]
+            if append_lock[0]:
+                with sqlite3.connect(database) as connection:
+                    connection.execute("INSERT INTO acquire_write (lock_status) VALUES (1)")
+            if mutate_file[0]:
+                with (segment / "header.bin").open("ab") as handle: handle.write(b"!")
+            return {"ids": ids, "embeddings": [[0.0] * 384 for _ in ids]}
+    class Client:
+        def get_collection(self, name): assert name == runner.v1.ORIGINAL_COLLECTION; return Collection()
+        def close(self): closed.append(True)
+    monkeypatch.setitem(sys.modules, "chromadb", SimpleNamespace(PersistentClient=lambda **_: Client()))
+    monkeypatch.setattr(runner.v1, "load_original_product", lambda *_: pytest.fail("direct audit must not load product"))
+    receipt = runner.original_index_build_receipt(palace_path=tmp_path, expected_namespace=expected)
+    assert closed == [True] and receipt["sqlite_operational_delta"]["validation"] == "passed"
+    mutate_file[0] = True
+    with pytest.raises(RuntimeError, match="mutated persisted"):
+        runner.original_index_build_receipt(palace_path=tmp_path, expected_namespace=expected)
+
+
+def test_coordinator_index_audit_does_not_call_original_loader(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner.v1, "load_original_product", lambda *_: pytest.fail("coordinator audit must not load original product"))
+    sentinel = {"receipt": "direct"}
+    monkeypatch.setattr(runner, "original_index_build_receipt", lambda **_: sentinel)
+    assert runner.coordinator_original_index_build_receipt(palace_path=tmp_path, expected_namespace=_expected_identity_namespace()) == sentinel
+
+
+def test_original_worker_keeps_one_loader_and_cold_reopen_barrier_in_same_process():
+    source = inspect.getsource(runner.worker_run)
+    assert source.count("v1.load_original_product(original_root)") == 1
+    assert source.index("cold_reopen_cleanup = v1.reset_original_product_backends(original_palace)") < source.index("original_product_query_namespaced(")
+
+
 def test_p5_validation_fails_on_any_freeze_drift():
     row = _row(1)
     runner.validate_p5_against_aerp4({_token(1): row["p5_top10"]}, [row])
@@ -370,6 +501,7 @@ def test_strict_worker_parser_binds_projection_trace_policy_and_product_config(a
         projection_content_sha256="c" * 64,
         item_tokens=tokens,
         model_sha256="m" * 64,
+        identity_namespace=_expected_identity_namespace() if arm == runner.ARM_ORIGINAL else None,
     )
     assert parsed["arm"] == arm
     corrupted = copy.deepcopy(value)
@@ -390,6 +522,7 @@ def test_strict_worker_parser_binds_projection_trace_policy_and_product_config(a
             projection_content_sha256="c" * 64,
             item_tokens=tokens,
             model_sha256="m" * 64,
+            identity_namespace=_expected_identity_namespace() if arm == runner.ARM_ORIGINAL else None,
         )
 
 
@@ -404,6 +537,7 @@ def test_strict_worker_parser_recomputes_trace_and_projection_content_receipts()
             projection_content_sha256="c" * 64,
             item_tokens=tokens,
             model_sha256="m" * 64,
+            identity_namespace=None,
         )
 
 
@@ -434,6 +568,7 @@ def test_strict_worker_parser_binds_dialog_evidence_trace_and_p5_final_receipt(m
             projection_content_sha256="c" * 64,
             item_tokens=tokens,
             model_sha256="m" * 64,
+            identity_namespace=None,
         )
     value, tokens = _valid_worker_freeze(runner.ARM_P5)
     with pytest.raises(ValueError, match="identity/projection"):
@@ -444,6 +579,7 @@ def test_strict_worker_parser_binds_dialog_evidence_trace_and_p5_final_receipt(m
             projection_content_sha256="wrong",
             item_tokens=tokens,
             model_sha256="m" * 64,
+            identity_namespace=None,
         )
 
 
@@ -479,7 +615,8 @@ def test_worker_config_is_the_only_subprocess_entry_and_carries_no_scorer(tmp_pa
 def test_score_is_impossible_before_all_repeats_and_is_cluster_paired():
     with pytest.raises(RuntimeError, match="all arms"):
         runner.score_after_all_freezes(scorer=SimpleNamespace(scorer_items={}), freezes={})
-    assert runner.paired_cluster_bootstrap([{"conversation_id": "a", "recall": {"x": 1., "y": 0.}}], current="x", original="y", estimand="conversation_macro")["point_estimate"] == 1
+    rows = [{"conversation_id": "a", "recall": {"x": 1., "y": 0.}, "original_replicate_recall": [0.] * 5}]
+    assert runner.paired_cluster_bootstrap(rows, current="x", original="y", estimand="conversation_macro")["point_estimate"] == 1
 
 
 def test_score_reads_dialog_top10_and_keeps_unresolved_in_denominator():
@@ -489,11 +626,24 @@ def test_score_reads_dialog_top10_and_keeps_unresolved_in_denominator():
         token = _token(index); dialogs = [f"d{index}-{rank}" for rank in range(10)]
         items[token] = SimpleNamespace(opaque_conversation_id="c", category=5, official_exact=SimpleNamespace(resolved_opaque_dialog_ids=(dialogs[0],), source_evidence_item_count=2, unresolved_evidence_item_count=1))
         for arm in runner.ALL_ARMS: rankings[arm][token] = {"dialog_top10": dialogs}
-    freezes = {arm: [{"projection_sha256": "same", "items": rankings[arm]}, {"projection_sha256": "same", "items": rankings[arm]}] for arm in runner.ALL_ARMS}
+    freezes = {arm: [{"projection_sha256": "same", "items": rankings[arm]} for _ in range(runner.REPEATS_BY_ARM[arm])] for arm in runner.ALL_ARMS}
+    varied_original = copy.deepcopy(rankings[runner.ARM_ORIGINAL])
+    first_token = _token(0)
+    varied_original[first_token]["dialog_top10"] = [f"different-{rank}" for rank in range(10)]
+    freezes[runner.ARM_ORIGINAL][1] = {
+        "projection_sha256": "different-original-ranking",
+        "items": varied_original,
+    }
     aggregate, rows = runner.score_after_all_freezes(scorer=SimpleNamespace(scorer_items=items), freezes=freezes)
     assert aggregate["question_macro"][runner.ARM_P5] == .5 and sum(row["unresolved"] for row in rows) == 1982
+    assert rows[0]["original_replicate_recall"][0] == .5
+    assert rows[0]["original_replicate_recall"][1] == 0.0
     summary = runner.summarize_scored_rows(rows)
-    for arm in runner.ALL_ARMS:
+    replicate_report = runner.original_replicate_reports(rows)
+    assert replicate_report["replicate_count"] == runner.ORIGINAL_REPEATS
+    assert len(replicate_report["replicates"]) == runner.ORIGINAL_REPEATS
+    assert replicate_report["variability"]["overall"]["question_macro_recall_at_10"]["range"] > 0.0
+    for arm in (runner.ARM_P5, runner.ARM_SIX_VIEW):
         metrics = summary["arms"][arm]
         assert metrics["question_macro_recall_at_10"] == .5
         assert metrics["conversation_macro_recall_at_10"] == .5
@@ -549,23 +699,29 @@ def test_coordinator_vertical_slice_launches_six_then_custodian_then_nonreplace_
     monkeypatch.setattr(runner, "scorer_implementation_receipt", lambda *_: {"scorer": "pinned"})
     monkeypatch.setattr(runner.v1, "file_tree_receipt", lambda *_: {"model": "same"})
     monkeypatch.setattr(runner, "build_public_projection", lambda **_: _compact_projection(tokens))
+    monkeypatch.setattr(runner, "original_identity_namespace", lambda *_: {"expected_unique_count": 5882, "mapping_sha256": "n" * 64})
+    monkeypatch.setattr(runner, "_sqlite_embedding_count", lambda *_: 5882)
+    monkeypatch.setattr(runner, "coordinator_original_index_build_receipt", lambda **_: {"receipt": "coordinator"})
     monkeypatch.setattr(runner, "validate_p5_against_aerp4", lambda *_: None)
     def fake_parse(_value, *, arm, **_kwargs):
         return {"projection_sha256": "repeat", "onnx_providers": ["CPUExecutionProvider"], "model_file_tree_sha256": manifest["run"]["model"]["file_tree_sha256"], "dialog_ranking_sha256": "dialog", "evidence_ranking_sha256": "evidence", "policy_receipts_sha256": "policy" if arm != runner.ARM_ORIGINAL else "unsupported", "trace_receipt": {"trace_sha256": "trace" if arm != runner.ARM_ORIGINAL else "unsupported"}, "items": {token: {"evidence_top10": []} for token in tokens}}
     monkeypatch.setattr(runner, "parse_worker_freeze", fake_parse)
     def fake_supervise(_command, *, sidecar, freeze_path):
-        timeline.append("worker"); freeze_path.write_text("{}", encoding="utf-8"); sidecar.write_text("{}", encoding="utf-8"); return {"ok": True}
+        timeline.append("worker")
+        worker_config = json.loads(Path(_command[-1]).read_text(encoding="utf-8"))
+        payload = {"original_index_build_receipt": {"receipt": "coordinator"}} if worker_config["arm"] == runner.ARM_ORIGINAL else {}
+        freeze_path.write_text(json.dumps(payload), encoding="utf-8"); sidecar.write_text("{}", encoding="utf-8"); return {"ok": True}
     monkeypatch.setattr(runner, "supervise_worker", fake_supervise)
     def fake_run(command, **_kwargs):
-        assert len(timeline) == 6; timeline.append("scorer")
+        assert len(timeline) == 9; timeline.append("scorer")
         config = json.loads((work / "custodian-config.json").read_text())
-        (work / "custodian-score.json").write_text(json.dumps({"scorer_implementation_receipt": config["scorer_implementation_receipt"], "input_receipts": {"dataset_sha256": config["expected_dataset_sha256"], "projection_sha256": config["expected_projection_sha256"], "projection_content_sha256": config["expected_projection_content_sha256"], "freeze_sha256": config["expected_freeze_sha256"], "scientific_gates_sha256": config["expected_scientific_gates_sha256"], "manifest_sha256": config["manifest_sha256"]}}), encoding="utf-8")
+        (work / "custodian-score.json").write_text(json.dumps({"scorer_implementation_receipt": config["scorer_implementation_receipt"], "input_receipts": {"dataset_sha256": config["expected_dataset_sha256"], "projection_sha256": config["expected_projection_sha256"], "projection_content_sha256": config["expected_projection_content_sha256"], "freeze_sha256": config["expected_freeze_sha256"], "original_index_receipts_sha256": config["expected_original_index_receipts_sha256"], "scientific_gates_sha256": config["expected_scientific_gates_sha256"], "manifest_sha256": config["manifest_sha256"]}}), encoding="utf-8")
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
     train_json = {"partition": "train", "status": "complete", "items": []}; dev_json = {"partition": "dev", "status": "complete", "items": []}
     pins = [SimpleNamespace(load=lambda: {}), SimpleNamespace(load=lambda: {}), SimpleNamespace(load=lambda: train_json), SimpleNamespace(load=lambda: dev_json)]
     result = runner.coordinator_run(dataset=dataset, original_root=original, model_dir=model, study=pins[0], custody=pins[1], train=pins[2], dev=pins[3], work=work, output=output, manifest=manifest)
-    assert timeline == ["worker"] * 6 + ["scorer"] and output.is_file() and result["score"]["input_receipts"] == json.loads((work / "custodian-score.json").read_text())["input_receipts"]
+    assert timeline == ["worker"] * 9 + ["scorer"] and output.is_file() and result["score"]["input_receipts"] == json.loads((work / "custodian-score.json").read_text())["input_receipts"]
 
 
 def test_environment_gate_rejects_wrong_model_or_dirty_original():

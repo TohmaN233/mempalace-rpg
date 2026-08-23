@@ -152,6 +152,35 @@ The public, non-blind AERP-5 v2 product gate requires all of:
 - authorization, trace replay, exact-span, performance, and failure-injection
   guardrails pass.
 
+### AERP-5 v2 original-product identity amendment
+
+The label-free failure receipt `d90b622e91b27511d69ca3d9fb77214907d7d3e1aa3774a103b3ff1a4a58b2cf`
+superseded an initial HNSW-only explanation.  The original LoCoMo adapter had
+written ten conversations' locally restarted `dialog_...` IDs into one Chroma
+collection, so later upserts overwrote earlier physical records.  The amended
+protocol namespaces physical IDs by conversation, asserts the full 5,882-record
+collection, cold-reopens it before querying, and maps every returned physical ID
+back to its local dialog ID before custody/scoring.  Labels remain sealed.
+
+The original public batch-upsert seam still has observed index-build variation
+after that repair.  It is therefore measured as five fresh cold-reopen batch
+replicates; each current arm remains two byte-identical repeats.  The primary
+original value is the per-query arithmetic mean over those five replicates, and
+P5-vs-original CIs use a deterministic hierarchical bootstrap over conversation
+clusters and original index-build replicates (seed 20260822; 5,000 resamples).
+Every original replicate and its overall, hard Categories 1/2, Category 5, and
+per-category variability are reported separately.  This is a public non-blind
+engineering amendment, never a confirmation claim.
+
+All three AERP-5 v2 arms use a matched lifecycle: ingest all ten conversations,
+close and cold-reopen their backend, then query all 1,982 items.  Current-arm
+latency ends on `current_product_rank` return, before benchmark trace/receipt
+construction; original-arm latency ends after the namespaced public-search
+adapter has validated and mapped the returned physical IDs.  Each original
+replicate also carries a coordinator-remeasured physical-ID, float32 embedding,
+SQLite HNSW-configuration, and four-file HNSW graph receipt before custody can
+unseal labels.
+
 Each untouched confirmation dataset independently requires all of:
 
 - versus the exact pinned original public product, overall point improvement is
