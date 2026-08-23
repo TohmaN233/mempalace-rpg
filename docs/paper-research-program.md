@@ -218,6 +218,24 @@ other.
   conversation-level diagnostic.  Official answer accuracy is outside Track A
   unless an answer model, prompt, category-specific judge, and their source and
   model digests are frozen before the run.
+  Before the one permitted formal execution, a fail-closed coordinator binds
+  the candidate `READY`/raw/canonical receipts, clean code/model/source
+  identity, all arms and serializers, five isolated original builds,
+  byte-identical P5 repeat, bootstrap/gates, and pre-frozen resource limits.
+  Candidate workers receive only a label-free allowlist.  A separate custodian
+  may open labels only after ranking/resource receipts are cross-bound by a
+  release authorization; final publication is exclusive/non-replacing and an
+  exact-byte retry is the only idempotent retry.  This synthetic-tested gate is
+  explicit about P5 accounting: its primary and repeat executions each require
+  a separately digested resource receipt; the release HMAC collectively binds
+  both receipts, while the current-worker receipt binds their identical
+  artifact digest and exactly two P5 executions.
+  The gate is protocol-only: it contains no approved formal subprocess runner and therefore
+  cannot authorize or execute a ConvoMem run.  It is not a completed ConvoMem
+  result.  Its publication helper is a synthetic-tested filesystem scaffold:
+  it assumes the output directory is controlled by the coordinator between its
+  exclusive-link and durability operations; hostile concurrent filesystem
+  mutation requires a platform-specific publication primitive before formal use.
 - MemBench is the second retrieval confirmation dataset.  Split by `tid` because
   a `tid` recurs across task files.  `target_step_id`, answers, choices, and
   ground truth belong only to the label custodian.  Items with more than ten
