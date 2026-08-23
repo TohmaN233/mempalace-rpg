@@ -21,6 +21,30 @@ def _row(number: int) -> dict:
     return {"item_token": _token(number), "raw_top10": [f"r{number}-{i}" for i in range(10)], "p5_top10": [f"p{number}-{i}" for i in range(10)]}
 
 
+def _compact_projection(tokens: tuple[str, ...]) -> dict:
+    conversations = [
+        {
+            "conversation_id": f"conversation_{index:06d}",
+            "conversation_token": _token(10_000 + index),
+            "sessions": [{"opaque_session_id": f"s-{index}", "dialogs": []}],
+        }
+        for index in range(10)
+    ]
+    return {
+        "schema": runner.PROJECTION_SCHEMA,
+        "conversations": conversations,
+        "items": [
+            {
+                "item_token": token,
+                "item_id": f"item-{index}",
+                "conversation_id": conversations[index % len(conversations)]["conversation_id"],
+                "query": f"q-{index}",
+            }
+            for index, token in enumerate(tokens)
+        ],
+    }
+
+
 def _valid_worker_freeze(arm: str) -> tuple[dict, tuple[str, ...]]:
     tokens = tuple(_token(index) for index in range(1982))
     items = {
@@ -275,12 +299,58 @@ def test_pinned_json_uses_file_bytes_digest_not_reserialized_json(tmp_path):
 
 
 def test_projection_is_exact_and_label_free():
-    allowed = [_token(i) for i in range(2)]
-    rows = [{"item_token": token, "item_id": f"i{index}", "conversation_id": "c", "conversation_token": "c", "query": "q", "sessions": []} for index, token in enumerate(allowed)]
-    assert [row["item_token"] for row in runner.project_public_items(public_items=rows, allowed_item_tokens=allowed)] == allowed
+    allowed = [_token(i) for i in range(1982)]
+    rows = [
+        {
+            "item_token": token,
+            "item_id": f"i{index}",
+            "conversation_id": f"c{index % 10}",
+            "conversation_token": _token(5_000 + index % 10),
+            "query": "q",
+            "sessions": [{"opaque_session_id": f"s-{index % 10}", "dialogs": [{"id": "d", "text": "x" * 20_000}]}],
+        }
+        for index, token in enumerate(allowed)
+    ]
+    projection = runner.project_public_items(public_items=rows, allowed_item_tokens=allowed)
+    items, conversations = runner._validate_public_projection(projection)
+    assert [row["item_token"] for row in items] == allowed
+    assert len(conversations) == 10
+    assert all("sessions" not in row and set(row) == {"item_token", "item_id", "conversation_id", "query"} for row in items)
+    # A corpus duplicated per item would be about 200MB here; the projection stores ten copies.
+    assert len(runner._canonical(projection)) < len(runner._canonical(rows)) // 50
     with pytest.raises(ValueError, match="exactly"):
         runner.project_public_items(public_items=rows[:1], allowed_item_tokens=allowed)
     assert "scorer" not in inspect.signature(runner.worker_run).parameters
+
+
+def test_projection_rejects_repeated_conversation_drift_and_forbidden_nested_fields():
+    tokens = tuple(_token(index) for index in range(1982))
+    projection = _compact_projection(tokens)
+    first, second = projection["items"][:2]
+    public_rows = []
+    for item in projection["items"]:
+        conversation = next(row for row in projection["conversations"] if row["conversation_id"] == item["conversation_id"])
+        public_rows.append({**item, "conversation_token": conversation["conversation_token"], "sessions": copy.deepcopy(conversation["sessions"])})
+    public_rows[1]["conversation_id"] = first["conversation_id"]
+    public_rows[1]["conversation_token"] = next(row for row in projection["conversations"] if row["conversation_id"] == first["conversation_id"])["conversation_token"]
+    public_rows[1]["sessions"] = [{"opaque_session_id": "drift", "dialogs": []}]
+    with pytest.raises(ValueError, match="diverged"):
+        runner.project_public_items(public_items=public_rows, allowed_item_tokens=tokens)
+    projection["conversations"][0]["sessions"][0]["scorer_hint"] = "forbidden"
+    with pytest.raises(ValueError, match="label/scorer"):
+        runner._validate_public_projection(projection)
+
+
+def test_projection_parser_rejects_item_corpus_duplication_or_membership_drift():
+    tokens = tuple(_token(index) for index in range(1982))
+    projection = _compact_projection(tokens)
+    projection["items"][0]["sessions"] = []
+    with pytest.raises(ValueError, match="only reference"):
+        runner._validate_public_projection(projection)
+    projection = _compact_projection(tokens)
+    projection["items"][1]["item_token"] = projection["items"][0]["item_token"]
+    with pytest.raises(ValueError, match="membership/query"):
+        runner._validate_public_projection(projection)
 
 
 def test_p5_validation_fails_on_any_freeze_drift():
@@ -478,7 +548,7 @@ def test_coordinator_vertical_slice_launches_six_then_custodian_then_nonreplace_
     monkeypatch.setattr(runner, "validate_environment_receipt", lambda *_: None)
     monkeypatch.setattr(runner, "scorer_implementation_receipt", lambda *_: {"scorer": "pinned"})
     monkeypatch.setattr(runner.v1, "file_tree_receipt", lambda *_: {"model": "same"})
-    monkeypatch.setattr(runner, "build_public_projection", lambda **_: [{"item_token": token} for token in tokens])
+    monkeypatch.setattr(runner, "build_public_projection", lambda **_: _compact_projection(tokens))
     monkeypatch.setattr(runner, "validate_p5_against_aerp4", lambda *_: None)
     def fake_parse(_value, *, arm, **_kwargs):
         return {"projection_sha256": "repeat", "onnx_providers": ["CPUExecutionProvider"], "model_file_tree_sha256": manifest["run"]["model"]["file_tree_sha256"], "dialog_ranking_sha256": "dialog", "evidence_ranking_sha256": "evidence", "policy_receipts_sha256": "policy" if arm != runner.ARM_ORIGINAL else "unsupported", "trace_receipt": {"trace_sha256": "trace" if arm != runner.ARM_ORIGINAL else "unsupported"}, "items": {token: {"evidence_top10": []} for token in tokens}}

@@ -56,6 +56,7 @@ ARM_ORIGINAL = "original_public_product_minilm"
 ARM_P5 = "current_fixed_p5_product"
 ARM_SIX_VIEW = "current_fixed_six_view_product_secondary"
 ALL_ARMS = (ARM_ORIGINAL, ARM_P5, ARM_SIX_VIEW)
+PROJECTION_SCHEMA = SCHEMA + "-projection-v2"
 # This asserts implementation availability, never experimental completion.
 END_TO_END_PRODUCT_WORKER_IMPLEMENTED = True
 
@@ -199,30 +200,111 @@ def validate_aerp4_membership(
     return {"item_tokens": tuple(sorted(tokens)), "excluded_item_tokens": tuple(sorted(excluded)), "count": len(tokens)}
 
 
+def _reject_projection_label_or_scorer_fields(value: Any) -> None:
+    """Reject labels at the projection boundary, including nested metadata."""
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ValueError("public projection field names must be strings")
+            if "label" in key.casefold() or "scorer" in key.casefold():
+                raise ValueError("public projection contains forbidden label/scorer field")
+            _reject_projection_label_or_scorer_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_projection_label_or_scorer_fields(child)
+
+
+def _validate_public_projection(value: Any) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Return the exact item/conversation views of the canonical compact input.
+
+    The corpus is intentionally stored once per conversation.  This is both a
+    memory contract (workers must not retain 1,982 copies) and an audit
+    contract: each item contains only its question identity and a
+    ``conversation_id`` reference.
+    """
+    _reject_projection_label_or_scorer_fields(value)
+    if not isinstance(value, Mapping) or set(value) != {"schema", "conversations", "items"}:
+        raise ValueError("public projection schema is malformed")
+    if value.get("schema") != PROJECTION_SCHEMA:
+        raise ValueError("public projection schema version drifted")
+    conversations_raw, items_raw = value.get("conversations"), value.get("items")
+    if not isinstance(conversations_raw, list) or len(conversations_raw) != 10 or not isinstance(items_raw, list) or len(items_raw) != 1982:
+        raise ValueError("public projection must contain exact 10 conversations and 1,982 items")
+    conversations: dict[str, dict[str, Any]] = {}
+    for conversation in conversations_raw:
+        if not isinstance(conversation, Mapping) or set(conversation) != {"conversation_id", "conversation_token", "sessions"}:
+            raise ValueError("public projection conversation is malformed")
+        conversation_id = conversation.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ValueError("public projection conversation id is malformed")
+        _token(conversation.get("conversation_token"), "public conversation token")
+        if not isinstance(conversation.get("sessions"), list):
+            raise ValueError("public projection conversation sessions are malformed")
+        if conversation_id in conversations:
+            raise ValueError("public projection has duplicate conversation corpus")
+        conversations[conversation_id] = dict(conversation)
+    items: list[dict[str, Any]] = []
+    tokens: set[str] = set(); item_ids: set[str] = set()
+    for item in items_raw:
+        if not isinstance(item, Mapping) or set(item) != {"item_token", "item_id", "conversation_id", "query"}:
+            raise ValueError("public projection item must only reference conversation_id")
+        token = _token(item.get("item_token"), "public item token")
+        item_id, conversation_id, query = item.get("item_id"), item.get("conversation_id"), item.get("query")
+        if token in tokens or not isinstance(item_id, str) or not item_id or item_id in item_ids or not isinstance(conversation_id, str) or conversation_id not in conversations or not isinstance(query, str):
+            raise ValueError("public projection item membership/query is malformed")
+        tokens.add(token); item_ids.add(item_id)
+        items.append(dict(item))
+    if len(tokens) != 1982:
+        raise ValueError("public projection item tokens are not exact 1,982")
+    if items != sorted(items, key=lambda row: row["item_token"]) or list(conversations) != sorted(conversations):
+        raise ValueError("public projection ordering is not canonical")
+    return items, conversations
+
+
 def project_public_items(
     *, public_items: Iterable[Mapping[str, Any]], allowed_item_tokens: Iterable[str]
-) -> list[dict[str, Any]]:
-    """Project official public inputs by opaque AERP4 item token only.
+) -> dict[str, Any]:
+    """Normalize official public inputs into a one-corpus-per-conversation projection.
 
-    Callers must supply no scorer object or label payload.  The projection is
-    intentionally strict so a public replay cannot silently expand to 1,986.
+    Every repeated source copy of a conversation must have byte-identical
+    sanitized sessions and the same opaque conversation token.  The resulting
+    item rows deliberately do not contain corpus/session fields.
     """
     allowed = set(allowed_item_tokens)
     projected: list[dict[str, Any]] = []
+    conversations: dict[str, dict[str, Any]] = {}
     for source in public_items:
+        _reject_projection_label_or_scorer_fields(source)
         token = _token(source.get("item_token"), "public item token")
+        fields = {key: source.get(key) for key in ("item_token", "item_id", "conversation_id", "conversation_token", "query", "sessions")}
+        if not isinstance(fields["query"], str) or not isinstance(fields["sessions"], list) or not isinstance(fields["item_id"], str) or not fields["item_id"] or not isinstance(fields["conversation_id"], str) or not fields["conversation_id"]:
+            raise ValueError("public item lacks query/session projection")
+        _token(fields["conversation_token"], "public conversation token")
+        conversation = {
+            "conversation_id": fields["conversation_id"],
+            "conversation_token": fields["conversation_token"],
+            "sessions": fields["sessions"],
+        }
+        prior = conversations.get(fields["conversation_id"])
+        if prior is None:
+            conversations[fields["conversation_id"]] = conversation
+        elif canonical_sha256(prior) != canonical_sha256(conversation):
+            raise ValueError("repeated public conversation sessions/token diverged")
         if token not in allowed:
             continue
-        fields = {key: source.get(key) for key in ("item_token", "item_id", "conversation_id", "conversation_token", "query", "sessions")}
-        if not isinstance(fields["query"], str) or not isinstance(fields["sessions"], list) or not isinstance(fields["item_id"], str) or not isinstance(fields["conversation_id"], str):
-            raise ValueError("public item lacks query/session projection")
-        projected.append(fields)
+        projected.append({key: fields[key] for key in ("item_token", "item_id", "conversation_id", "query")})
     if len(projected) != len(allowed) or {row["item_token"] for row in projected} != allowed:
         raise ValueError("official bundle projection does not exactly match AERP4 membership")
-    return sorted(projected, key=lambda row: row["item_token"])
+    normalized = {
+        "schema": PROJECTION_SCHEMA,
+        "conversations": [conversations[key] for key in sorted(conversations)],
+        "items": sorted(projected, key=lambda row: row["item_token"]),
+    }
+    _validate_public_projection(normalized)
+    return normalized
 
 
-def build_public_projection(*, dataset: Path, original_root: Path, allowed_item_tokens: Iterable[str]) -> list[dict[str, Any]]:
+def build_public_projection(*, dataset: Path, original_root: Path, allowed_item_tokens: Iterable[str]) -> dict[str, Any]:
     """Build the sole worker input from official query/session bytes, no scorer."""
     _palace, _searcher, protocol, _state = v1.load_original_product(original_root)
     loaded = protocol.load_official_locomo10(dataset)
@@ -233,8 +315,7 @@ def build_public_projection(*, dataset: Path, original_root: Path, allowed_item_
         for qa in sample["qa"]:
             item_id = f"item_{ordinal:06d}"; ordinal += 1
             token = a4paired._token("aerp4:item", item_id)
-            if token in allowed:
-                result.append({"item_token": token, "item_id": item_id, "conversation_id": conversation_id, "conversation_token": a4paired._token("aerp4:group", conversation_id), "query": qa["question"], "sessions": sessions})
+            result.append({"item_token": token, "item_id": item_id, "conversation_id": conversation_id, "conversation_token": a4paired._token("aerp4:group", conversation_id), "query": qa["question"], "sessions": sessions})
     if ordinal != 1986:
         raise ValueError("official LoCoMo source denominator drifted")
     return project_public_items(public_items=result, allowed_item_tokens=allowed)
@@ -344,11 +425,10 @@ def worker_run(config: Mapping[str, Any]) -> dict[str, Any]:
     arm = config.get("arm"); projection_path = Path(str(config.get("projection"))); output = Path(str(config.get("output"))); backend = Path(str(config.get("temporary_backend")))
     if arm not in ALL_ARMS or output.exists() or backend.exists(): raise ValueError("invalid worker arm/output/fresh backend")
     projection = json.loads(projection_path.read_text(encoding="utf-8"))
-    if not isinstance(projection, list) or len(projection) != 1982: raise ValueError("worker projection must contain exact 1,982 public items")
-    if any("label" in key.casefold() or "scorer" in key.casefold() for row in projection for key in row): raise ValueError("worker projection contains forbidden label/scorer field")
+    projection_items, projection_conversations = _validate_public_projection(projection)
     backend.mkdir(parents=True); model = Path(str(config["model_dir"])); original_root = Path(str(config["original_root"]));
     started = time.monotonic(); by_conversation: dict[str, list[dict[str, Any]]] = {}
-    for row in projection: by_conversation.setdefault(str(row["conversation_id"]), []).append(dict(row))
+    for row in projection_items: by_conversation.setdefault(str(row["conversation_id"]), []).append(dict(row))
     rankings: dict[str, dict[str, list[str]]] = {}; traces: dict[str, dict[str, Any]] = {}; policies: dict[str, dict[str, Any]] = {}; query_ns: list[int] = []; ingest_ns: list[int] = []
     with RssMonitor(os.getpid()) as monitor, v1.pinned_original_environment():
         palace, searcher, _protocol, _state = v1.load_original_product(original_root); encoder = v1.native_minilm_adapter(model)
@@ -357,7 +437,7 @@ def worker_run(config: Mapping[str, Any]) -> dict[str, Any]:
         ranker = None if arm == ARM_ORIGINAL else SixViewRanker(encoder, diagnostic_ledger=True, routing_policy=FixedP5Policy() if arm == ARM_P5 else FixedSixViewPolicy())
         with RpgMemoryKernel(db_path=str(db_path), retrieval_ranker=ranker) if ranker else _NullContext() as kernel:
             for conversation_id, rows in sorted(by_conversation.items()):
-                payload = {"sessions": rows[0]["sessions"]}; dialogs = v1.raw_dialogs(payload)
+                payload = {"sessions": projection_conversations[conversation_id]["sessions"]}; dialogs = v1.raw_dialogs(payload)
                 start = time.perf_counter_ns()
                 if arm == ARM_ORIGINAL: v1.original_product_ingest(palace=palace, palace_path=original_palace, conversation_id=conversation_id, dialogs=dialogs)
                 else: event_map, _ = aerp2.seed_sanitized_conversation(kernel, payload, conversation_id=conversation_id)
@@ -690,7 +770,8 @@ def coordinator_run(*, dataset: Path, original_root: Path, model_dir: Path, stud
     projection_path = work / "projection.json"; projection_path.write_bytes(_canonical(projection))
     projection_file_sha256 = sha256_file(projection_path)
     projection_content_sha256 = canonical_sha256(projection)
-    projection_tokens = tuple(row["item_token"] for row in projection)
+    projection_tokens, _projection_conversations = _validate_public_projection(projection)
+    projection_tokens = tuple(row["item_token"] for row in projection_tokens)
     outputs: dict[str, list[dict[str, Any]]] = {arm: [] for arm in ALL_ARMS}
     try:
         for arm in ALL_ARMS:
@@ -839,11 +920,12 @@ def custodian_score_run(config: Mapping[str, Any]) -> dict[str, Any]:
     if scorer_receipt != config.get("scorer_implementation_receipt"): raise RuntimeError("scorer implementation receipt drift before scoring")
     if sha256_file(projection_path) != config.get("expected_projection_sha256") or sha256_file(dataset_path) != config.get("expected_dataset_sha256"): raise RuntimeError("custodian input drift before scoring")
     projection = json.loads(projection_path.read_text(encoding="utf-8"))
-    if not isinstance(projection, list) or len(projection) != 1982 or not isinstance(freeze_paths, Mapping) or set(freeze_paths) != set(ALL_ARMS): raise ValueError("custodian input contract is malformed")
+    projection_items, _projection_conversations = _validate_public_projection(projection)
+    if not isinstance(freeze_paths, Mapping) or set(freeze_paths) != set(ALL_ARMS): raise ValueError("custodian input contract is malformed")
     projection_content_sha256 = canonical_sha256(projection)
     if projection_content_sha256 != config.get("expected_projection_content_sha256"):
         raise RuntimeError("custodian projection content drift before scoring")
-    projection_tokens = tuple(row["item_token"] for row in projection)
+    projection_tokens = tuple(row["item_token"] for row in projection_items)
     freezes: dict[str, list[dict[str, Any]]] = {}
     for arm, paths in freeze_paths.items():
         if not isinstance(paths, list) or len(paths) != 2: raise ValueError("custodian requires two freezes per arm")
@@ -857,7 +939,7 @@ def custodian_score_run(config: Mapping[str, Any]) -> dict[str, Any]:
     _retrieval, scorer = protocol.prepare_hard_story_track(
         dataset, candidate_pool_size=TOP_K, require_official_counts=True
     )
-    item_to_token = {row["item_id"]: row["item_token"] for row in projection}
+    item_to_token = {row["item_id"]: row["item_token"] for row in projection_items}
     scorer_view = type("ScorerView", (), {"scorer_items": {item_to_token[key]: value for key, value in scorer.scorer_items.items() if key in item_to_token}})()
     aggregate, rows = score_after_all_freezes(scorer=scorer_view, freezes=freezes)
     if sum(row["unresolved"] for row in rows) != sum(scorer.scorer_items[key].official_exact.unresolved_evidence_item_count for key in item_to_token): raise RuntimeError("unresolved evidence disappeared from score ledger")

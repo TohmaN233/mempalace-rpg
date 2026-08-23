@@ -63,6 +63,17 @@ blind-180, 30k-event, SQLite/drawer failure-injection, and frozen resource
 threshold receipts are explicitly bound.  Any result remains `public_nonblind`
 and can never supply a confirmation claim.
 
+The first real execution of commit `9caacc6` failed the pre-registered 2 GiB
+RSS cap before any label scoring or formal report publication.  The observed
+worker/supervisor peaks were about 2.209/2.209 GB.  Diagnosis showed that the
+label-free transport repeated each conversation's sessions once per question,
+producing a 405,116,475-byte projection; the ranking phase itself stayed below
+the cap and receipt serialization crossed it.  The allowed follow-up is a
+representation-only normalization that stores each conversation corpus once,
+keeps the 1,982 query membership and frozen rankings unchanged, and retains the
+same 2 GiB threshold.  Raising the threshold or using labels during this repair
+is forbidden.
+
 ## Track A: retrieval
 
 ### Frozen method and comparators
