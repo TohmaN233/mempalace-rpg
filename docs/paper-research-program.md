@@ -170,6 +170,30 @@ other.
   by question or premixed context.  `message_evidences` belongs only to the
   label custodian.  Abstention items are a separate safety endpoint and do not
   enter positive-evidence R@10.
+  The AERP-7 prelabel slice is not a confirmation run and must not score: its
+  custodian publishes a normalized candidate projection with opaque HMAC IDs
+  plus a separately published custody bundle under a different filesystem
+  access boundary.  The candidate-ranking process receives only the candidate
+  bundle path; it must not receive or access the custody path or binding secret.
+  The custodian later receives both paths and the secret.  The custody bundle
+  records that evidence span mapping is unresolved/not attempted; it is the
+  only place where answers, evidence labels, directory-derived metadata, and
+  source locators may exist.
+  Before any labels are unsealed, AERP-7 must also freeze exact-only span
+  mapping, a strong raw BM25+dense comparator, static-P5 ranking outputs, and a
+  persona/context-stratified paired bootstrap.  Positive evidence retrieval and
+  abstention are separate endpoints.  Static P5 has no abstain decision, so the
+  latter may report only threshold-free confidence separability unless a
+  source-disjoint burned calibration set and decision rule are frozen first.
+  The streaming SQLite index must use the explicitly approved staging volume.
+  On Windows, launch the isolated benchmark process after setting both
+  `$env:TMP=$staging` and `$env:TEMP=$staging`, then pass
+  `--staging-root $staging`; on Linux launch it with
+  `SQLITE_TMPDIR=$staging` and the same flag.  The builder is supported only on
+  Windows or Linux with `renameat2(RENAME_NOREPLACE)` and rejects other systems
+  before reading official inputs.  Content-digest bundle loaders remain
+  portable beyond those builder platforms.  The process verifies the OS temp
+  route and `PRAGMA temp_store=FILE` before reading official inputs.
 - MemBench is the second retrieval confirmation dataset.  Split by `tid` because
   a `tid` recurs across task files.  `target_step_id`, answers, choices, and
   ground truth belong only to the label custodian.  Items with more than ten
@@ -334,7 +358,9 @@ generator, the frozen AERP treatment must:
 The work is paper-ready only when the following receipts bind one immutable
 method checkpoint:
 
-1. a calibration `tau` freeze from burned, source-separated engineering data;
+1. an immutable static-P5 method freeze, strong-raw comparator, and label-blind
+   ranking receipts; any future operational abstention threshold must be frozen
+   separately from burned, source-separated engineering data;
 2. two separately passing retrieval confirmation datasets;
 3. a direct original-product comparison plus matched-encoder and equal-budget
    comparisons;
