@@ -249,6 +249,58 @@ class _LiveOriginalObserver:
         }
 
 
+class _SupervisorTreeObserver(RssMonitor):
+    """Supervisor-side sampled process-tree/RSS observation.
+
+    The worker cannot prove anything about descendants.  This observer runs in
+    the parent process for the complete child lifetime and records every
+    descendant PID seen by the sampler.  Polling is deliberately identified as
+    non-exhaustive: a missing/failed sample is never interpreted as zero
+    children, and an otherwise complete polling lifecycle is not accepted as
+    formal proof that a short-lived descendant never existed.
+    """
+
+    def __init__(self, root_pid: int) -> None:
+        super().__init__(root_pid)
+        self._descendant_pids: set[int] = set()
+        self._sample_count = 0
+
+    def _sample_once(self) -> None:
+        import psutil
+
+        try:
+            root = psutil.Process(self.root_pid)
+            descendants = list(root.children(recursive=True))
+        except psutil.NoSuchProcess:
+            return
+        self._sample_count += 1
+        self._descendant_pids.update(int(process.pid) for process in descendants)
+        total = 0
+        for process in [root, *descendants]:
+            try:
+                if process.is_running():
+                    total += int(process.memory_info().rss)
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+        self.peak_bytes = max(self.peak_bytes, total)
+        if total > self.cap_bytes:
+            self.error = f"RSS cap exceeded: {total} > {self.cap_bytes}"
+
+    def receipt(self) -> dict[str, Any]:
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        if self._sample_count < 2 or self.peak_bytes <= 0:
+            raise RuntimeError("supervisor process-tree observation incomplete")
+        return {
+            "observed_process_tree_peak_rss_bytes": int(self.peak_bytes),
+            "descendant_process_count": len(self._descendant_pids),
+            "descendant_processes_observed": bool(self._descendant_pids),
+            "descendant_observation_method": "psutil_polling_non_exhaustive",
+            "supervisor_observation_samples": self._sample_count,
+            "supervisor_observation_complete": True,
+        }
+
+
 def _assert_synthetic(config: Mapping[str, Any]) -> None:
     if not SYNTHETIC_EXECUTION_ONLY or config.get("synthetic_test_mode") is not True:
         raise CustodyError("executor_formal_execution_blocked")
@@ -280,7 +332,9 @@ def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDr
         original_product._validate_clock_receipt(telemetry.get("clock_receipt"))
     except original_product.OriginalProductError as exc:
         raise CustodyError("executor_original_resource_invalid") from exc
-    if telemetry.get("process_cpu_scope") != "worker_process_only" or telemetry.get("descendant_processes_observed") is not False:
+    if telemetry["clock_receipt"].get("timing_source") != "stdlib":
+        raise CustodyError("executor_original_clock_source_invalid")
+    if telemetry.get("process_cpu_scope") != "worker_process_only_excludes_descendants" or telemetry.get("descendant_observation") != "external_supervisor_zero_required":
         raise CustodyError("executor_original_resource_descendant_process_invalid")
     # The child cannot observe a durable process-tree RSS maximum without
     # authoring its own claim.  ``0`` is an explicit pre-supervisor sentinel;
@@ -316,16 +370,33 @@ def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDr
     )
 
 
-def finalize_original_resource(*, resource: Mapping[str, Any], supervisor: Mapping[str, Any]) -> dict[str, Any]:
+def finalize_original_resource(*, resource: Mapping[str, Any], supervisor: Mapping[str, Any], worker_pid: int) -> dict[str, Any]:
     """Bind a live original resource draft to the external RSS observation."""
     row = dict(resource)
     if row.get("arm_id") != "original_public_product" or row.get("peak_rss_bytes") != 0:
         raise CustodyError("executor_original_resource_finalize_precondition_invalid")
-    if not isinstance(supervisor, Mapping) or supervisor.get("descendant_processes_observed", False) is not False:
+    required_observation = {
+        "observed_process_tree_peak_rss_bytes",
+        "descendant_process_count",
+        "descendant_processes_observed",
+        "descendant_observation_method",
+        "supervisor_observation_samples",
+        "supervisor_observation_complete",
+    }
+    if not isinstance(supervisor, Mapping) or not required_observation <= set(supervisor):
+        raise CustodyError("executor_original_resource_descendant_observation_missing")
+    if isinstance(worker_pid, bool) or not isinstance(worker_pid, int) or worker_pid <= 0 or supervisor.get("pid") != worker_pid or supervisor.get("exit_code") != 0:
+        raise CustodyError("executor_original_resource_supervisor_binding_invalid")
+    if supervisor.get("descendant_processes_observed") is not False or supervisor.get("supervisor_observation_complete") is not True:
         raise CustodyError("executor_original_resource_descendant_process_invalid")
-    descendant_count = supervisor.get("descendant_process_count", 0)
+    if supervisor.get("descendant_observation_method") != "os_enforced_complete_process_group":
+        raise CustodyError("executor_original_resource_descendant_observation_insufficient")
+    descendant_count = supervisor["descendant_process_count"]
     if isinstance(descendant_count, bool) or not isinstance(descendant_count, int) or descendant_count != 0:
         raise CustodyError("executor_original_resource_descendant_process_invalid")
+    samples = supervisor.get("supervisor_observation_samples")
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 2:
+        raise CustodyError("executor_original_resource_descendant_observation_incomplete")
     observed = supervisor.get("observed_process_tree_peak_rss_bytes")
     if isinstance(observed, bool) or not isinstance(observed, int) or observed <= 0:
         raise CustodyError("executor_original_resource_supervisor_peak_invalid")
@@ -798,7 +869,7 @@ def _run_subprocess(command: Sequence[str], *, config: Mapping[str, Any], output
     # The blank cwd/environment remain defense in depth, not an OS ACL boundary.
     cwd = Path(tempfile.mkdtemp(prefix="aerp7-public-worker-cwd-"))
     process = subprocess.Popen(list(command), cwd=cwd, env=env, stdin=subprocess.PIPE)
-    with RssMonitor(process.pid) as monitor:
+    with _SupervisorTreeObserver(process.pid) as monitor:
         try:
             process.communicate(_bytes(config), timeout=timeout_seconds)
             code = process.returncode
@@ -814,12 +885,13 @@ def _run_subprocess(command: Sequence[str], *, config: Mapping[str, Any], output
             shutil.rmtree(cwd, ignore_errors=True)
     if code != 0:
         raise subprocess.CalledProcessError(code, list(command))
-    if not output.is_file() or monitor.peak_bytes <= 0:
+    observation = monitor.receipt()
+    if not output.is_file() or observation["observed_process_tree_peak_rss_bytes"] <= 0:
         raise RuntimeError("executor_worker_missing_output")
     packet = _load(output)
     if packet.get("process_id") != process.pid or packet.get("packet_sha256") != _digest({key: item for key, item in packet.items() if key != "packet_sha256"}):
         raise CustodyError("executor_worker_packet_identity_invalid")
-    return {"pid": process.pid, "exit_code": code, "command_sha256": _digest(list(command)), "environment_keys_sha256": _digest(sorted(env)), "cwd_sha256": _digest(str(cwd)), "observed_process_tree_peak_rss_bytes": monitor.peak_bytes, "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "packet_sha256": packet["packet_sha256"]}
+    return {"pid": process.pid, "exit_code": code, "command_sha256": _digest(list(command)), "environment_keys_sha256": _digest(sorted(env)), "cwd_sha256": _digest(str(cwd)), **observation, "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "packet_sha256": packet["packet_sha256"]}
 
 
 def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str, Any],
@@ -891,6 +963,7 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
                 "resource_receipt": finalize_original_resource(
                     resource=resource,
                     supervisor=supervisors[f"original-{number}"],
+                    worker_pid=packet["process_id"],
                 ),
             }
             rebound["packet_sha256"] = _digest({key: item for key, item in rebound.items() if key != "packet_sha256"})

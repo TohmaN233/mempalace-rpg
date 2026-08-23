@@ -54,7 +54,10 @@ PRIVATE_KEYS = frozenset({
 })
 SUPERVISOR_KEYS = frozenset({
     "pid", "exit_code", "command_sha256", "environment_keys_sha256", "cwd_sha256",
-    "observed_process_tree_peak_rss_bytes", "output_sha256", "packet_sha256",
+    "observed_process_tree_peak_rss_bytes", "descendant_process_count",
+    "descendant_processes_observed", "descendant_observation_method",
+    "supervisor_observation_samples",
+    "supervisor_observation_complete", "output_sha256", "packet_sha256",
 })
 EXPECTED_SUPERVISORS = frozenset({
     "current-raw", "current-p5_primary", "current-p5_repeat", "current-six",
@@ -212,6 +215,24 @@ def _validate_supervisors(value: Any) -> dict[str, Any]:
         for key in ("command_sha256", "environment_keys_sha256", "cwd_sha256", "output_sha256", "packet_sha256"):
             _hex(row[key], "custodian_supervisor_receipt_invalid")
         if isinstance(row["observed_process_tree_peak_rss_bytes"], bool) or not isinstance(row["observed_process_tree_peak_rss_bytes"], int) or row["observed_process_tree_peak_rss_bytes"] <= 0:
+            raise CustodyError("custodian_supervisor_receipt_invalid")
+        descendant_count = row["descendant_process_count"]
+        samples = row["supervisor_observation_samples"]
+        if (
+            isinstance(descendant_count, bool)
+            or not isinstance(descendant_count, int)
+            or descendant_count < 0
+            or not isinstance(row["descendant_processes_observed"], bool)
+            or row["descendant_processes_observed"] != (descendant_count > 0)
+            or row["descendant_observation_method"] not in {
+                "psutil_polling_non_exhaustive",
+                "os_enforced_complete_process_group",
+            }
+            or isinstance(samples, bool)
+            or not isinstance(samples, int)
+            or samples < 2
+            or row["supervisor_observation_complete"] is not True
+        ):
             raise CustodyError("custodian_supervisor_receipt_invalid")
     if len(pids) != len(rows):
         raise CustodyError("custodian_supervisor_pid_collision")

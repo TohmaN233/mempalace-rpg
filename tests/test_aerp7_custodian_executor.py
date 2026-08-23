@@ -179,6 +179,21 @@ def test_resealed_supervisor_tamper_is_rejected_by_public_freeze(tmp_path, monke
         custodian.validate_public_freeze(config)
 
 
+def test_inconsistent_descendant_observation_is_rejected_before_custody(tmp_path, monkeypatch):
+    config, _config_path, _private, _freeze = _public_run(tmp_path, monkeypatch)
+    freeze_path = Path(config["public_freeze_packet"])
+    packet = json.loads(freeze_path.read_text(encoding="utf-8"))
+    supervisor = packet["supervisors"]["original-0"]
+    supervisor["descendant_process_count"] = 0
+    supervisor["descendant_processes_observed"] = True
+    packet["packet_sha256"] = executor._digest({key: value for key, value in packet.items() if key != "packet_sha256"})
+    freeze_path.write_bytes(executor._bytes(packet))
+    config = dict(config)
+    config["freeze_packet_file_sha256"] = hashlib.sha256(freeze_path.read_bytes()).hexdigest()
+    with pytest.raises(CustodyError, match="custodian_supervisor_receipt_invalid"):
+        custodian.validate_public_freeze(config)
+
+
 def test_real_synthetic_bundle_scores_in_a_distinct_subprocess_and_is_idempotent(tmp_path, monkeypatch):
     config, config_path, private, freeze = _public_run(tmp_path, monkeypatch)
     launched = custodian.launch_custodian(public_config_path=config_path, private_payload=private)

@@ -116,17 +116,18 @@ def _clock_receipt() -> dict[str, Any]:
         "schema": CLOCK_RECEIPT_SCHEMA,
         "wall": one("perf_counter"),
         "process_cpu": one("process_time"),
-        "process_cpu_scope": "worker_process_only",
-        "descendant_processes_observed": False,
+        "timing_source": "stdlib",
+        "process_cpu_scope": "worker_process_only_excludes_descendants",
+        "descendant_observation": "external_supervisor_zero_required",
     }
 
 
 def _validate_clock_receipt(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != {
-        "schema", "wall", "process_cpu", "process_cpu_scope", "descendant_processes_observed"
+        "schema", "wall", "process_cpu", "timing_source", "process_cpu_scope", "descendant_observation"
     } or value.get("schema") != CLOCK_RECEIPT_SCHEMA:
         raise OriginalProductError("resource telemetry clock receipt is malformed")
-    if value.get("process_cpu_scope") != "worker_process_only" or value.get("descendant_processes_observed") is not False:
+    if value.get("timing_source") not in {"stdlib", "injected_test_clock"} or value.get("process_cpu_scope") != "worker_process_only_excludes_descendants" or value.get("descendant_observation") != "external_supervisor_zero_required":
         raise OriginalProductError("resource telemetry process CPU scope is invalid")
     for key, expected_name in (("wall", "perf_counter"), ("process_cpu", "process_time")):
         clock = value.get(key)
@@ -270,12 +271,12 @@ def _validate_worker_draft_telemetry(value: Any) -> dict[str, Any]:
     if not isinstance(value["formal_eligible"], bool) or not isinstance(value["live_receipt"], Mapping) or not isinstance(value["ledger"], list) or not isinstance(value["resources"], Mapping):
         raise OriginalProductError("worker draft telemetry schema is malformed")
     resources = value["resources"]
-    required_sidecars = {"query_measurements", "clock_receipt", "process_cpu_scope", "descendant_processes_observed"}
+    required_sidecars = {"query_measurements", "clock_receipt", "process_cpu_scope", "descendant_observation"}
     if not required_sidecars <= set(resources):
         raise OriginalProductError("worker draft telemetry sidecar schema is malformed")
     _validate_query_measurement_rows(resources["query_measurements"])
     _validate_clock_receipt(resources["clock_receipt"])
-    if resources["process_cpu_scope"] != "worker_process_only" or resources["descendant_processes_observed"] is not False:
+    if resources["process_cpu_scope"] != "worker_process_only_excludes_descendants" or resources["descendant_observation"] != "external_supervisor_zero_required":
         raise OriginalProductError("worker draft telemetry process CPU scope is invalid")
     return dict(value)
 
@@ -371,22 +372,40 @@ def ingest_corpus_once(*, palace: Any, palace_path: Path, corpus: Mapping[str, A
     ledger.append({"event": "upsert", "corpus_id": corpus_id, "physical_ids_sha256": _digest(ids), "count": len(ids)})
 
 
-def _row_for_query(*, item: Mapping[str, Any], corpus: Mapping[str, Any], physical_by_message: Mapping[str, str], searcher: Any, palace_path: Path, ledger: list[dict[str, Any]], latency_seconds: float) -> tuple[dict[str, Any], dict[str, Any]]:
+def _row_for_query(*, item: Mapping[str, Any], corpus: Mapping[str, Any], physical_by_message: Mapping[str, str], searcher: Any, palace_path: Path, ledger: list[dict[str, Any]], latency_seconds: float, wall_clock_ns: Callable[[], int] | None = None, cpu_clock_ns: Callable[[], int] | None = None, query_measurements: list[dict[str, Any]] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     corpus_id = _token(item.get("corpus_id"), "item corpus_id")
     if corpus_id != corpus.get("corpus_id"):
         raise OriginalProductError("query corpus binding mismatch")
     reverse = {physical: message for message, physical in physical_by_message.items()}
+    corpus_ids = list(reverse)
+    query_text = _token(item.get("query_text"), "query_text")
+    item_id = _token(item.get("item_id"), "item_id")
+    if (wall_clock_ns is None) != (cpu_clock_ns is None):
+        raise OriginalProductError("query timing clocks must be supplied as a pair")
     # Reuse the AERP5 public-product helper rather than re-implementing its
     # parameters or accepting an alternate direct Chroma path.  It calls only
     # ``searcher.search_memories(query, palace_path, room=..., n_results=10,
     # max_distance=0.0, candidate_strategy='vector', collection_name=...)``.
+    wall_started = wall_clock_ns() if wall_clock_ns is not None else None
+    cpu_started = cpu_clock_ns() if cpu_clock_ns is not None else None
     try:
         selected = v1.original_product_query(
             searcher=searcher, palace_path=palace_path, conversation_id=corpus_id,
-            corpus_ids=list(reverse), query=_token(item.get("query_text"), "query_text"), item_id=_token(item.get("item_id"), "item_id"),
+            corpus_ids=corpus_ids, query=query_text, item_id=item_id,
         )
     except Exception as exc:
         raise OriginalProductError("original public-product query failed") from exc
+    if wall_clock_ns is not None and cpu_clock_ns is not None:
+        wall_elapsed_ns = wall_clock_ns() - wall_started
+        cpu_elapsed_ns = cpu_clock_ns() - cpu_started
+        if query_measurements is not None:
+            query_measurements.append({
+                "item_id": item["item_id"],
+                "query_sha256": hashlib.sha256(item["query_text"].encode("utf-8")).hexdigest(),
+                "wall_ns": wall_elapsed_ns,
+                "cpu_ns": cpu_elapsed_ns,
+            })
+        latency_seconds = wall_elapsed_ns / 1_000_000_000
     if set(selected) - set(reverse):
         raise OriginalProductError("original searcher crossed the corpus physical universe")
     message_ids = [reverse[physical] for physical in selected]
@@ -532,13 +551,13 @@ def _validate_resource_telemetry(*, value: Mapping[str, Any], seams: OriginalPro
         raise OriginalProductError("resource observer lacks actual RSS/storage/native-embedding/provider measurement")
     for key in ("peak_rss_bytes", "storage_bytes"):
         _nonnegative_int(row[key], key)
-    required_sidecars = {"query_measurements", "clock_receipt", "process_cpu_scope", "descendant_processes_observed"}
+    required_sidecars = {"query_measurements", "clock_receipt", "process_cpu_scope", "descendant_observation"}
     if required_sidecars & set(row) and not required_sidecars <= set(row):
         raise OriginalProductError("resource telemetry sidecar schema is malformed")
     if required_sidecars <= set(row):
         _validate_query_measurement_rows(row["query_measurements"])
         _validate_clock_receipt(row["clock_receipt"])
-        if row["process_cpu_scope"] != "worker_process_only" or row["descendant_processes_observed"] is not False:
+        if row["process_cpu_scope"] != "worker_process_only_excludes_descendants" or row["descendant_observation"] != "external_supervisor_zero_required":
             raise OriginalProductError("resource telemetry process CPU scope is invalid")
     for key in ("passage_embedding", "query_embedding"):
         metric = row[key]
@@ -576,6 +595,9 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
     """
     if observer is None:
         raise OriginalProductError("a real resource observer is required")
+    injected_clocks = wall_clock_ns is not None or cpu_clock_ns is not None
+    if formal and injected_clocks:
+        raise OriginalProductError("formal query clocks must be stdlib")
     if formal:
         _validate_live_provenance(seams=seams, live_receipt=live_receipt)
         if resource_sink is None:
@@ -608,20 +630,19 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
     corpora = {row["corpus_id"]: row for row in frozen["corpora"]}
     rows, traces, query_latencies, query_measurements = [], [], [], []
     for item in sorted(frozen["items"], key=lambda row: row["item_id"]):
-        wall_started = wall_clock_ns()
-        cpu_started = cpu_clock_ns()
-        row, trace = _row_for_query(item=item, corpus=corpora[item["corpus_id"]], physical_by_message=by_corpus[item["corpus_id"]], searcher=seams.searcher, palace_path=palace_path, ledger=ledger, latency_seconds=0.0)
-        wall_elapsed_ns = wall_clock_ns() - wall_started
-        cpu_elapsed_ns = cpu_clock_ns() - cpu_started
-        elapsed = wall_elapsed_ns / 1_000_000_000
-        ledger[-1]["latency_seconds"] = elapsed
-        query_latencies.append(elapsed)
-        query_measurements.append({
-            "item_id": row["item_id"],
-            "query_sha256": row["query_sha256"],
-            "wall_ns": wall_elapsed_ns,
-            "cpu_ns": cpu_elapsed_ns,
-        })
+        row, trace = _row_for_query(
+            item=item,
+            corpus=corpora[item["corpus_id"]],
+            physical_by_message=by_corpus[item["corpus_id"]],
+            searcher=seams.searcher,
+            palace_path=palace_path,
+            ledger=ledger,
+            latency_seconds=0.0,
+            wall_clock_ns=wall_clock_ns,
+            cpu_clock_ns=cpu_clock_ns,
+            query_measurements=query_measurements,
+        )
+        query_latencies.append(query_measurements[-1]["wall_ns"] / 1_000_000_000)
         rows.append(row); traces.append(trace)
     observer.checkpoint("after_queries")
     worker_physical = dynamic_original_index_build_receipt(palace_path=palace_path, expected_namespace=namespace, auditor=seams.auditor)
@@ -632,9 +653,9 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
         "index_seconds": index_seconds,
         "query_latency_seconds": query_latencies,
         "query_measurements": sorted(query_measurements, key=lambda item: item["item_id"]),
-        "clock_receipt": _clock_receipt(),
-        "process_cpu_scope": "worker_process_only",
-        "descendant_processes_observed": False,
+        "clock_receipt": _clock_receipt() if not injected_clocks else {**_clock_receipt(), "timing_source": "injected_test_clock"},
+        "process_cpu_scope": "worker_process_only_excludes_descendants",
+        "descendant_observation": "external_supervisor_zero_required",
         "native_internal_embedding_calls_observable": False,
         "native_internal_embedding_limitation": "exact_public_product_uses_cached_native_callable; internal_embedding_calls_unobservable",
     })

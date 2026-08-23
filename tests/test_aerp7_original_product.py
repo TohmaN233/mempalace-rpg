@@ -170,6 +170,17 @@ def test_five_dynamic_replicates_wrap_into_the_strict_frozen_original_artifact(t
 def test_formal_rejects_synthetic_provenance_and_internal_api_type_error_is_not_retried(tmp_path):
     p = projection()
     injected, _palace, _state = seams()
+    with pytest.raises(original.OriginalProductError, match="formal query clocks"):
+        original.run_original_public_replicate(
+            projection=p,
+            build_id="formal-clock-build",
+            collection_identity="formal-clock-collection",
+            palace_path=tmp_path / "formal-clock",
+            observer=Observer(),
+            seams=injected,
+            formal=True,
+            wall_clock_ns=lambda: 1,
+        )
     with pytest.raises(original.OriginalProductError, match="live-pinned"):
         original.run_original_public_replicate(projection=p, build_id="formal-build", collection_identity="formal-collection", palace_path=tmp_path / "formal", observer=Observer(), seams=injected, formal=True, live_receipt={"forged": True}, resource_sink=lambda _row: None)
     palace, state = InternalTypeErrorPalace(), {"reset": False}
@@ -270,6 +281,16 @@ def test_query_sidecar_uses_injected_process_clocks_and_does_not_change_rankings
     p = projection()
     wall = iter([100, 250, 400, 700])
     cpu = iter([1_000, 1_100, 2_000, 2_200])
+    clock_calls = []
+
+    def wall_clock():
+        clock_calls.append("wall")
+        return next(wall)
+
+    def cpu_clock():
+        clock_calls.append("cpu")
+        return next(cpu)
+
     injected, _palace, _state = seams()
     timed = original.run_original_public_replicate(
         projection=p,
@@ -278,8 +299,8 @@ def test_query_sidecar_uses_injected_process_clocks_and_does_not_change_rankings
         palace_path=tmp_path / "clock-palace",
         observer=Observer(),
         seams=injected,
-        wall_clock_ns=lambda: next(wall),
-        cpu_clock_ns=lambda: next(cpu),
+        wall_clock_ns=wall_clock,
+        cpu_clock_ns=cpu_clock,
     )
     injected_again, _palace_again, _state_again = seams()
     untimed = original.run_original_public_replicate(
@@ -297,9 +318,19 @@ def test_query_sidecar_uses_injected_process_clocks_and_does_not_change_rankings
         {"item_id": ordered_items[1]["item_id"], "query_sha256": rank._query_digest(ordered_items[1]["query_text"]), "wall_ns": 300, "cpu_ns": 200},
     ]
     assert telemetry["clock_receipt"]["schema"] == original.CLOCK_RECEIPT_SCHEMA
-    assert telemetry["process_cpu_scope"] == "worker_process_only"
-    assert telemetry["descendant_processes_observed"] is False
+    assert telemetry["clock_receipt"]["timing_source"] == "injected_test_clock"
+    assert telemetry["process_cpu_scope"] == "worker_process_only_excludes_descendants"
+    assert telemetry["descendant_observation"] == "external_supervisor_zero_required"
+    assert clock_calls == ["wall", "cpu", "wall", "cpu"] * len(ordered_items)
+    search_ledger = [row for row in timed.telemetry["ledger"] if row["event"] == "search"]
+    assert [row["latency_seconds"] for row in search_ledger] == [
+        measurement["wall_ns"] / 1_000_000_000
+        for measurement in telemetry["query_measurements"]
+    ]
     assert timed.replicate_without_coordinator_audit["rankings"] == untimed.replicate_without_coordinator_audit["rankings"]
+    assert original._canonical_bytes(timed.replicate_without_coordinator_audit["rankings"]) == original._canonical_bytes(untimed.replicate_without_coordinator_audit["rankings"])
+    assert original._canonical_bytes(timed.replicate_without_coordinator_audit["trace_receipt"]) == original._canonical_bytes(untimed.replicate_without_coordinator_audit["trace_receipt"])
+    assert timed.replicate_without_coordinator_audit["trace_sha256"] == untimed.replicate_without_coordinator_audit["trace_sha256"]
 
 
 def test_query_sidecar_rejects_nonpositive_timing_and_binding_tampering():

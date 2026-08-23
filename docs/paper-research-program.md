@@ -276,8 +276,12 @@ other.
   separate open/audit path; the formal release validator has no synthetic opt-in.
   Likewise, the synthetic isolation canary records only a plan-level rehearsal
   (`live_evidence = false`), while its separate rehearsal attestation records
-  `formal_eligible = false`.  Formal isolation accepts only a live
-  container-probe canary, and the absent live runner fails closed.
+  `formal_eligible = false`.  A later isolated-rehearsal runner now enforces the
+  fixed create/inspect/start/READY/canary/RELEASE/wait/cleanup sequence against
+  an injectable Docker backend.  Its pre-release gate binds the exact container,
+  pinned image/config identities, created and running inspect evidence, fixed
+  denial probe, absent early output, and launch config before an exclusive
+  RELEASE can be written.  This receipt is still explicitly non-formal.
   The isolation plan itself freezes an image repository digest and config image
   ID, non-root identity, read-only root filesystem, no network, no-new-privileges,
   dropped capabilities, resource limits, role-specific command identity, and
@@ -287,9 +291,19 @@ other.
   This checkpoint is not a ConvoMem result.  The public MiniLM model has passed
   a direct native-adapter smoke check without changing its model-file tree, but
   the formal current workers are not yet wired through the live isolated runner.
-  The pinned original public product exposes wall time but not process-CPU time,
-  so its formal resource gate still fails rather than inventing a value.  The
-  local Docker daemon/fixed image/live denial probe are also not yet available.
+  The pinned original public product now records exact item/query-bound wall and
+  process-CPU deltas around only the unchanged public search call, together with
+  the stdlib clock receipt.  Formal execution rejects injected clocks and states
+  explicitly that process CPU excludes descendants.  The current external
+  supervisor supplies sampled process-tree RSS and records any descendants it
+  observes, but its polling is explicitly non-exhaustive and cannot prove that a
+  short-lived descendant never existed.  It is therefore rehearsal evidence
+  only: formal original resource finalization requires OS-enforced complete
+  process-group accounting (or an equivalent inclusive per-query CPU source),
+  zero descendants, and a positive process-tree RSS peak.  That formal telemetry
+  gate and the pinned live original smoke remain open.
+  The local Docker daemon, fixed worker image/helpers, and real container denial
+  probe have also not yet passed a live run.
   Therefore formal ConvoMem data remains unopened, unenumerated, and unhashed
   until those live gates pass and a fresh review authorizes the one-shot run.
 - MemBench is the second retrieval confirmation dataset.  Split by `tid` because

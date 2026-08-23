@@ -29,6 +29,9 @@ ATTESTATION_SCHEMA = "aerp7-worker-isolation-attestation-v1"
 CANARY_SCHEMA = "aerp7-worker-isolation-denial-canary-live-v1"
 SYNTHETIC_CANARY_SCHEMA = "aerp7-worker-isolation-denial-canary-plan-only-v1"
 SYNTHETIC_ATTESTATION_SCHEMA = "aerp7-worker-isolation-rehearsal-attestation-v1"
+LIVE_REHEARSAL_SCHEMA = "aerp7-worker-isolation-live-rehearsal-v2"
+PRE_RELEASE_GATE_SCHEMA = "aerp7-worker-isolation-pre-release-gate-v1"
+RELEASE_RECEIPT_SCHEMA = "aerp7-worker-isolation-release-receipt-v1"
 FORMAL_ISOLATION_ENABLED = False
 SYNTHETIC_ISOLATION_ONLY = True
 
@@ -106,6 +109,9 @@ _FORBIDDEN_PATH_PARTS = frozenset(
 )
 _CANARY_TARGET = "/inputs/forbidden-secret"
 _CANARY_DENIED_OUTPUT = b"aerp7-denial-canary:denied\n"
+_READY_OUTPUT = b"AERP7 READY\n"
+_WAIT_SUCCESS_OUTPUT = b"0\n"
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _PLAN_KEYS = frozenset(
     {
@@ -151,10 +157,53 @@ _SYNTHETIC_CANARY_KEYS = frozenset({"schema", "mode", "target", "live_evidence",
 _SYNTHETIC_ATTESTATION_KEYS = frozenset(
     {"schema", "synthetic_test_mode", "formal_eligible", "plan_sha256", "denial_canary", "attestation_sha256"}
 )
+_LIVE_REHEARSAL_KEYS = frozenset(
+    {
+        "schema",
+        "synthetic_test_mode",
+        "formal_eligible",
+        "plan_sha256",
+        "container_id",
+        "host_init_pid",
+        "image_observation",
+        "image_inspect_sha256",
+        "created_inspect_summary",
+        "created_inspect_sha256",
+        "running_inspect_summary",
+        "running_inspect_sha256",
+        "ready_output_sha256",
+        "denial_canary",
+        "pre_release_gate",
+        "pre_release_gate_sha256",
+        "release_receipt",
+        "release_receipt_sha256",
+        "release_content_sha256",
+        "release_output_sha256",
+        "wait_output_sha256",
+        "output_validation",
+        "output_validation_sha256",
+        "attestation_sha256",
+    }
+)
+_IMAGE_OBSERVATION_KEYS = frozenset({"repo_digest", "config_image_id"})
+_OUTPUT_ABSENT_KEYS = frozenset({"release_exists", "output_exists"})
+_OUTPUT_PRESENT_KEYS = frozenset({"release_exists", "output_exists", "release_content_sha256", "output_sha256"})
+_PRE_RELEASE_GATE_KEYS = frozenset(
+    {
+        "schema", "plan_sha256", "container_id", "host_init_pid", "launch_config_sha256",
+        "image_observation", "image_inspect_sha256", "created_inspect_summary", "created_inspect_sha256",
+        "running_inspect_summary", "running_inspect_sha256", "ready_output_sha256", "denial_canary",
+        "output_absence", "output_absence_sha256", "pre_release_gate_sha256",
+    }
+)
+_RELEASE_RECEIPT_KEYS = frozenset(
+    {"schema", "plan_sha256", "container_id", "pre_release_gate_sha256", "launch_config_sha256", "release_content_sha256"}
+)
 _INSPECT_KEYS = frozenset(
     {
         "repo_digest",
         "config_image_id",
+        "configured_image",
         "path",
         "args",
         "working_dir",
@@ -162,6 +211,9 @@ _INSPECT_KEYS = frozenset(
         "user",
         "rootfs_read_only",
         "no_new_privileges",
+        "security_options",
+        "restart_policy",
+        "privileged",
         "cap_drop",
         "resource_limits",
         "mounts",
@@ -542,6 +594,93 @@ def docker_run_command(plan: Mapping[str, Any], *, docker_executable: str = "doc
     return command
 
 
+def _docker_runtime_options(checked: Mapping[str, Any], *, docker_executable: str, verb: str) -> list[str]:
+    """Return the fixed runtime options shared by ``create`` and legacy run."""
+
+    resources = checked["resource_limits"]
+    user = checked["user"]
+    command = [docker_executable, verb, "--network", "none", "--restart", "no", "--user", f"{user['uid']}:{user['gid']}", "--read-only",
+               "--security-opt", "no-new-privileges:true", "--cap-drop", "ALL", "--pids-limit", str(resources["pids"]),
+               "--memory", resources["memory"], "--cpus", resources["cpus"], "--workdir", checked["workdir"]]
+    for row in checked["mounts"]:
+        command.extend(("--mount", _mount_flag(row)))
+    command.append(checked["image"])
+    command.extend(checked["container_argv"])
+    return command
+
+
+def _docker_executable(value: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise IsolationError("isolation_docker_executable_invalid")
+    return value
+
+
+def docker_create_command(plan: Mapping[str, Any], *, docker_executable: str = "docker") -> list[str]:
+    """Build the only allowed container creation command (never auto-remove)."""
+
+    return _docker_runtime_options(validate_isolation_plan(plan), docker_executable=_docker_executable(docker_executable), verb="create")
+
+
+def _container_id(value: Any, code: str = "isolation_container_id_invalid") -> str:
+    if not isinstance(value, str) or not _CONTAINER_ID_RE.fullmatch(value):
+        raise IsolationError(code)
+    return value
+
+
+def docker_start_command(container_id: str, *, docker_executable: str = "docker") -> list[str]:
+    return [_docker_executable(docker_executable), "start", _container_id(container_id)]
+
+
+def docker_container_inspect_command(container_id: str, *, docker_executable: str = "docker") -> list[str]:
+    return [_docker_executable(docker_executable), "container", "inspect", _container_id(container_id)]
+
+
+def docker_image_inspect_command(plan: Mapping[str, Any], *, docker_executable: str = "docker") -> list[str]:
+    checked = validate_isolation_plan(plan)
+    return [_docker_executable(docker_executable), "image", "inspect", checked["image"]]
+
+
+def docker_ready_command(container_id: str, *, docker_executable: str = "docker") -> list[str]:
+    return [_docker_executable(docker_executable), "exec", _container_id(container_id), "/opt/aerp7/bin/aerp7-ready", "--barrier"]
+
+
+def docker_canary_command(container_id: str, *, docker_executable: str = "docker") -> list[str]:
+    """Fixed same-container probe: no shell, path, or caller arguments."""
+
+    return [_docker_executable(docker_executable), "exec", _container_id(container_id), "/opt/aerp7/bin/aerp7-denial-canary"]
+
+
+def docker_release_command(
+    container_id: str,
+    *,
+    plan_sha256: str,
+    pre_release_gate_sha256: str,
+    launch_config_sha256: str | None = None,
+    docker_executable: str = "docker",
+) -> list[str]:
+    """Build the fixed RELEASE command bound to its pre-release gate."""
+
+    command = [
+        _docker_executable(docker_executable), "exec", _container_id(container_id), "/opt/aerp7/bin/aerp7-release",
+        "--exclusive-create", "/outputs/result/RELEASE", "--plan-sha256", _hex(plan_sha256, "isolation_release_plan_digest_invalid"),
+        "--container-id", _container_id(container_id), "--pre-release-gate-sha256",
+        _hex(pre_release_gate_sha256, "isolation_release_gate_digest_invalid"),
+    ]
+    if launch_config_sha256 is not None:
+        command.extend(("--launch-config-sha256", _hex(launch_config_sha256, "isolation_launch_config_digest_invalid")))
+    return command
+
+
+def docker_wait_command(container_id: str, *, docker_executable: str = "docker") -> list[str]:
+    return [_docker_executable(docker_executable), "wait", _container_id(container_id)]
+
+
+def docker_remove_command(container_id: str, *, docker_executable: str = "docker") -> list[str]:
+    """Force-remove the exact container ID, including post-start failures."""
+
+    return [_docker_executable(docker_executable), "container", "rm", "--force", _container_id(container_id)]
+
+
 # Descriptive aliases make the seam easy to discover without creating a
 # second implementation with subtly different validation rules.
 build_docker_command = docker_run_command
@@ -555,6 +694,7 @@ def expected_inspect_summary(plan: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "repo_digest": checked["image"],
         "config_image_id": checked["image_config_digest"],
+        "configured_image": checked["image"],
         "path": argv[0],
         "args": argv[1:],
         "working_dir": checked["workdir"],
@@ -562,6 +702,9 @@ def expected_inspect_summary(plan: Mapping[str, Any]) -> dict[str, Any]:
         "user": f"{user['uid']}:{user['gid']}",
         "rootfs_read_only": True,
         "no_new_privileges": True,
+        "security_options": ["no-new-privileges:true"],
+        "restart_policy": {"name": "no", "maximum_retry_count": 0},
+        "privileged": False,
         "cap_drop": ["ALL"],
         "resource_limits": {
             "pids": resources["pids"],
@@ -591,56 +734,72 @@ def validate_inspect_summary(plan: Mapping[str, Any], summary: Mapping[str, Any]
     return dict(summary)
 
 
-def normalize_docker_inspect(
-    raw: Mapping[str, Any], *, expected_repo_digest: str | None = None, image_digest: str | None = None
-) -> dict[str, Any]:
-    """Normalize one raw Docker inspect object without trusting caller labels.
+def normalize_image_inspect(raw: Mapping[str, Any], *, expected_repo_digest: str) -> dict[str, str]:
+    """Normalize *image inspect* evidence only.
 
-    ``expected_repo_digest`` (and the deprecated spelling ``image_digest``) is
-    only a commitment to compare against.  The returned repo digest comes from
-    the raw ``RepoDigests`` field, while the config image id comes from the raw
-    container ``Image`` field.  Path, Args, and WorkingDir are likewise copied
-    from inspect and are checked against the plan later.
+    Docker's container inspect does not promise ``RepoDigests``.  The manifest
+    identity is therefore consumed from a separate raw ``docker image inspect``
+    response, while a container inspect is used only for the container config
+    ID and runtime boundary below.
     """
 
-    if expected_repo_digest is not None and image_digest is not None and expected_repo_digest != image_digest:
-        raise IsolationError("isolation_inspect_repo_digest_ambiguous")
-    expected = expected_repo_digest if expected_repo_digest is not None else image_digest
-    if expected is not None:
-        _validate_image(expected, expected.rsplit("@sha256:", 1)[1] if "@sha256:" in expected else None)
+    _validate_image(expected_repo_digest, expected_repo_digest.rsplit("@sha256:", 1)[1])
     if not isinstance(raw, Mapping):
-        raise IsolationError("isolation_inspect_invalid")
+        raise IsolationError("isolation_image_inspect_invalid")
+    repo_digests = raw.get("RepoDigests")
+    if not isinstance(repo_digests, list) or any(not isinstance(item, str) for item in repo_digests):
+        raise IsolationError("isolation_image_inspect_repo_digest_invalid")
+    if expected_repo_digest not in repo_digests or any(not _IMAGE_RE.fullmatch(item) for item in repo_digests):
+        raise IsolationError("isolation_image_inspect_repo_digest_mismatch")
+    config_id = _config_digest(raw.get("Id"), "isolation_image_inspect_config_id_invalid")
+    return {"repo_digest": expected_repo_digest, "config_image_id": config_id}
+
+
+def normalize_container_inspect(raw: Mapping[str, Any], *, expected_container_id: str | None = None) -> dict[str, Any]:
+    """Normalize *container inspect* evidence without assuming RepoDigests."""
+
+    if not isinstance(raw, Mapping):
+        raise IsolationError("isolation_container_inspect_invalid")
+    container_id = raw.get("Id")
+    if not isinstance(container_id, str) or not _CONTAINER_ID_RE.fullmatch(container_id):
+        raise IsolationError("isolation_container_inspect_id_invalid")
+    if expected_container_id is not None and container_id != expected_container_id:
+        raise IsolationError("isolation_container_id_mismatch")
     host = raw.get("HostConfig")
     config = raw.get("Config")
-    if not isinstance(host, Mapping) or not isinstance(config, Mapping):
-        raise IsolationError("isolation_inspect_invalid")
-
-    repo_digests = raw.get("RepoDigests")
-    if not isinstance(repo_digests, list) or not repo_digests or any(not isinstance(item, str) for item in repo_digests):
-        raise IsolationError("isolation_inspect_repo_digest_invalid")
-    valid_repo_digests = [item for item in repo_digests if _IMAGE_RE.fullmatch(item)]
-    if len(valid_repo_digests) != len(repo_digests):
-        raise IsolationError("isolation_inspect_repo_digest_invalid")
-    if expected is not None:
-        if expected not in valid_repo_digests:
-            raise IsolationError("isolation_inspect_repo_digest_mismatch")
-        repo_digest = expected
-    elif len(valid_repo_digests) == 1:
-        repo_digest = valid_repo_digests[0]
-    else:
-        raise IsolationError("isolation_inspect_repo_digest_ambiguous")
-
+    state = raw.get("State")
+    if not isinstance(host, Mapping) or not isinstance(config, Mapping) or not isinstance(state, Mapping):
+        raise IsolationError("isolation_container_inspect_invalid")
     # Container inspect uses ``Image`` for the immutable config image ID;
-    # ``Id`` is the container identity and must not be confused with it.
+    # ``Id`` is the container identity and must never be confused with it.
     config_id = _config_digest(raw.get("Image"), "isolation_inspect_config_image_id_invalid")
+    configured_image = config.get("Image")
     path, args, working_dir = raw.get("Path"), raw.get("Args"), config.get("WorkingDir")
+    if not isinstance(configured_image, str) or not _IMAGE_RE.fullmatch(configured_image):
+        raise IsolationError("isolation_inspect_configured_image_invalid")
     if not isinstance(path, str) or not path.startswith("/") or not isinstance(args, list) or any(not isinstance(item, str) for item in args):
         raise IsolationError("isolation_inspect_command_identity_invalid")
     if not isinstance(working_dir, str) or not working_dir.startswith("/"):
         raise IsolationError("isolation_inspect_workdir_invalid")
 
-    security = host.get("SecurityOpt") or []
+    security = host.get("SecurityOpt")
+    # Docker's JSON inspect contract returns this as a list.  Accept a tuple
+    # only for injectable test backends, but preserve the exact normalized
+    # list in the receipt; a bare NNP among extra options is not sufficient.
+    if not isinstance(security, (list, tuple)) or any(not isinstance(item, str) for item in security):
+        raise IsolationError("isolation_inspect_security_options_invalid")
+    security = list(security)
+    if security != ["no-new-privileges:true"]:
+        raise IsolationError("isolation_inspect_security_options_invalid")
     cap_drop = host.get("CapDrop") or []
+    cap_add = host.get("CapAdd")
+    if cap_add not in (None, []):
+        raise IsolationError("isolation_inspect_cap_add_invalid")
+    restart = host.get("RestartPolicy")
+    if not isinstance(restart, Mapping) or restart.get("Name") != "no" or restart.get("MaximumRetryCount") != 0:
+        raise IsolationError("isolation_inspect_restart_policy_invalid")
+    if host.get("Privileged") is not False:
+        raise IsolationError("isolation_inspect_privileged_invalid")
     mounts_raw = raw.get("Mounts")
     if not isinstance(mounts_raw, list):
         raise IsolationError("isolation_inspect_invalid")
@@ -648,6 +807,8 @@ def normalize_docker_inspect(
     for row in mounts_raw:
         if not isinstance(row, Mapping):
             raise IsolationError("isolation_inspect_invalid")
+        if row.get("Type") != "bind":
+            raise IsolationError("isolation_inspect_mount_type_invalid")
         destination, source = row.get("Destination"), row.get("Source")
         rw = row.get("RW")
         if not isinstance(destination, str) or not isinstance(source, str) or not isinstance(rw, bool):
@@ -662,19 +823,60 @@ def normalize_docker_inspect(
     pids, memory_bytes, nano_cpus = host.get("PidsLimit"), host.get("Memory"), host.get("NanoCpus")
     if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in (pids, memory_bytes, nano_cpus)):
         raise IsolationError("isolation_inspect_resource_limits_invalid")
+    status, running, pid = state.get("Status"), state.get("Running"), state.get("Pid")
+    if status not in {"created", "running"} or not isinstance(running, bool) or isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
+        raise IsolationError("isolation_container_state_invalid")
+    if (status == "created" and (running or pid != 0)) or (status == "running" and (not running or pid <= 0)):
+        raise IsolationError("isolation_container_state_invalid")
     return {
-        "repo_digest": repo_digest,
+        "container_id": container_id,
         "config_image_id": config_id,
+        "configured_image": configured_image,
         "path": path,
         "args": list(args),
         "working_dir": working_dir,
         "network_mode": host.get("NetworkMode"),
         "user": user,
         "rootfs_read_only": host.get("ReadonlyRootfs"),
-        "no_new_privileges": any(item == "no-new-privileges:true" for item in security),
+        "no_new_privileges": True,
+        "security_options": security,
+        "restart_policy": {"name": "no", "maximum_retry_count": 0},
+        "privileged": False,
         "cap_drop": list(cap_drop),
         "resource_limits": {"pids": pids, "memory_bytes": memory_bytes, "nano_cpus": nano_cpus},
         "mounts": sorted(mounts, key=lambda row: row["kind"]),
+        "state": status,
+        "host_init_pid": pid,
+    }
+
+
+def normalize_docker_inspect(
+    raw: Mapping[str, Any], *, image_raw: Mapping[str, Any] | None = None, expected_repo_digest: str | None = None,
+    image_digest: str | None = None,
+) -> dict[str, Any]:
+    """Compatibility wrapper requiring separate image evidence.
+
+    It intentionally rejects the old fabricated model where a container
+    inspect was treated as carrying ``RepoDigests``.
+    """
+
+    if expected_repo_digest is not None and image_digest is not None and expected_repo_digest != image_digest:
+        raise IsolationError("isolation_inspect_repo_digest_ambiguous")
+    expected = expected_repo_digest if expected_repo_digest is not None else image_digest
+    if expected is None or image_raw is None:
+        raise IsolationError("isolation_image_inspect_required")
+    image = normalize_image_inspect(image_raw, expected_repo_digest=expected)
+    container = normalize_container_inspect(raw)
+    return {
+        "repo_digest": image["repo_digest"],
+        "config_image_id": container["config_image_id"],
+        "configured_image": container["configured_image"],
+        "path": container["path"], "args": container["args"], "working_dir": container["working_dir"],
+        "network_mode": container["network_mode"], "user": container["user"],
+        "rootfs_read_only": container["rootfs_read_only"], "no_new_privileges": container["no_new_privileges"],
+        "security_options": container["security_options"],
+        "restart_policy": container["restart_policy"], "privileged": container["privileged"],
+        "cap_drop": container["cap_drop"], "resource_limits": container["resource_limits"], "mounts": container["mounts"],
     }
 
 
@@ -905,9 +1107,380 @@ def require_formal_isolation() -> None:
         raise IsolationError("aerp7_formal_isolation_disabled")
 
 
+def _stdout_bytes(result: Any, *, code: str) -> bytes:
+    if getattr(result, "returncode", 1) != 0:
+        raise IsolationError(code)
+    stdout = getattr(result, "stdout", b"")
+    stderr = getattr(result, "stderr", b"")
+    if isinstance(stdout, str):
+        stdout = stdout.encode("utf-8")
+    if isinstance(stderr, str):
+        stderr = stderr.encode("utf-8")
+    if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
+        raise IsolationError(code)
+    return stdout
+
+
+def _run_fixed(runner: Callable[..., Any], command: Sequence[str], *, timeout_seconds: int, code: str) -> Any:
+    try:
+        result = runner(list(command), capture_output=True, text=False, timeout=timeout_seconds, check=False)
+    except (OSError, subprocess.SubprocessError, TimeoutError) as exc:
+        raise IsolationError(code) from exc
+    _stdout_bytes(result, code=code)
+    stderr = getattr(result, "stderr", b"")
+    if isinstance(stderr, str):
+        stderr = stderr.encode("utf-8")
+    if stderr != b"":
+        raise IsolationError(code)
+    return result
+
+
+def _json_inspect(result: Any, *, code: str) -> dict[str, Any]:
+    stdout = _stdout_bytes(result, code=code)
+    try:
+        decoded = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IsolationError(code) from exc
+    if isinstance(decoded, list):
+        if len(decoded) != 1:
+            raise IsolationError(code)
+        decoded = decoded[0]
+    if not isinstance(decoded, Mapping):
+        raise IsolationError(code)
+    return dict(decoded)
+
+
+def _fixed_output(result: Any, expected: bytes, *, code: str) -> str:
+    stdout = _stdout_bytes(result, code=code)
+    stderr = getattr(result, "stderr", b"")
+    if isinstance(stderr, str):
+        stderr = stderr.encode("utf-8")
+    if stderr != b"" or stdout != expected:
+        raise IsolationError(code)
+    return hashlib.sha256(stdout).hexdigest()
+
+
+def _validate_output_observation(value: Any, *, before_release: bool) -> dict[str, Any]:
+    expected = _OUTPUT_ABSENT_KEYS if before_release else _OUTPUT_PRESENT_KEYS
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise IsolationError("isolation_output_validation_invalid")
+    if before_release:
+        if value.get("release_exists") is not False:
+            raise IsolationError("isolation_release_exists_before_attestation")
+        if value.get("output_exists") is not False:
+            raise IsolationError("isolation_output_exists_before_attestation")
+        return {"release_exists": False, "output_exists": False}
+    if value.get("release_exists") is not True:
+        raise IsolationError("isolation_release_output_missing")
+    if value.get("output_exists") is not True:
+        raise IsolationError("isolation_final_output_missing")
+    release_content = _hex(value.get("release_content_sha256"), "isolation_output_validation_invalid")
+    output = _hex(value.get("output_sha256"), "isolation_output_validation_invalid")
+    return {"release_exists": True, "output_exists": True, "release_content_sha256": release_content, "output_sha256": output}
+
+
+def _inspect_summary_from_container(container: Mapping[str, Any], image: Mapping[str, str]) -> dict[str, Any]:
+    return {
+        "repo_digest": image["repo_digest"], "config_image_id": container["config_image_id"],
+        "configured_image": container["configured_image"],
+        "path": container["path"], "args": container["args"], "working_dir": container["working_dir"],
+        "network_mode": container["network_mode"], "user": container["user"],
+        "rootfs_read_only": container["rootfs_read_only"], "no_new_privileges": container["no_new_privileges"],
+        "security_options": container["security_options"],
+        "restart_policy": container["restart_policy"], "privileged": container["privileged"],
+        "cap_drop": container["cap_drop"], "resource_limits": container["resource_limits"], "mounts": container["mounts"],
+    }
+
+
+def _live_unsigned(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key != "attestation_sha256"}
+
+
+def _gate_unsigned(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key != "pre_release_gate_sha256"}
+
+
+def _nullable_digest(value: Any, code: str) -> str | None:
+    if value is None:
+        return None
+    return _hex(value, code)
+
+
+def make_pre_release_gate(
+    *,
+    plan: Mapping[str, Any],
+    container_id: str,
+    host_init_pid: int,
+    image_observation: Mapping[str, Any],
+    image_inspect_sha256: str,
+    created_inspect_summary: Mapping[str, Any],
+    created_inspect_sha256: str,
+    running_inspect_summary: Mapping[str, Any],
+    running_inspect_sha256: str,
+    ready_output_sha256: str,
+    denial_canary: Mapping[str, Any],
+    output_absence: Mapping[str, Any],
+    launch_config_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Mint the immutable gate immediately before the exclusive RELEASE call."""
+
+    checked = validate_isolation_plan(plan)
+    _container_id(container_id)
+    if isinstance(host_init_pid, bool) or not isinstance(host_init_pid, int) or host_init_pid <= 0:
+        raise IsolationError("isolation_pre_release_gate_invalid")
+    image = dict(image_observation) if isinstance(image_observation, Mapping) else None
+    if image != {"repo_digest": checked["image"], "config_image_id": checked["image_config_digest"]}:
+        raise IsolationError("isolation_pre_release_gate_image_invalid")
+    for value, code in ((image_inspect_sha256, "isolation_live_image_digest_invalid"), (created_inspect_sha256, "isolation_live_inspect_digest_invalid"), (running_inspect_sha256, "isolation_live_inspect_digest_invalid")):
+        _hex(value, code)
+    created = validate_inspect_summary(checked, created_inspect_summary)
+    running = validate_inspect_summary(checked, running_inspect_summary)
+    if ready_output_sha256 != hashlib.sha256(_READY_OUTPUT).hexdigest():
+        raise IsolationError("isolation_ready_barrier_invalid")
+    canary = validate_denial_canary(denial_canary)
+    absence = _validate_output_observation(output_absence, before_release=True)
+    launch = _nullable_digest(launch_config_sha256, "isolation_launch_config_digest_invalid")
+    unsigned = {
+        "schema": PRE_RELEASE_GATE_SCHEMA, "plan_sha256": checked["plan_sha256"], "container_id": container_id,
+        "host_init_pid": host_init_pid, "launch_config_sha256": launch, "image_observation": image,
+        "image_inspect_sha256": image_inspect_sha256, "created_inspect_summary": created,
+        "created_inspect_sha256": created_inspect_sha256, "running_inspect_summary": running,
+        "running_inspect_sha256": running_inspect_sha256, "ready_output_sha256": ready_output_sha256,
+        "denial_canary": canary, "output_absence": absence, "output_absence_sha256": canonical_sha256(absence),
+    }
+    return {**unsigned, "pre_release_gate_sha256": canonical_sha256(unsigned)}
+
+
+def validate_pre_release_gate(value: Mapping[str, Any], *, plan: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _PRE_RELEASE_GATE_KEYS or value.get("schema") != PRE_RELEASE_GATE_SCHEMA:
+        raise IsolationError("isolation_pre_release_gate_invalid")
+    row = dict(value)
+    # Re-use the constructor's invariant checks, then compare the generated
+    # canonical gate byte-for-byte.  This avoids a parallel validation path.
+    rebuilt = make_pre_release_gate(
+        plan=plan, container_id=row.get("container_id"), host_init_pid=row.get("host_init_pid"),
+        image_observation=row.get("image_observation"), image_inspect_sha256=row.get("image_inspect_sha256"),
+        created_inspect_summary=row.get("created_inspect_summary"), created_inspect_sha256=row.get("created_inspect_sha256"),
+        running_inspect_summary=row.get("running_inspect_summary"), running_inspect_sha256=row.get("running_inspect_sha256"),
+        ready_output_sha256=row.get("ready_output_sha256"), denial_canary=row.get("denial_canary"),
+        output_absence=row.get("output_absence"), launch_config_sha256=row.get("launch_config_sha256"),
+    )
+    if row != rebuilt:
+        raise IsolationError("isolation_pre_release_gate_digest_invalid")
+    return row
+
+
+def validate_release_receipt(
+    value: Mapping[str, Any], *, plan: Mapping[str, Any], pre_release_gate: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate the canonical helper response before it is allowed to publish."""
+
+    checked = validate_isolation_plan(plan)
+    gate = validate_pre_release_gate(pre_release_gate, plan=checked)
+    if not isinstance(value, Mapping) or set(value) != _RELEASE_RECEIPT_KEYS or value.get("schema") != RELEASE_RECEIPT_SCHEMA:
+        raise IsolationError("isolation_release_receipt_invalid")
+    row = dict(value)
+    if (
+        row.get("plan_sha256") != checked["plan_sha256"]
+        or row.get("container_id") != gate["container_id"]
+        or row.get("pre_release_gate_sha256") != gate["pre_release_gate_sha256"]
+        or row.get("launch_config_sha256") != gate["launch_config_sha256"]
+    ):
+        raise IsolationError("isolation_release_binding_invalid")
+    _hex(row.get("release_content_sha256"), "isolation_release_content_digest_invalid")
+    return row
+
+
+def _release_receipt_from_result(result: Any, *, plan: Mapping[str, Any], gate: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    """Accept only an exact canonical, stderr-free structured helper response."""
+
+    stdout = _stdout_bytes(result, code="isolation_release_failed")
+    try:
+        parsed = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IsolationError("isolation_release_receipt_invalid") from exc
+    if not isinstance(parsed, Mapping) or _bytes(parsed) != stdout:
+        raise IsolationError("isolation_release_receipt_invalid")
+    receipt = validate_release_receipt(parsed, plan=plan, pre_release_gate=gate)
+    return receipt, hashlib.sha256(stdout).hexdigest()
+
+
+def validate_live_rehearsal_attestation(value: Mapping[str, Any], *, plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the v2 live-container receipt, which remains non-formal."""
+
+    checked = validate_isolation_plan(plan)
+    if not isinstance(value, Mapping) or set(value) != _LIVE_REHEARSAL_KEYS or value.get("schema") != LIVE_REHEARSAL_SCHEMA:
+        raise IsolationError("isolation_live_rehearsal_attestation_invalid")
+    row = dict(value)
+    if row.get("synthetic_test_mode") is not True or row.get("formal_eligible") is not False or row.get("plan_sha256") != checked["plan_sha256"]:
+        raise IsolationError("isolation_live_rehearsal_attestation_invalid")
+    container_id = _container_id(row.get("container_id"))
+    pid = row.get("host_init_pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise IsolationError("isolation_live_rehearsal_attestation_invalid")
+    image = row.get("image_observation")
+    if not isinstance(image, Mapping) or set(image) != _IMAGE_OBSERVATION_KEYS:
+        raise IsolationError("isolation_live_image_observation_invalid")
+    if dict(image) != {"repo_digest": checked["image"], "config_image_id": checked["image_config_digest"]}:
+        raise IsolationError("isolation_live_image_observation_invalid")
+    _hex(row.get("image_inspect_sha256"), "isolation_live_image_digest_invalid")
+    created = validate_inspect_summary(checked, row.get("created_inspect_summary"))
+    running = validate_inspect_summary(checked, row.get("running_inspect_summary"))
+    _hex(row.get("created_inspect_sha256"), "isolation_live_inspect_digest_invalid")
+    _hex(row.get("running_inspect_sha256"), "isolation_live_inspect_digest_invalid")
+    if row.get("ready_output_sha256") != hashlib.sha256(_READY_OUTPUT).hexdigest():
+        raise IsolationError("isolation_ready_barrier_invalid")
+    canary = validate_denial_canary(row.get("denial_canary"))
+    gate = validate_pre_release_gate(row.get("pre_release_gate"), plan=checked)
+    if row.get("pre_release_gate_sha256") != gate["pre_release_gate_sha256"]:
+        raise IsolationError("isolation_pre_release_gate_digest_invalid")
+    if (
+        gate["container_id"] != container_id or gate["host_init_pid"] != pid
+        or gate["image_observation"] != image or gate["denial_canary"] != canary
+        or gate["created_inspect_summary"] != created or gate["running_inspect_summary"] != running
+        or gate["ready_output_sha256"] != row["ready_output_sha256"]
+        or gate["image_inspect_sha256"] != row["image_inspect_sha256"]
+        or gate["created_inspect_sha256"] != row["created_inspect_sha256"]
+        or gate["running_inspect_sha256"] != row["running_inspect_sha256"]
+    ):
+        raise IsolationError("isolation_pre_release_gate_binding_invalid")
+    release = validate_release_receipt(row.get("release_receipt"), plan=checked, pre_release_gate=gate)
+    if row.get("release_receipt_sha256") != canonical_sha256(release) or row.get("release_content_sha256") != release["release_content_sha256"]:
+        raise IsolationError("isolation_release_receipt_invalid")
+    if row.get("release_output_sha256") != canonical_sha256(release) or row.get("wait_output_sha256") != hashlib.sha256(_WAIT_SUCCESS_OUTPUT).hexdigest():
+        raise IsolationError("isolation_release_receipt_invalid")
+    output = _validate_output_observation(row.get("output_validation"), before_release=False)
+    if output["release_content_sha256"] != release["release_content_sha256"]:
+        raise IsolationError("isolation_release_content_binding_invalid")
+    if row.get("output_validation_sha256") != canonical_sha256(output):
+        raise IsolationError("isolation_output_validation_digest_invalid")
+    if row.get("attestation_sha256") != canonical_sha256(_live_unsigned(row)):
+        raise IsolationError("isolation_live_rehearsal_attestation_digest_invalid")
+    # Keep these locals deliberately evaluated: they make the receipt's key
+    # identities explicit in this validator rather than merely schema-shaped.
+    _ = (container_id, pid, canary)
+    return row
+
+
+def run_isolated_rehearsal(
+    plan: Mapping[str, Any],
+    *,
+    runner: Callable[..., Any],
+    output_validator: Callable[[str, str], Mapping[str, Any]],
+    docker_executable: str = "docker",
+    timeout_seconds: int = 30,
+    issued_container_ids: set[str] | None = None,
+    launch_config_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Exercise the exact Docker lifecycle through an injectable backend.
+
+    This is intentionally a test/rehearsal seam.  It does not fall back to a
+    host subprocess, cannot enable formal eligibility, and always removes the
+    one exact container ID it created.  ``output_validator`` is called twice:
+    ``before_release`` must prove RELEASE absent; ``after_wait`` proves the
+    released output exists and supplies its digest.
+    """
+
+    checked = validate_isolation_plan(plan)
+    if not callable(runner) or not callable(output_validator):
+        raise IsolationError("isolation_lifecycle_backend_invalid")
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
+        raise IsolationError("isolation_lifecycle_timeout_invalid")
+    executable = _docker_executable(docker_executable)
+    launch = _nullable_digest(launch_config_sha256, "isolation_launch_config_digest_invalid")
+    container_id: str | None = None
+    primary_error: BaseException | None = None
+    try:
+        create = _run_fixed(runner, docker_create_command(checked, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_create_failed")
+        create_stdout = _stdout_bytes(create, code="isolation_create_failed")
+        if getattr(create, "stderr", b"") not in {b"", ""}:
+            raise IsolationError("isolation_create_failed")
+        try:
+            container_id = _container_id(create_stdout.decode("ascii").strip())
+        except UnicodeDecodeError as exc:
+            raise IsolationError("isolation_container_id_invalid") from exc
+        if issued_container_ids is not None:
+            if container_id in issued_container_ids:
+                raise IsolationError("isolation_container_id_reused")
+            issued_container_ids.add(container_id)
+
+        created_result = _run_fixed(runner, docker_container_inspect_command(container_id, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_created_inspect_failed")
+        created_raw = _json_inspect(created_result, code="isolation_created_inspect_failed")
+        created = normalize_container_inspect(created_raw, expected_container_id=container_id)
+        if created["state"] != "created" or created["host_init_pid"] != 0:
+            raise IsolationError("isolation_created_state_invalid")
+
+        image_result = _run_fixed(runner, docker_image_inspect_command(checked, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_image_inspect_failed")
+        image_raw = _json_inspect(image_result, code="isolation_image_inspect_failed")
+        image = normalize_image_inspect(image_raw, expected_repo_digest=checked["image"])
+        if image["config_image_id"] != checked["image_config_digest"] or created["config_image_id"] != image["config_image_id"]:
+            raise IsolationError("isolation_image_config_binding_invalid")
+        created_summary = _inspect_summary_from_container(created, image)
+        validate_inspect_summary(checked, created_summary)
+
+        _fixed_output(_run_fixed(runner, docker_start_command(container_id, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_start_failed"), (container_id + "\n").encode("ascii"), code="isolation_start_failed")
+        ready_digest = _fixed_output(_run_fixed(runner, docker_ready_command(container_id, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_ready_barrier_invalid"), _READY_OUTPUT, code="isolation_ready_barrier_invalid")
+        running_result = _run_fixed(runner, docker_container_inspect_command(container_id, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_running_inspect_failed")
+        running_raw = _json_inspect(running_result, code="isolation_running_inspect_failed")
+        running = normalize_container_inspect(running_raw, expected_container_id=container_id)
+        if running["state"] != "running" or running["host_init_pid"] <= 0 or running["config_image_id"] != image["config_image_id"]:
+            raise IsolationError("isolation_running_state_invalid")
+        running_summary = _inspect_summary_from_container(running, image)
+        validate_inspect_summary(checked, running_summary)
+
+        canary_result = _run_fixed(runner, docker_canary_command(container_id, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_live_denial_canary_failed")
+        canary_digest = _fixed_output(canary_result, _CANARY_DENIED_OUTPUT, code="isolation_live_denial_canary_failed")
+        canary = validate_denial_canary({"schema": CANARY_SCHEMA, "mode": "container_probe", "target": _CANARY_TARGET, "attempted": True, "denied": True, "readable": False, "output_sha256": canary_digest})
+        absence = _validate_output_observation(output_validator(container_id, "before_release"), before_release=True)
+        gate = make_pre_release_gate(
+            plan=checked, container_id=container_id, host_init_pid=running["host_init_pid"], image_observation=image,
+            image_inspect_sha256=canonical_sha256(image_raw), created_inspect_summary=created_summary,
+            created_inspect_sha256=canonical_sha256(created_raw), running_inspect_summary=running_summary,
+            running_inspect_sha256=canonical_sha256(running_raw), ready_output_sha256=ready_digest,
+            denial_canary=canary, output_absence=absence, launch_config_sha256=launch,
+        )
+        release_result = _run_fixed(
+            runner,
+            docker_release_command(container_id, plan_sha256=checked["plan_sha256"], pre_release_gate_sha256=gate["pre_release_gate_sha256"], launch_config_sha256=launch, docker_executable=executable),
+            timeout_seconds=timeout_seconds, code="isolation_release_failed",
+        )
+        release, release_digest = _release_receipt_from_result(release_result, plan=checked, gate=gate)
+        wait_result = _run_fixed(runner, docker_wait_command(container_id, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_wait_failed")
+        wait_digest = _fixed_output(wait_result, _WAIT_SUCCESS_OUTPUT, code="isolation_worker_exit_nonzero")
+        output = _validate_output_observation(output_validator(container_id, "after_wait"), before_release=False)
+        image_sha = canonical_sha256(image_raw)
+        unsigned = {
+            "schema": LIVE_REHEARSAL_SCHEMA, "synthetic_test_mode": True, "formal_eligible": False,
+            "plan_sha256": checked["plan_sha256"], "container_id": container_id, "host_init_pid": running["host_init_pid"],
+            "image_observation": image, "image_inspect_sha256": image_sha,
+            "created_inspect_summary": created_summary, "created_inspect_sha256": canonical_sha256(created_raw),
+            "running_inspect_summary": running_summary, "running_inspect_sha256": canonical_sha256(running_raw),
+            "ready_output_sha256": ready_digest, "denial_canary": canary, "pre_release_gate": gate,
+            "pre_release_gate_sha256": gate["pre_release_gate_sha256"], "release_receipt": release,
+            "release_receipt_sha256": canonical_sha256(release), "release_content_sha256": release["release_content_sha256"], "release_output_sha256": release_digest,
+            "wait_output_sha256": wait_digest, "output_validation": output, "output_validation_sha256": canonical_sha256(output),
+        }
+        return validate_live_rehearsal_attestation({**unsigned, "attestation_sha256": canonical_sha256(unsigned)}, plan=checked)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if container_id is not None:
+            try:
+                remove = _run_fixed(runner, docker_remove_command(container_id, docker_executable=executable), timeout_seconds=timeout_seconds, code="isolation_cleanup_failed")
+                _fixed_output(remove, (container_id + "\n").encode("ascii"), code="isolation_cleanup_failed")
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                raise IsolationError("isolation_cleanup_failed") from cleanup_error
+
+
 __all__ = [
     "ATTESTATION_SCHEMA",
     "CANARY_SCHEMA",
+    "LIVE_REHEARSAL_SCHEMA",
+    "PRE_RELEASE_GATE_SCHEMA",
+    "RELEASE_RECEIPT_SCHEMA",
     "SYNTHETIC_ATTESTATION_SCHEMA",
     "SYNTHETIC_CANARY_SCHEMA",
     "DockerUnavailable",
@@ -922,21 +1495,37 @@ __all__ = [
     "canonical_sha256",
     "check_docker_readiness",
     "docker_readiness",
+    "docker_canary_command",
+    "docker_container_inspect_command",
+    "docker_create_command",
+    "docker_image_inspect_command",
+    "docker_ready_command",
+    "docker_release_command",
+    "docker_remove_command",
     "docker_run_command",
+    "docker_start_command",
+    "docker_wait_command",
     "expected_inspect_summary",
     "expected_worker_argv",
     "make_attestation",
+    "make_pre_release_gate",
     "make_rehearsal_attestation",
     "make_synthetic_rehearsal_attestation",
     "normalize_docker_inspect",
+    "normalize_container_inspect",
+    "normalize_image_inspect",
     "require_docker_readiness",
     "require_formal_isolation",
     "run_denial_canary",
+    "run_isolated_rehearsal",
     "run_synthetic_denial_canary",
     "validate_attestation",
     "validate_denial_canary",
     "validate_inspect_summary",
     "validate_isolation_plan",
+    "validate_live_rehearsal_attestation",
+    "validate_pre_release_gate",
+    "validate_release_receipt",
     "validate_rehearsal_attestation",
     "validate_synthetic_denial_canary",
     "validate_synthetic_rehearsal_attestation",

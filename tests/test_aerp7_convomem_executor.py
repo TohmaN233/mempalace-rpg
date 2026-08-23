@@ -164,6 +164,10 @@ def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, m
     assert packet["formal_eligible"] is False
     assert set(packet["supervisors"]) == {"current-raw", "current-p5_primary", "current-p5_repeat", "current-six", "original-0", "original-1", "original-2", "original-3", "original-4"}
     assert len({row["pid"] for row in packet["supervisors"].values()}) == 9
+    assert all(isinstance(row["descendant_process_count"], int) and row["descendant_process_count"] >= 0 for row in packet["supervisors"].values())
+    assert all(row["descendant_processes_observed"] is (row["descendant_process_count"] > 0) for row in packet["supervisors"].values())
+    assert all(row["descendant_observation_method"] == "psutil_polling_non_exhaustive" for row in packet["supervisors"].values())
+    assert all(row["supervisor_observation_complete"] is True and row["supervisor_observation_samples"] >= 2 for row in packet["supervisors"].values())
     assert packet["current_worker_receipt"]["static_p5_execution_count"] == 2
     assert packet["current_worker_receipt"]["static_p5_primary_sha256"] == packet["current_worker_receipt"]["static_p5_repeat_sha256"]
     execution = packet["current_worker_receipt"]["execution_receipts"]
@@ -210,14 +214,148 @@ def test_original_resource_requires_external_supervisor_rebind_before_publish():
     )
     rebound = executor.finalize_original_resource(
         resource=resource,
-        supervisor={"observed_process_tree_peak_rss_bytes": 97},
+        supervisor={
+            "pid": 321,
+            "exit_code": 0,
+            "observed_process_tree_peak_rss_bytes": 97,
+            "descendant_process_count": 0,
+            "descendant_processes_observed": False,
+            "descendant_observation_method": "os_enforced_complete_process_group",
+            "supervisor_observation_samples": 3,
+            "supervisor_observation_complete": True,
+        },
+        worker_pid=321,
     )
     assert rebound["peak_rss_bytes"] == 97
     assert rebound["resource_sha256"] == executor.formal.resource_digest(rebound)
+    with pytest.raises(CustodyError, match="descendant_observation_missing"):
+        executor.finalize_original_resource(
+            resource=resource,
+            supervisor={"observed_process_tree_peak_rss_bytes": 97},
+            worker_pid=321,
+        )
+    with pytest.raises(CustodyError, match="descendant_process"):
+        executor.finalize_original_resource(
+            resource=resource,
+            supervisor={
+                "pid": 321,
+                "exit_code": 0,
+                "observed_process_tree_peak_rss_bytes": 97,
+                "descendant_process_count": 1,
+                "descendant_processes_observed": True,
+                "descendant_observation_method": "os_enforced_complete_process_group",
+                "supervisor_observation_samples": 3,
+                "supervisor_observation_complete": True,
+            },
+            worker_pid=321,
+        )
     with pytest.raises(CustodyError, match="supervisor_peak_invalid"):
         executor.finalize_original_resource(
             resource=resource,
-            supervisor={"observed_process_tree_peak_rss_bytes": 0},
+            supervisor={
+                "pid": 321,
+                "exit_code": 0,
+                "observed_process_tree_peak_rss_bytes": 0,
+                "descendant_process_count": 0,
+                "descendant_processes_observed": False,
+                "descendant_observation_method": "os_enforced_complete_process_group",
+                "supervisor_observation_samples": 3,
+                "supervisor_observation_complete": True,
+            },
+            worker_pid=321,
+        )
+
+
+def test_supervisor_observer_records_transient_descendants_and_non_exhaustive_no_child_sample(monkeypatch):
+    class NoSuchProcess(Exception):
+        pass
+
+    class ZombieProcess(Exception):
+        pass
+
+    class Child:
+        pid = 222
+
+        def is_running(self):
+            return True
+
+        def memory_info(self):
+            return SimpleNamespace(rss=3)
+
+    class Root:
+        def __init__(self, with_transient_child):
+            self.calls = 0
+            self.with_transient_child = with_transient_child
+
+        def children(self, recursive=True):
+            self.calls += 1
+            if self.with_transient_child and self.calls >= 2:
+                return [Child()]
+            return []
+
+        def is_running(self):
+            return True
+
+        def memory_info(self):
+            return SimpleNamespace(rss=7)
+
+    def run(with_transient_child):
+        root = Root(with_transient_child)
+        fake_psutil = SimpleNamespace(
+            NoSuchProcess=NoSuchProcess,
+            ZombieProcess=ZombieProcess,
+            Process=lambda _pid: root,
+        )
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+        observer = executor._SupervisorTreeObserver(111)
+        with observer:
+            time.sleep(0.06)
+        return observer.receipt()
+
+    transient = run(True)
+    assert transient["descendant_process_count"] == 1
+    assert transient["descendant_processes_observed"] is True
+    assert transient["descendant_observation_method"] == "psutil_polling_non_exhaustive"
+    assert transient["supervisor_observation_complete"] is True
+    no_child = run(False)
+    assert no_child["descendant_process_count"] == 0
+    assert no_child["descendant_processes_observed"] is False
+    assert no_child["descendant_observation_method"] == "psutil_polling_non_exhaustive"
+    assert no_child["supervisor_observation_samples"] >= 2
+
+
+def test_original_resource_rejects_polling_as_formal_zero_descendant_proof():
+    resource = executor._resource(
+        arm_id="original_public_product",
+        artifact_sha256="4" * 64,
+        denominators={"query_count": 2, "candidate_text_count": 2},
+        query_measurements=[
+            {"item_id": "item-1", "query_sha256": "1" * 64, "wall_ns": 1, "cpu_ns": 1},
+            {"item_id": "item-2", "query_sha256": "2" * 64, "wall_ns": 1, "cpu_ns": 1},
+        ],
+        build_id="build-1",
+        index_sha256="5" * 64,
+        peak_rss_bytes=0,
+        allow_unfinalized_peak=True,
+        passage_embedding={"calls": 1, "texts": 2},
+        query_embedding={"calls": 2, "texts": 2},
+        measurement_mode="live_original_public_product",
+        storage_bytes=13,
+    )
+    with pytest.raises(CustodyError, match="descendant_observation_insufficient"):
+        executor.finalize_original_resource(
+            resource=resource,
+            supervisor={
+                "pid": 321,
+                "exit_code": 0,
+                "observed_process_tree_peak_rss_bytes": 97,
+                "descendant_process_count": 0,
+                "descendant_processes_observed": False,
+                "descendant_observation_method": "psutil_polling_non_exhaustive",
+                "supervisor_observation_samples": 3,
+                "supervisor_observation_complete": True,
+            },
+            worker_pid=321,
         )
 
 
