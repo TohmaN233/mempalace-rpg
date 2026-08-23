@@ -189,6 +189,38 @@ def test_live_current_helper_is_not_reachable_from_synthetic_execution(tmp_path)
         executor.run_live_current_execution(role="raw", protocol=protocol, projection=projection, worker_config=fixture["worker_config"](projection, protocol), model_dir=tmp_path)
 
 
+def test_original_resource_requires_external_supervisor_rebind_before_publish():
+    measurements = [
+        {"item_id": "1" * 64, "query_sha256": "2" * 64, "wall_ns": 11, "cpu_ns": 5},
+        {"item_id": "3" * 64, "query_sha256": "4" * 64, "wall_ns": 17, "cpu_ns": 7},
+    ]
+    resource = executor._resource(
+        arm_id="original_public_product",
+        artifact_sha256="0" * 64,
+        denominators={"query_count": 2, "candidate_text_count": 2},
+        query_measurements=measurements,
+        build_id="build-0",
+        index_sha256="5" * 64,
+        peak_rss_bytes=0,
+        allow_unfinalized_peak=True,
+        passage_embedding={"calls": 1, "texts": 2},
+        query_embedding={"calls": 2, "texts": 2},
+        measurement_mode="live_original_public_product",
+        storage_bytes=13,
+    )
+    rebound = executor.finalize_original_resource(
+        resource=resource,
+        supervisor={"observed_process_tree_peak_rss_bytes": 97},
+    )
+    assert rebound["peak_rss_bytes"] == 97
+    assert rebound["resource_sha256"] == executor.formal.resource_digest(rebound)
+    with pytest.raises(CustodyError, match="supervisor_peak_invalid"):
+        executor.finalize_original_resource(
+            resource=resource,
+            supervisor={"observed_process_tree_peak_rss_bytes": 0},
+        )
+
+
 def test_worker_failure_discards_staging_and_consumes_authorization(tmp_path, monkeypatch):
     config, output = _coordinator_inputs(tmp_path, monkeypatch)
     monkeypatch.setattr(executor, "_run_subprocess", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected_worker_failure")))

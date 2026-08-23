@@ -124,7 +124,7 @@ def _percentiles(values: Sequence[int]) -> dict[str, int]:
     return {"count": len(rows), "p50": at(.50), "p95": at(.95), "p99": at(.99), "max": rows[-1]}
 
 
-def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], query_measurements: Sequence[Mapping[str, Any]], build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1, passage_embedding: Mapping[str, Any] | None = None, query_embedding: Mapping[str, Any] | None = None, measurement_mode: str = "synthetic_rehearsal", storage_bytes: int = 0, storage_scope: str | None = None) -> dict[str, Any]:
+def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], query_measurements: Sequence[Mapping[str, Any]], build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1, allow_unfinalized_peak: bool = False, passage_embedding: Mapping[str, Any] | None = None, query_embedding: Mapping[str, Any] | None = None, measurement_mode: str = "synthetic_rehearsal", storage_bytes: int = 0, storage_scope: str | None = None) -> dict[str, Any]:
     execution_role = role or ("fresh_build" if arm_id == "original_public_product" else "primary")
     accounting = {"primary": "primary_excludes_repeat", "repeat": "repeat_measured_separately"}[execution_role] if arm_id == "static_p5" else "not_applicable"
     measurements = [dict(item) for item in query_measurements]
@@ -140,6 +140,8 @@ def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, i
     else:
         passage.update({"measurement_kind": "public_upsert_request_proxy", "native_embedding_observable": False, "limitation": "native_internal_embedding_calls_unobservable; public upsert request ledger only"})
         query.update({"measurement_kind": "public_search_request_proxy", "native_embedding_observable": False, "limitation": "native_internal_embedding_calls_unobservable; public search request ledger only"})
+    if isinstance(peak_rss_bytes, bool) or not isinstance(peak_rss_bytes, int) or peak_rss_bytes < 0 or (peak_rss_bytes == 0 and not allow_unfinalized_peak):
+        raise RuntimeError("executor peak RSS observation invalid")
     receipt = {
         "schema": formal.RESOURCE_SCHEMA,
         "arm_id": arm_id,
@@ -156,7 +158,7 @@ def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, i
         "query_embedding": query,
         "storage_scope": storage_scope or ("no_persistent_index" if current_arm else "palace_directory_after_cold_reopen"),
         "storage_bytes": int(storage_bytes),
-        "peak_rss_bytes": max(1, int(peak_rss_bytes)),
+        "peak_rss_bytes": int(peak_rss_bytes),
         "artifact_sha256": artifact_sha256,
         "build_id": build_id,
         "index_sha256": index_sha256,
@@ -208,9 +210,8 @@ class _LiveOriginalObserver:
     original-product module independently cross-checks them against its ledger.
     """
 
-    def __init__(self, *, palace_path: Path, monitor: RssMonitor, provider: Mapping[str, Any], denominators: Mapping[str, int], corpus_count: int) -> None:
+    def __init__(self, *, palace_path: Path, provider: Mapping[str, Any], denominators: Mapping[str, int], corpus_count: int) -> None:
         self._palace_path = palace_path
-        self._monitor = monitor
         self._provider = dict(provider)
         self._denominators = dict(denominators)
         self._corpus_count = int(corpus_count)
@@ -226,10 +227,13 @@ class _LiveOriginalObserver:
         if self._phases != ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]:
             raise RuntimeError("original product observer lifecycle incomplete")
         storage = sum(path.stat().st_size for path in self._palace_path.rglob("*") if path.is_file() and not path.is_symlink())
-        if self._monitor.peak_bytes <= 0 or storage <= 0:
+        if storage <= 0:
             raise RuntimeError("original product resource observation incomplete")
         return {
-            "peak_rss_bytes": int(self._monitor.peak_bytes),
+            # The child cannot author its own formal peak-RSS claim.  The
+            # coordinator rebinds this explicit non-publishable sentinel to
+            # the external supervisor's process-tree observation after exit.
+            "peak_rss_bytes": 0,
             "storage_bytes": int(storage),
             "passage_embedding": {
                 "calls": self._corpus_count,
@@ -267,17 +271,67 @@ def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDr
     telemetry = draft.telemetry.get("resources")
     if not isinstance(telemetry, Mapping):
         raise CustodyError("executor_original_resource_invalid")
-    latencies = telemetry.get("query_latency_seconds")
-    if not isinstance(latencies, list) or len(latencies) != int(denominators["query_count"]):
+    try:
+        measurements = original_product.validate_query_measurements(
+            measurements=telemetry.get("query_measurements"),
+            replicate=replicate,
+            expected_count=int(denominators["query_count"]),
+        )
+        original_product._validate_clock_receipt(telemetry.get("clock_receipt"))
+    except original_product.OriginalProductError as exc:
+        raise CustodyError("executor_original_resource_invalid") from exc
+    if telemetry.get("process_cpu_scope") != "worker_process_only" or telemetry.get("descendant_processes_observed") is not False:
+        raise CustodyError("executor_original_resource_descendant_process_invalid")
+    # The child cannot observe a durable process-tree RSS maximum without
+    # authoring its own claim.  ``0`` is an explicit pre-supervisor sentinel;
+    # finalize_original_resource binds the external positive observation later.
+    if telemetry.get("peak_rss_bytes") != 0:
+        raise CustodyError("executor_original_resource_peak_not_unfinalized")
+    storage_bytes = telemetry.get("storage_bytes")
+    if isinstance(storage_bytes, bool) or not isinstance(storage_bytes, int) or storage_bytes <= 0:
         raise CustodyError("executor_original_resource_invalid")
-    latency_ns = [max(1, int(float(value) * 1_000_000_000)) for value in latencies]
-    rankings = replicate.get("rankings")
-    if not isinstance(rankings, list) or len(rankings) != len(latency_ns):
+    passage = telemetry.get("passage_embedding")
+    query = telemetry.get("query_embedding")
+    if not isinstance(passage, Mapping) or not isinstance(query, Mapping):
         raise CustodyError("executor_original_resource_invalid")
-    # Upstream's current draft telemetry provides only wall-clock per query.  A
-    # CPU number copied from wall time would be fabricated evidence, so the live
-    # original route remains fail-closed until its runner exposes CPU sidecars.
-    raise CustodyError("executor_original_cpu_timing_unobservable")
+    for metric in (passage, query):
+        if isinstance(metric.get("calls"), bool) or not isinstance(metric.get("calls"), int) or metric["calls"] <= 0:
+            raise CustodyError("executor_original_resource_invalid")
+        if isinstance(metric.get("texts"), bool) or not isinstance(metric.get("texts"), int) or metric["texts"] <= 0:
+            raise CustodyError("executor_original_resource_invalid")
+    return _resource(
+        arm_id="original_public_product",
+        artifact_sha256="0" * 64,
+        denominators=denominators,
+        query_measurements=measurements,
+        build_id=str(replicate["build_id"]),
+        index_sha256=str(replicate["index_sha256"]),
+        peak_rss_bytes=0,
+        allow_unfinalized_peak=True,
+        passage_embedding={"calls": passage["calls"], "texts": passage["texts"]},
+        query_embedding={"calls": query["calls"], "texts": query["texts"]},
+        measurement_mode="live_original_public_product",
+        storage_bytes=storage_bytes,
+        storage_scope="palace_directory_after_cold_reopen",
+    )
+
+
+def finalize_original_resource(*, resource: Mapping[str, Any], supervisor: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind a live original resource draft to the external RSS observation."""
+    row = dict(resource)
+    if row.get("arm_id") != "original_public_product" or row.get("peak_rss_bytes") != 0:
+        raise CustodyError("executor_original_resource_finalize_precondition_invalid")
+    if not isinstance(supervisor, Mapping) or supervisor.get("descendant_processes_observed", False) is not False:
+        raise CustodyError("executor_original_resource_descendant_process_invalid")
+    descendant_count = supervisor.get("descendant_process_count", 0)
+    if isinstance(descendant_count, bool) or not isinstance(descendant_count, int) or descendant_count != 0:
+        raise CustodyError("executor_original_resource_descendant_process_invalid")
+    observed = supervisor.get("observed_process_tree_peak_rss_bytes")
+    if isinstance(observed, bool) or not isinstance(observed, int) or observed <= 0:
+        raise CustodyError("executor_original_resource_supervisor_peak_invalid")
+    row["peak_rss_bytes"] = observed
+    row["resource_sha256"] = formal.resource_digest(row)
+    return row
 
 
 def _sanitized_env() -> dict[str, str]:
@@ -664,11 +718,11 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         original_root, model_dir = Path(str(config["original_root"])), Path(str(config["model_dir"]))
         if not original_root.is_dir() or original_root.is_symlink() or not model_dir.is_dir() or model_dir.is_symlink():
             raise CustodyError("executor_original_live_input_invalid")
-        with RssMonitor(os.getpid()) as monitor, original_product.pinned_live_original_product(
+        with original_product.pinned_live_original_product(
             original_root=original_root, model_dir=model_dir, palace_path=palace_path,
         ) as (seams, live_receipt):
             observer = _LiveOriginalObserver(
-                palace_path=palace_path, monitor=monitor, provider=seams.encoder.runtime_identity,
+                palace_path=palace_path, provider=seams.encoder.runtime_identity,
                 denominators=denominators, corpus_count=len(projection["corpora"]),
             )
             draft = original_product.run_original_public_replicate(
@@ -830,7 +884,18 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             for packet, (draft_path, palace_path) in zip(original_packets, original_jobs, strict=True)
         ]
         original_replicates = [row[0] for row in reaudited]
-        original_packets = [{**packet, "resource_receipt": resource} for packet, (_replicate, resource) in zip(original_packets, reaudited, strict=True)]
+        rebound_packets = []
+        for number, (packet, (_replicate, resource)) in enumerate(zip(original_packets, reaudited, strict=True)):
+            rebound = {
+                **packet,
+                "resource_receipt": finalize_original_resource(
+                    resource=resource,
+                    supervisor=supervisors[f"original-{number}"],
+                ),
+            }
+            rebound["packet_sha256"] = _digest({key: item for key, item in rebound.items() if key != "packet_sha256"})
+            rebound_packets.append(rebound)
+        original_packets = rebound_packets
     sealed = {"replicates": original_replicates, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": protocol["original_code_receipt"], "original_code_after": protocol["original_code_receipt"]}
     sealed["worker_sha256"] = formal._digest(sealed)
     checked_original = formal.validate_original_worker_receipt(sealed, projection=projection, protocol=protocol)

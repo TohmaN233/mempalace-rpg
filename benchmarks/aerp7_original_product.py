@@ -30,6 +30,7 @@ LIVE_PINNED = "live_pinned"
 PUBLIC_UPSERT_MEASUREMENT = "public_upsert_document_request_ledger_native_internal_calls_unobservable"
 PUBLIC_SEARCH_MEASUREMENT = "public_search_request_ledger_native_internal_calls_unobservable"
 DRAFT_SCHEMA = "aerp7-original-product-worker-draft-v1"
+CLOCK_RECEIPT_SCHEMA = "aerp7-original-product-clock-receipt-v1"
 _LIVE_CAPABILITIES: set[int] = set()
 
 
@@ -91,6 +92,95 @@ def _digest(value: Any) -> str:
 
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _clock_receipt() -> dict[str, Any]:
+    """Bind the two stdlib clocks used by the per-query sidecar.
+
+    ``process_time`` is deliberately documented as belonging to this worker
+    process only.  It is not an adapter/model counter and it does not include
+    descendants; the external supervisor supplies the separate process-tree
+    RSS observation after the child exits.
+    """
+    def one(name: str) -> dict[str, Any]:
+        info = time.get_clock_info(name)
+        return {
+            "name": name,
+            "implementation": str(info.implementation),
+            "monotonic": bool(info.monotonic),
+            "adjustable": bool(info.adjustable),
+            "resolution_ns": int(round(float(info.resolution) * 1_000_000_000)),
+        }
+
+    return {
+        "schema": CLOCK_RECEIPT_SCHEMA,
+        "wall": one("perf_counter"),
+        "process_cpu": one("process_time"),
+        "process_cpu_scope": "worker_process_only",
+        "descendant_processes_observed": False,
+    }
+
+
+def _validate_clock_receipt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema", "wall", "process_cpu", "process_cpu_scope", "descendant_processes_observed"
+    } or value.get("schema") != CLOCK_RECEIPT_SCHEMA:
+        raise OriginalProductError("resource telemetry clock receipt is malformed")
+    if value.get("process_cpu_scope") != "worker_process_only" or value.get("descendant_processes_observed") is not False:
+        raise OriginalProductError("resource telemetry process CPU scope is invalid")
+    for key, expected_name in (("wall", "perf_counter"), ("process_cpu", "process_time")):
+        clock = value.get(key)
+        if not isinstance(clock, Mapping) or set(clock) != {"name", "implementation", "monotonic", "adjustable", "resolution_ns"}:
+            raise OriginalProductError("resource telemetry clock receipt is malformed")
+        if clock.get("name") != expected_name or not isinstance(clock.get("implementation"), str) or not clock["implementation"].strip():
+            raise OriginalProductError("resource telemetry clock receipt is malformed")
+        if not isinstance(clock.get("monotonic"), bool) or not isinstance(clock.get("adjustable"), bool):
+            raise OriginalProductError("resource telemetry clock receipt is malformed")
+        resolution = clock.get("resolution_ns")
+        if isinstance(resolution, bool) or not isinstance(resolution, int) or resolution <= 0:
+            raise OriginalProductError("resource telemetry clock receipt is malformed")
+    return dict(value)
+
+
+def _validate_query_measurement_rows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise OriginalProductError("resource telemetry query measurements are malformed")
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, Mapping) or set(raw) != {"item_id", "query_sha256", "wall_ns", "cpu_ns"}:
+            raise OriginalProductError("resource telemetry query measurements are malformed")
+        item_id, query_sha = raw.get("item_id"), raw.get("query_sha256")
+        if not isinstance(item_id, str) or len(item_id) != 64 or any(ch not in "0123456789abcdef" for ch in item_id) or item_id in seen:
+            raise OriginalProductError("resource telemetry query measurements are malformed")
+        if not isinstance(query_sha, str) or len(query_sha) != 64 or any(ch not in "0123456789abcdef" for ch in query_sha):
+            raise OriginalProductError("resource telemetry query measurements are malformed")
+        for key in ("wall_ns", "cpu_ns"):
+            sample = raw.get(key)
+            if isinstance(sample, bool) or not isinstance(sample, int):
+                raise OriginalProductError("resource telemetry query measurements are malformed")
+        seen.add(item_id)
+        rows.append(dict(raw))
+    return rows
+
+
+def validate_query_measurements(*, measurements: Any, replicate: Mapping[str, Any], expected_count: int) -> list[dict[str, Any]]:
+    """Bind sidecar rows to the exact worker ranking order and query hashes."""
+    rows = _validate_query_measurement_rows(measurements)
+    rankings = replicate.get("rankings") if isinstance(replicate, Mapping) else None
+    if not isinstance(rankings, list) or len(rankings) != expected_count or len(rows) != expected_count:
+        raise OriginalProductError("resource telemetry query coverage is invalid")
+    expected: list[dict[str, str]] = []
+    for ranking in rankings:
+        if not isinstance(ranking, Mapping) or not isinstance(ranking.get("item_id"), str) or not isinstance(ranking.get("query_sha256"), str):
+            raise OriginalProductError("resource telemetry query coverage is invalid")
+        expected.append({"item_id": ranking["item_id"], "query_sha256": ranking["query_sha256"]})
+    actual = [{"item_id": row["item_id"], "query_sha256": row["query_sha256"]} for row in rows]
+    if actual != expected or actual != sorted(actual, key=lambda row: row["item_id"]):
+        raise OriginalProductError("resource telemetry query binding is invalid")
+    if any(row["wall_ns"] <= 0 or row["cpu_ns"] <= 0 for row in rows):
+        raise OriginalProductError("resource telemetry query timing is invalid")
+    return rows
 
 
 def _token(value: Any, label: str) -> str:
@@ -179,6 +269,14 @@ def _validate_worker_draft_telemetry(value: Any) -> dict[str, Any]:
         raise OriginalProductError("worker draft telemetry schema is malformed")
     if not isinstance(value["formal_eligible"], bool) or not isinstance(value["live_receipt"], Mapping) or not isinstance(value["ledger"], list) or not isinstance(value["resources"], Mapping):
         raise OriginalProductError("worker draft telemetry schema is malformed")
+    resources = value["resources"]
+    required_sidecars = {"query_measurements", "clock_receipt", "process_cpu_scope", "descendant_processes_observed"}
+    if not required_sidecars <= set(resources):
+        raise OriginalProductError("worker draft telemetry sidecar schema is malformed")
+    _validate_query_measurement_rows(resources["query_measurements"])
+    _validate_clock_receipt(resources["clock_receipt"])
+    if resources["process_cpu_scope"] != "worker_process_only" or resources["descendant_processes_observed"] is not False:
+        raise OriginalProductError("worker draft telemetry process CPU scope is invalid")
     return dict(value)
 
 
@@ -434,6 +532,14 @@ def _validate_resource_telemetry(*, value: Mapping[str, Any], seams: OriginalPro
         raise OriginalProductError("resource observer lacks actual RSS/storage/native-embedding/provider measurement")
     for key in ("peak_rss_bytes", "storage_bytes"):
         _nonnegative_int(row[key], key)
+    required_sidecars = {"query_measurements", "clock_receipt", "process_cpu_scope", "descendant_processes_observed"}
+    if required_sidecars & set(row) and not required_sidecars <= set(row):
+        raise OriginalProductError("resource telemetry sidecar schema is malformed")
+    if required_sidecars <= set(row):
+        _validate_query_measurement_rows(row["query_measurements"])
+        _validate_clock_receipt(row["clock_receipt"])
+        if row["process_cpu_scope"] != "worker_process_only" or row["descendant_processes_observed"] is not False:
+            raise OriginalProductError("resource telemetry process CPU scope is invalid")
     for key in ("passage_embedding", "query_embedding"):
         metric = row[key]
         if not isinstance(metric, Mapping) or set(metric) != {"calls", "texts", "measurement"}:
@@ -461,7 +567,7 @@ def _validate_resource_telemetry(*, value: Mapping[str, Any], seams: OriginalPro
     return row
 
 
-def run_original_public_replicate(*, projection: Any, build_id: str, collection_identity: str, palace_path: Path, observer: ResourceObserver | None, seams: OriginalProductSeams, live_receipt: Mapping[str, Any] | None = None, formal: bool = False, resource_sink: Callable[[Mapping[str, Any]], None] | None = None) -> OriginalProductWorkerDraft:
+def run_original_public_replicate(*, projection: Any, build_id: str, collection_identity: str, palace_path: Path, observer: ResourceObserver | None, seams: OriginalProductSeams, live_receipt: Mapping[str, Any] | None = None, formal: bool = False, resource_sink: Callable[[Mapping[str, Any]], None] | None = None, wall_clock_ns: Callable[[], int] | None = None, cpu_clock_ns: Callable[[], int] | None = None) -> OriginalProductWorkerDraft:
     """Run the worker phase; a coordinator audit is mandatory before publication.
 
     Return a deliberately non-publishable draft.  The only function that creates
@@ -481,6 +587,10 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
     by_corpus = _namespace_by_corpus(namespace)
     if len({build_id, collection_identity}) != 2 or not all(isinstance(value, str) and value.strip() for value in (build_id, collection_identity)):
         raise OriginalProductError("build/collection identity must be distinct non-empty strings")
+    wall_clock_ns = time.perf_counter_ns if wall_clock_ns is None else wall_clock_ns
+    cpu_clock_ns = time.process_time_ns if cpu_clock_ns is None else cpu_clock_ns
+    if not callable(wall_clock_ns) or not callable(cpu_clock_ns):
+        raise OriginalProductError("query timing clocks must be callable")
     ledger: list[dict[str, Any]] = []
     observer.checkpoint("before_ingest")
     started = time.perf_counter()
@@ -496,18 +606,39 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
     ledger.append({"event": "cold_reopen_barrier", "cleanup": cleanup})
     observer.checkpoint("after_cold_close")
     corpora = {row["corpus_id"]: row for row in frozen["corpora"]}
-    rows, traces, query_latencies = [], [], []
+    rows, traces, query_latencies, query_measurements = [], [], [], []
     for item in sorted(frozen["items"], key=lambda row: row["item_id"]):
-        began = time.perf_counter()
+        wall_started = wall_clock_ns()
+        cpu_started = cpu_clock_ns()
         row, trace = _row_for_query(item=item, corpus=corpora[item["corpus_id"]], physical_by_message=by_corpus[item["corpus_id"]], searcher=seams.searcher, palace_path=palace_path, ledger=ledger, latency_seconds=0.0)
-        elapsed = time.perf_counter() - began
+        wall_elapsed_ns = wall_clock_ns() - wall_started
+        cpu_elapsed_ns = cpu_clock_ns() - cpu_started
+        elapsed = wall_elapsed_ns / 1_000_000_000
         ledger[-1]["latency_seconds"] = elapsed
-        query_latencies.append(elapsed); rows.append(row); traces.append(trace)
+        query_latencies.append(elapsed)
+        query_measurements.append({
+            "item_id": row["item_id"],
+            "query_sha256": row["query_sha256"],
+            "wall_ns": wall_elapsed_ns,
+            "cpu_ns": cpu_elapsed_ns,
+        })
+        rows.append(row); traces.append(trace)
     observer.checkpoint("after_queries")
     worker_physical = dynamic_original_index_build_receipt(palace_path=palace_path, expected_namespace=namespace, auditor=seams.auditor)
     request_counts = _public_request_counts(ledger)
-    resources = _validate_resource_telemetry(value=observer.receipt(), seams=seams, formal=formal, public_request_counts=request_counts, expected_query_count=len(frozen["items"]), expected_corpus_count=len(frozen["corpora"]), expected_candidate_count=sum(len(corpus["candidates"]) for corpus in frozen["corpora"]))
-    resources.update({"ingest_seconds": ingest_seconds, "index_seconds": index_seconds, "query_latency_seconds": query_latencies, "native_internal_embedding_calls_observable": False, "native_internal_embedding_limitation": "exact_public_product_uses_cached_native_callable; internal_embedding_calls_unobservable"})
+    resources = dict(observer.receipt())
+    resources.update({
+        "ingest_seconds": ingest_seconds,
+        "index_seconds": index_seconds,
+        "query_latency_seconds": query_latencies,
+        "query_measurements": sorted(query_measurements, key=lambda item: item["item_id"]),
+        "clock_receipt": _clock_receipt(),
+        "process_cpu_scope": "worker_process_only",
+        "descendant_processes_observed": False,
+        "native_internal_embedding_calls_observable": False,
+        "native_internal_embedding_limitation": "exact_public_product_uses_cached_native_callable; internal_embedding_calls_unobservable",
+    })
+    resources = _validate_resource_telemetry(value=resources, seams=seams, formal=formal, public_request_counts=request_counts, expected_query_count=len(frozen["items"]), expected_corpus_count=len(frozen["corpora"]), expected_candidate_count=sum(len(corpus["candidates"]) for corpus in frozen["corpora"]))
     input_receipt = rank._input_receipt(frozen, rank.ORIGINAL_MEMPALACE_SERIALIZER)
     query_coverage = _digest([{"item_id": item["item_id"], "query_sha256": hashlib.sha256(item["query_text"].encode("utf-8")).hexdigest()} for item in sorted(frozen["items"], key=lambda row: row["item_id"])])
     output_coverage = _digest([{"item_id": trace["item_id"], "ranking_sha256": trace["ranking_sha256"]} for trace in traces])

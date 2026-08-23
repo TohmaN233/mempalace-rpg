@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -263,3 +264,65 @@ def test_worker_draft_packet_rejects_schema_digest_and_cross_binding_tampering(t
     worker_tamper = copy.deepcopy(packet); worker_tamper["worker_physical_receipt"]["sqlite_semantic_sha256"] = h("forged"); worker_tamper["worker_physical_receipt_sha256"] = original._digest(worker_tamper["worker_physical_receipt"])
     with pytest.raises(original.OriginalProductError, match="physical receipt mismatch"):
         original.load_worker_draft(_repack(worker_tamper))
+
+
+def test_query_sidecar_uses_injected_process_clocks_and_does_not_change_rankings(tmp_path):
+    p = projection()
+    wall = iter([100, 250, 400, 700])
+    cpu = iter([1_000, 1_100, 2_000, 2_200])
+    injected, _palace, _state = seams()
+    timed = original.run_original_public_replicate(
+        projection=p,
+        build_id="clock-build",
+        collection_identity="clock-collection",
+        palace_path=tmp_path / "clock-palace",
+        observer=Observer(),
+        seams=injected,
+        wall_clock_ns=lambda: next(wall),
+        cpu_clock_ns=lambda: next(cpu),
+    )
+    injected_again, _palace_again, _state_again = seams()
+    untimed = original.run_original_public_replicate(
+        projection=p,
+        build_id="clock-build-2",
+        collection_identity="clock-collection-2",
+        palace_path=tmp_path / "clock-palace-2",
+        observer=Observer(),
+        seams=injected_again,
+    )
+    telemetry = timed.telemetry["resources"]
+    ordered_items = sorted(p["items"], key=lambda row: row["item_id"])
+    assert telemetry["query_measurements"] == [
+        {"item_id": ordered_items[0]["item_id"], "query_sha256": rank._query_digest(ordered_items[0]["query_text"]), "wall_ns": 150, "cpu_ns": 100},
+        {"item_id": ordered_items[1]["item_id"], "query_sha256": rank._query_digest(ordered_items[1]["query_text"]), "wall_ns": 300, "cpu_ns": 200},
+    ]
+    assert telemetry["clock_receipt"]["schema"] == original.CLOCK_RECEIPT_SCHEMA
+    assert telemetry["process_cpu_scope"] == "worker_process_only"
+    assert telemetry["descendant_processes_observed"] is False
+    assert timed.replicate_without_coordinator_audit["rankings"] == untimed.replicate_without_coordinator_audit["rankings"]
+
+
+def test_query_sidecar_rejects_nonpositive_timing_and_binding_tampering():
+    p = projection()
+    injected, _palace, _state = seams()
+    draft = original.run_original_public_replicate(
+        projection=p,
+        build_id="sidecar-build",
+        collection_identity="sidecar-collection",
+        palace_path=Path("sidecar-palace"),
+        observer=Observer(),
+        seams=injected,
+    )
+    rows = draft.telemetry["resources"]["query_measurements"]
+    with pytest.raises(original.OriginalProductError, match="query timing"):
+        original.validate_query_measurements(
+            measurements=[{**rows[0], "wall_ns": 0}, rows[1]],
+            replicate=draft.replicate_without_coordinator_audit,
+            expected_count=2,
+        )
+    with pytest.raises(original.OriginalProductError, match="query binding"):
+        original.validate_query_measurements(
+            measurements=[{**rows[0], "query_sha256": h("forged")}, rows[1]],
+            replicate=draft.replicate_without_coordinator_audit,
+            expected_count=2,
+        )
