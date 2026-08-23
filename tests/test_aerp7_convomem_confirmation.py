@@ -64,9 +64,9 @@ def _roots(tmp_path: Path, *, mixed: bool = False) -> tuple[Path, Path]:
             _write(canonical / "core_benchmark" / "evidence_questions" / group / "tier-1" / f"{persona}.json", {"evidence_items": [evidence]})
             for size in (1, 8, 13):
                 embedded = {key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}
-                all_cases.append({"contextSize": size, "evidenceItems": [embedded], "conversations": [{"id": conversation, "messages": [{"text": f"candidate-{persona}-{suffix}"}]}]})
+                all_cases.append({"contextSize": size, "evidenceItems": [embedded], "conversations": [{"id": conversation, "messages": [{"speaker": f"speaker-{persona}", "text": f"candidate-{persona}-{suffix}"}]}]})
     if mixed:
-        all_cases.append({"contextSize": 3, "evidenceItems": [{"personId": "p-a", "question": "q-p-a-1", "answer": "SECRET-p-a-group-1", "category": "category-group-1", "conversations": [{"id": "p-a-group-1-conversation"}]}, {"personId": "p-b", "question": "q-p-b-1", "answer": "SECRET-p-b-group-1", "category": "category-group-1", "conversations": [{"id": "p-b-group-1-conversation"}]}], "conversations": [{"id": "p-a-group-1-conversation", "messages": [{"text": "candidate-p-a-1"}]}, {"id": "p-b-group-1-conversation", "messages": [{"text": "candidate-p-b-1"}]}]})
+        all_cases.append({"contextSize": 3, "evidenceItems": [{"personId": "p-a", "question": "q-p-a-1", "answer": "SECRET-p-a-group-1", "category": "category-group-1", "conversations": [{"id": "p-a-group-1-conversation"}]}, {"personId": "p-b", "question": "q-p-b-1", "answer": "SECRET-p-b-group-1", "category": "category-group-1", "conversations": [{"id": "p-b-group-1-conversation"}]}], "conversations": [{"id": "p-a-group-1-conversation", "messages": [{"speaker": "speaker-p-a", "text": "candidate-p-a-1"}]}, {"id": "p-b-group-1-conversation", "messages": [{"speaker": "speaker-p-b", "text": "candidate-p-b-1"}]}]})
     _write(premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json", all_cases)
     _write(canonical / "core_benchmark" / "evidence_questions" / "legacy_benchmarks" / "ignored.json", {"evidence_items": []})
     return canonical, premix
@@ -108,10 +108,111 @@ def test_multicontext_projection_is_normalized_safe_and_group_selected(tmp_path:
     assert len({item["corpus_id"] for item in projection["items"]}) == 4
     assert all(row["candidates"][0]["text"].startswith("candidate-") for row in expanded)
     serialized = json.dumps(projection)
-    assert all(token not in serialized for token in ("SECRET-", '"speaker"', '"message_evidences"', "category-group-", '"contextSize"'))
+    assert all(token not in serialized for token in ("SECRET-", '"message_evidences"', "category-group-", '"contextSize"'))
+    corpus = projection["corpora"][0]
+    assert set(corpus) == {"corpus_id", "declared_context_size", "actual_conversation_count", "actual_message_count", "candidates"}
+    assert set(corpus["candidates"][0]) == {"message_id", "opaque_conversation_id", "conversation_order", "message_order", "corpus_order", "speaker", "text"}
     assert sealed["mapping_status"]["scoring_permitted"] is False
     assert sealed["selection_receipt"]["exclusion_counts"]["multi_persona_cases"] == 1
     assert all("canonical_item_id" in item for item in sealed["items"])
+
+
+def test_v3_projection_preserves_nested_order_and_rejects_count_order_tamper(tmp_path: Path) -> None:
+    projection = custody.load_candidate_projection(_build(tmp_path))
+    corpus = projection["corpora"][0]
+    corpus["actual_conversation_count"] = 2
+    corpus["actual_message_count"] = 4
+    corpus["candidates"] = [
+        {
+            "message_id": hashlib.sha256(f"message-{index}".encode()).hexdigest(),
+            "opaque_conversation_id": hashlib.sha256(f"conversation-{conversation}".encode()).hexdigest(),
+            "conversation_order": conversation,
+            "message_order": message,
+            "corpus_order": index,
+            "speaker": f"speaker-{conversation}",
+            "text": f"message-{conversation}-{message}",
+        }
+        for index, (conversation, message) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1)))
+    ]
+    validated = custody.validate_candidate_projection(projection)
+    assert [
+        (row["conversation_order"], row["message_order"], row["corpus_order"])
+        for row in validated["corpora"][0]["candidates"]
+    ] == [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 3)]
+
+    def tampered() -> dict[str, object]:
+        return json.loads(json.dumps(projection))
+
+    bad = tampered(); bad["corpora"][0]["declared_context_size"] = 2.5
+    with pytest.raises(custody.CustodyError, match="projection_declared_context_size_invalid"):
+        custody.validate_candidate_projection(bad)
+    bad = tampered(); bad["corpora"][0]["actual_message_count"] = 3
+    with pytest.raises(custody.CustodyError, match="projection_candidates_count_invalid"):
+        custody.validate_candidate_projection(bad)
+    bad = tampered(); bad["corpora"][0]["candidates"][2]["corpus_order"] = 7
+    with pytest.raises(custody.CustodyError, match="projection_corpus_order_invalid"):
+        custody.validate_candidate_projection(bad)
+    bad = tampered(); bad["corpora"][0]["candidates"][3]["message_order"] = 3
+    with pytest.raises(custody.CustodyError, match="projection_message_order_invalid"):
+        custody.validate_candidate_projection(bad)
+    bad = tampered(); bad["corpora"][0]["candidates"][2]["conversation_order"] = 0
+    with pytest.raises(custody.CustodyError, match="projection_conversation_order_invalid|projection_message_order_invalid"):
+        custody.validate_candidate_projection(bad)
+
+
+def test_privileged_scoring_adapter_is_minimal_and_evidence_conversation_bound(tmp_path: Path) -> None:
+    output = _build(tmp_path)
+    projection = custody.load_candidate_projection(output)
+    scoring = custody.load_custody_for_scoring(
+        output, _custody_bundle(output), binding_secret=SECRET,
+    )
+    assert set(scoring) == {"schema", "projection_sha256", "items"}
+    assert scoring["projection_sha256"] == custody.canonical_sha256(projection)
+    assert all(
+        set(row) == {"item_id", "directory_group", "evidence_conversation_ids", "evidence_spans"}
+        for row in scoring["items"]
+    )
+    serialized = json.dumps(scoring)
+    assert all(token not in serialized for token in ("SECRET-", "source_locator", "canonical_item_id", "persona_source_id", '"answer"', '"tier"'))
+
+    sealed = custody.load_sealed_custody(output, _custody_bundle(output), binding_secret=SECRET)
+    sealed["items"][0]["evidence_conversation_ids"] = [hashlib.sha256(b"unknown-conversation").hexdigest()]
+    with pytest.raises(custody.CustodyError, match="custody_evidence_conversation_invalid"):
+        custody._validate_custody(sealed, projection, binding_secret=SECRET)
+
+
+def test_privileged_scoring_adapter_keeps_abstention_source_binding_private(tmp_path: Path) -> None:
+    canonical, premix = tmp_path / "labels", tmp_path / "premix"
+    conversation = "p-a-abstention-source"
+    evidence = {
+        "personId": "p-a", "question": "q-abstain", "answer": "no answer",
+        "category": "abstention", "conversations": [{"id": conversation}],
+        "message_evidences": [],
+    }
+    _write(
+        canonical / "core_benchmark" / "evidence_questions" / "abstention_evidence" / "tier-1" / "p-a.json",
+        {"evidence_items": [evidence]},
+    )
+    embedded = {key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}
+    _write(
+        premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json",
+        [{"contextSize": 1, "evidenceItems": [embedded], "conversations": [{"id": conversation, "messages": [{"speaker": "user", "text": "unrelated"}]}]}],
+    )
+    output = tmp_path / "bundle"
+    _publish(
+        canonical=canonical, premix=premix, output=output,
+        staging=_staging(tmp_path),
+        config=custody.SelectionConfig(seed=7, persona_quota=1, per_persona_group_quota=1, context_rank_indices=(0,)),
+    )
+    sealed = custody.load_sealed_custody(output, _custody_bundle(output), binding_secret=SECRET)
+    assert sealed["items"][0]["evidence_conversation_ids"]
+    scoring = custody.load_custody_for_scoring(output, _custody_bundle(output), binding_secret=SECRET)
+    assert scoring["items"] == [{
+        "item_id": sealed["items"][0]["item_id"],
+        "directory_group": "abstention_evidence",
+        "evidence_conversation_ids": [],
+        "evidence_spans": [],
+    }]
 
 
 def test_context_rank_semantics_and_revision_bound_hmac_ids(tmp_path: Path) -> None:
@@ -413,7 +514,7 @@ def test_failed_persona_does_not_pollute_variant_receipt(tmp_path: Path) -> None
         evidence = {"personId": "p-b", "question": f"q-p-b-extra-{group}", "answer": f"answer-extra-{group}", "category": f"category-{group}", "conversations": [{"id": conversation}], "message_evidences": [{"speaker": "s", "text": "e"}]}
         labels["evidence_items"].append(evidence); _write(labels_path, labels)
         cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"; cases = json.loads(cases_path.read_text(encoding="utf-8"))
-        for size in (1, 8, 13): cases.append({"contextSize": size, "evidenceItems": [{key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}], "conversations": [{"id": conversation, "messages": [{"text": "candidate"}]}]})
+        for size in (1, 8, 13): cases.append({"contextSize": size, "evidenceItems": [{key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}], "conversations": [{"id": conversation, "messages": [{"speaker": "candidate-speaker", "text": "candidate"}]}]})
         _write(cases_path, cases)
     index = custody._streaming_index(custody._subroot(canonical, "evidence_questions"), custody._subroot(premix, "pre_mixed_testcases"), _staging(tmp_path))
     try:

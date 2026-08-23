@@ -104,6 +104,17 @@ must execute `palace.get_collection(...).upsert(...)` followed by
 evidence-R@10 dataset because its public package omits answer-bearing evidence
 annotations.
 
+ConvoMem's official primary metric is category-specific LLM-judged answer
+accuracy by conversation-count context; message-level exact-evidence Recall@10,
+NDCG@10, and MRR@10 are this project's blinded retrieval protocol and must not
+be described as official ConvoMem metrics.  Bind protocol claims to upstream
+commit `624f582ecf0d336ae1d4539d19186089800774b1`.  Preserve ordered structured
+speaker/text messages and opaque conversation boundaries in candidate-safe
+projections, but keep the original MemPalace public-product document serializer
+text-only.  Exact evidence mapping is `(speaker, text)` within the custody-only
+evidence-conversation set; ambiguity or absence fails closed without fuzzy
+fallback.
+
 ## Verification
 
 Run `python -m pytest -q`, including `tests/test_aerp1_authorized_evidence_audit.py`

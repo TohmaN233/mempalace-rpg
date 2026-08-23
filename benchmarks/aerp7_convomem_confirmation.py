@@ -23,16 +23,19 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 
-SCHEMA = "aerp7-convomem-candidate-projection-v2"
-CUSTODY_SCHEMA = "aerp7-convomem-sealed-custody-v2"
-CANDIDATE_READY_SCHEMA = "aerp7-convomem-candidate-ready-v2"
-CUSTODY_READY_SCHEMA = "aerp7-convomem-custody-ready-v2"
+SCHEMA = "aerp7-convomem-candidate-projection-v3"
+CUSTODY_SCHEMA = "aerp7-convomem-sealed-custody-v3"
+CANDIDATE_READY_SCHEMA = "aerp7-convomem-candidate-ready-v3"
+CUSTODY_READY_SCHEMA = "aerp7-convomem-custody-ready-v3"
 SELECTION_ALGORITHM = "hmac-sha256-revision-bound-persona-group-tier-context-v1"
 BOUND_CUSTODY_ALGORITHM = "hmac-sha256-revision-bound-custody-binding-v1"
 SQLITE_INDEX_EXPANSION_FACTOR = 3
 STAGING_HEADROOM_BYTES = 8 * 1024 * 1024 * 1024
 _HEX = set("0123456789abcdef")
-_FORBIDDEN = frozenset({"speaker", "answer", "message_evidences", "abstention", "category", "group", "tier", "contextsize", "context_size", "evidence_count", "rubric", "split", "source_path", "source_locator", "ordinal", "evidenceitems", "evidence_items", "canonical_item_id"})
+# ``speaker`` is deliberately candidate-visible in v3: it is an input to the
+# frozen current-method observation serializer.  Everything which can reveal a
+# label, a source locator, or an endpoint assignment remains capability-sealed.
+_FORBIDDEN = frozenset({"answer", "message_evidences", "abstention", "category", "group", "tier", "contextsize", "context_size", "evidence_count", "rubric", "split", "source_path", "source_locator", "ordinal", "evidenceitems", "evidence_items", "canonical_item_id", "containsevidence", "contains_evidence", "model_name", "scenario_description", "conversation_id"})
 
 
 class CustodyError(ValueError):
@@ -364,14 +367,15 @@ def _premix(files: Sequence[dict[str, Any]], secret: bytes, revision: str) -> tu
                 for message_ordinal, raw_message in enumerate(_list(conversation.get("messages"), "premix_messages_invalid")):
                     message = _object(raw_message, "premix_message_invalid")
                     text = _text(message.get("text"), "premix_message_text_invalid")
+                    speaker = _text(message.get("speaker"), "premix_message_speaker_invalid")
                     source = {**locator, "conversation_id": conversation_id, "conversation_ordinal": conversation_ordinal, "message_ordinal": message_ordinal}
-                    messages.append({"message_id": _opaque(secret, revision, "message", {"conversation_id": conversation_id, "message_ordinal": message_ordinal}), "text": text, "source_locator": source})
+                    messages.append({"message_id": _opaque(secret, revision, "message", {"conversation_id": conversation_id, "message_ordinal": message_ordinal}), "opaque_conversation_id": _opaque(secret, revision, "conversation", conversation_id), "conversation_order": conversation_ordinal, "message_order": message_ordinal, "corpus_order": len(messages), "speaker": speaker, "text": text, "source_locator": source})
             if not messages:
                 raise CustodyError("premix_case_has_no_messages")
             context_size = case.get("contextSize")
-            if isinstance(context_size, bool) or not isinstance(context_size, (int, float)):
+            if isinstance(context_size, bool) or not isinstance(context_size, int) or context_size <= 0:
                 raise CustodyError("premix_context_size_invalid")
-            cases.append({"corpus_id": _opaque(secret, revision, "corpus", locator), "locator": locator, "locator_digest": canonical_sha256(locator), "context_size": context_size, "keys": keys, "messages": messages})
+            cases.append({"corpus_id": _opaque(secret, revision, "corpus", locator), "locator": locator, "locator_digest": canonical_sha256(locator), "context_size": context_size, "actual_conversation_count": len(outer_rows), "actual_message_count": len(messages), "keys": keys, "messages": messages})
     if not cases:
         raise CustodyError("premix_cases_empty")
     return cases, excluded
@@ -478,17 +482,34 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
     corpora = _list(projection.get("corpora"), "projection_corpora_invalid"); corpus_ids = set()
     for corpus in corpora:
         row = _object(corpus, "projection_corpus_invalid")
-        if set(row) != {"corpus_id", "candidates"}: raise CustodyError("projection_corpus_schema_invalid")
+        if set(row) != {"corpus_id", "declared_context_size", "actual_conversation_count", "actual_message_count", "candidates"}: raise CustodyError("projection_corpus_schema_invalid")
         corpus_id = _token(row.get("corpus_id"), "projection_corpus_id_invalid")
         if corpus_id in corpus_ids: raise CustodyError("projection_corpus_duplicate")
-        corpus_ids.add(corpus_id); messages = set()
+        corpus_ids.add(corpus_id)
+        declared_context_size = row.get("declared_context_size")
+        if isinstance(declared_context_size, bool) or not isinstance(declared_context_size, int) or declared_context_size <= 0:
+            raise CustodyError("projection_declared_context_size_invalid")
+        if any(isinstance(row.get(name), bool) or not isinstance(row.get(name), int) or row[name] <= 0 for name in ("actual_conversation_count", "actual_message_count")):
+            raise CustodyError("projection_corpus_count_invalid")
+        messages = set(); conversations: dict[str, list[tuple[int, int]]] = {}; expected_corpus_order = 0
         for candidate in _list(row.get("candidates"), "projection_candidates_invalid"):
             item = _object(candidate, "projection_candidate_invalid")
-            if set(item) != {"message_id", "text"}: raise CustodyError("projection_candidate_schema_invalid")
+            if set(item) != {"message_id", "opaque_conversation_id", "conversation_order", "message_order", "corpus_order", "speaker", "text"}: raise CustodyError("projection_candidate_schema_invalid")
             message_id = _token(item.get("message_id"), "projection_message_id_invalid")
             if message_id in messages: raise CustodyError("projection_message_duplicate")
-            messages.add(message_id); _text(item.get("text"), "projection_message_text_invalid")
-        if not messages: raise CustodyError("projection_candidates_empty")
+            messages.add(message_id); conversation_id = _token(item.get("opaque_conversation_id"), "projection_conversation_id_invalid"); _text(item.get("speaker"), "projection_message_speaker_invalid"); _text(item.get("text"), "projection_message_text_invalid")
+            if any(isinstance(item.get(name), bool) or not isinstance(item.get(name), int) or item[name] < 0 for name in ("conversation_order", "message_order", "corpus_order")):
+                raise CustodyError("projection_message_order_invalid")
+            if item["corpus_order"] != expected_corpus_order:
+                raise CustodyError("projection_corpus_order_invalid")
+            conversations.setdefault(conversation_id, []).append((item["conversation_order"], item["message_order"]))
+            expected_corpus_order += 1
+        if not messages or len(messages) != row["actual_message_count"] or len(conversations) != row["actual_conversation_count"]:
+            raise CustodyError("projection_candidates_count_invalid")
+        if sorted({pair[0] for rows in conversations.values() for pair in rows}) != list(range(row["actual_conversation_count"])):
+            raise CustodyError("projection_conversation_order_invalid")
+        if any(sorted(pair[1] for pair in rows) != list(range(len(rows))) or len({pair[0] for pair in rows}) != 1 for rows in conversations.values()):
+            raise CustodyError("projection_message_order_invalid")
     seen = set()
     for item in _list(projection.get("items"), "projection_items_invalid"):
         row = _object(item, "projection_item_invalid")
@@ -504,8 +525,8 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
 
 
 def materialize_candidate_items(value: Any) -> list[dict[str, Any]]:
-    projection = validate_candidate_projection(value); corpora = {row["corpus_id"]: row["candidates"] for row in projection["corpora"]}
-    return [{"item_id": row["item_id"], "persona_id": row["persona_id"], "query_text": row["query_text"], "candidates": corpora[row["corpus_id"]]} for row in projection["items"]]
+    projection = validate_candidate_projection(value); corpora = {row["corpus_id"]: row for row in projection["corpora"]}
+    return [{"item_id": row["item_id"], "persona_id": row["persona_id"], "query_text": row["query_text"], "corpus_id": row["corpus_id"], "declared_context_size": corpora[row["corpus_id"]]["declared_context_size"], "actual_conversation_count": corpora[row["corpus_id"]]["actual_conversation_count"], "actual_message_count": corpora[row["corpus_id"]]["actual_message_count"], "candidates": corpora[row["corpus_id"]]["candidates"]} for row in projection["items"]]
 
 
 def _write(path: Path, value: Any) -> None:
@@ -840,7 +861,7 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
                             else:
                                 case = _object(raw, "premix_case_invalid")
                                 context_size = case.get("contextSize")
-                                if isinstance(context_size, bool) or not isinstance(context_size, (int, float)):
+                                if isinstance(context_size, bool) or not isinstance(context_size, int) or context_size <= 0:
                                     raise CustodyError("premix_context_size_invalid")
                                 locator_case = {"path": locator, "case_ordinal": ordinal}; case_sha = canonical_sha256(locator_case)
                                 outer = _list(case.get("conversations"), "premix_conversations_invalid")
@@ -858,7 +879,8 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
                                     elif prior[0] != content_sha:
                                         raise CustodyError("premix_conversation_content_conflict")
                                     for message_ordinal, message in enumerate(_list(row.get("messages"), "premix_messages_invalid")):
-                                        messages.append({"conversation_id": conversation_id, "message_ordinal": message_ordinal, "text": _text(_object(message, "premix_message_invalid").get("text"), "premix_message_text_invalid"), "source_locator": {**locator_case, "conversation_id": conversation_id, "conversation_ordinal": conversation_ordinal, "message_ordinal": message_ordinal}})
+                                        parsed_message = _object(message, "premix_message_invalid")
+                                        messages.append({"conversation_id": conversation_id, "conversation_ordinal": conversation_ordinal, "message_ordinal": message_ordinal, "corpus_ordinal": len(messages), "speaker": _text(parsed_message.get("speaker"), "premix_message_speaker_invalid"), "text": _text(parsed_message.get("text"), "premix_message_text_invalid"), "source_locator": {**locator_case, "conversation_id": conversation_id, "conversation_ordinal": conversation_ordinal, "message_ordinal": message_ordinal}})
                                 if not messages:
                                     raise CustodyError("premix_case_has_no_messages")
                                 keys = []
@@ -1115,13 +1137,28 @@ def _selected_payloads_sql(database: Path, selected: Sequence[tuple[dict[str, An
             candidates = []
             for message in messages:
                 message_id = _opaque(secret, revision, "message", {"conversation_id": message["conversation_id"], "message_ordinal": message["message_ordinal"]})
-                candidates.append({"message_id": message_id, "text": message["text"]})
-            corpora.setdefault(corpus_id, {"corpus_id": corpus_id, "candidates": candidates})
+                candidates.append({
+                    "message_id": message_id,
+                    "opaque_conversation_id": _opaque(secret, revision, "conversation", message["conversation_id"]),
+                    "conversation_order": message["conversation_ordinal"],
+                    "message_order": message["message_ordinal"],
+                    "corpus_order": message["corpus_ordinal"],
+                    "speaker": message["speaker"],
+                    "text": message["text"],
+                })
+            declared_context_size = case["context_size"]
+            if isinstance(declared_context_size, bool) or not isinstance(declared_context_size, (int, float)) or not float(declared_context_size).is_integer() or int(declared_context_size) <= 0:
+                raise CustodyError("premix_context_size_invalid")
+            corpora.setdefault(corpus_id, {"corpus_id": corpus_id, "declared_context_size": int(declared_context_size), "actual_conversation_count": len({message["conversation_id"] for message in messages}), "actual_message_count": len(messages), "candidates": candidates})
             context_id = _opaque(secret, revision, "item-context", {"canonical_item_id": canonical_id, "corpus_id": corpus_id})
             projection_items.append({"item_id": context_id, "persona_id": item["persona_id"], "query_text": item["question"], "corpus_id": corpus_id})
             if len(candidates) != len(messages):
                 raise CustodyError("selected_message_count_invalid")
-            custody_items.append({"item_id": context_id, "canonical_item_id": canonical_id, "persona_id": item["persona_id"], "persona_source_id": item["persona"], "corpus_id": corpus_id, "source_locator": {"canonical": locator, "case": case["locator"]}, "directory": json.loads(canonical_row["directory"]), "labels": {"answer": canonical_row["answer"], "message_evidences": json.loads(canonical_row["labels"])}, "messages": [{"message_id": candidate["message_id"], "source_locator": message["source_locator"]} for candidate, message in zip(candidates, messages)]})
+            evidence_conversation_ids = [_opaque(secret, revision, "conversation", conversation_id) for conversation_id in json.loads(canonical_row["conversations"])]
+            candidate_conversation_ids = {candidate["opaque_conversation_id"] for candidate in candidates}
+            if not set(evidence_conversation_ids) <= candidate_conversation_ids:
+                raise CustodyError("evidence_conversation_not_in_corpus")
+            custody_items.append({"item_id": context_id, "canonical_item_id": canonical_id, "persona_id": item["persona_id"], "persona_source_id": item["persona"], "corpus_id": corpus_id, "source_locator": {"canonical": locator, "case": case["locator"]}, "directory": json.loads(canonical_row["directory"]), "labels": {"answer": canonical_row["answer"], "message_evidences": json.loads(canonical_row["labels"])}, "evidence_conversation_ids": evidence_conversation_ids, "messages": [{"message_id": candidate["message_id"], "source_locator": message["source_locator"]} for candidate, message in zip(candidates, messages)]})
         return [corpora[key] for key in sorted(corpora)], projection_items, custody_items
     finally:
         connection.close()
@@ -1251,6 +1288,38 @@ def load_sealed_custody(candidate_bundle: Path, custody_bundle: Path, *, binding
     return dict(custody)
 
 
+def load_custody_for_scoring(candidate_bundle: Path, custody_bundle: Path, *, binding_secret: bytes) -> dict[str, Any]:
+    """Privileged, minimal adapter from a fully verified sealed bundle.
+
+    This is intentionally the only bridge from AERP-7A custody to AERP-7B.
+    It does not make source locators, answers, tiers, or raw custody available
+    to the scorer.  Callers must invoke it only after every public ranking
+    freeze has validated.
+    """
+    sealed = load_sealed_custody(candidate_bundle, custody_bundle, binding_secret=binding_secret)
+    items = []
+    for row in sealed["items"]:
+        directory = _object(row["directory"], "custody_directory_invalid")
+        group = _text(directory.get("group"), "custody_directory_group_invalid")
+        spans = []
+        for evidence in _list(_object(row["labels"], "custody_labels_invalid").get("message_evidences"), "custody_evidence_labels_invalid"):
+            evidence_row = _object(evidence, "custody_evidence_label_invalid")
+            spans.append({"speaker": _text(evidence_row.get("speaker"), "custody_evidence_label_invalid"), "text": _text(evidence_row.get("text"), "custody_evidence_label_invalid")})
+        # The sealed custody binds every selected case to its source
+        # conversations, including abstention cases.  Those source bindings are
+        # not positive evidence labels.  The privileged scoring projection must
+        # therefore expose an empty evidence set for the official abstention
+        # endpoint while retaining the sealed source binding internally.
+        if group == "abstention_evidence":
+            if spans:
+                raise CustodyError("abstention_evidence_labels_invalid")
+            evidence_conversation_ids: list[str] = []
+        else:
+            evidence_conversation_ids = list(row["evidence_conversation_ids"])
+        items.append({"item_id": row["item_id"], "directory_group": group, "evidence_conversation_ids": evidence_conversation_ids, "evidence_spans": spans})
+    return {"schema": "aerp7-convomem-custody-for-scoring-v2", "projection_sha256": sealed["projection_sha256"], "items": items}
+
+
 def _validate_custody(value: Any, projection: dict[str, Any], *, binding_secret: bytes) -> Mapping[str, Any]:
     custody = _object(value, "custody_root_invalid")
     secret = _binding_secret(binding_secret)
@@ -1265,7 +1334,7 @@ def _validate_custody(value: Any, projection: dict[str, Any], *, binding_secret:
     if len(rows) != len(expected): raise CustodyError("custody_item_count_invalid")
     for raw in rows:
         row = _object(raw, "custody_item_invalid")
-        if set(row) != {"item_id", "canonical_item_id", "persona_id", "persona_source_id", "corpus_id", "source_locator", "directory", "labels", "messages", "binding_commitment"}: raise CustodyError("custody_item_schema_invalid")
+        if set(row) != {"item_id", "canonical_item_id", "persona_id", "persona_source_id", "corpus_id", "source_locator", "directory", "labels", "evidence_conversation_ids", "messages", "binding_commitment"}: raise CustodyError("custody_item_schema_invalid")
         item_id = _token(row.get("item_id"), "custody_item_id_invalid")
         corpus_id = _token(row.get("corpus_id"), "custody_corpus_id_invalid")
         if item_id not in expected or row.get("persona_id") != expected[item_id]["persona_id"] or corpus_id != expected[item_id]["corpus_id"]: raise CustodyError("custody_item_projection_binding_invalid")
@@ -1282,6 +1351,13 @@ def _validate_custody(value: Any, projection: dict[str, Any], *, binding_secret:
             evidence_row = _object(evidence, "custody_evidence_label_invalid")
             if set(evidence_row) != {"speaker", "text"}: raise CustodyError("custody_evidence_label_schema_invalid")
             _text(evidence_row.get("speaker"), "custody_evidence_label_invalid"); _text(evidence_row.get("text"), "custody_evidence_label_invalid")
+        evidence_conversations = _list(row.get("evidence_conversation_ids"), "custody_evidence_conversation_invalid")
+        if not evidence_conversations or len(evidence_conversations) != len(set(evidence_conversations)):
+            raise CustodyError("custody_evidence_conversation_invalid")
+        if not all(isinstance(value, str) and _token(value, "custody_evidence_conversation_invalid") for value in evidence_conversations):
+            raise CustodyError("custody_evidence_conversation_invalid")
+        if not set(evidence_conversations) <= {candidate["opaque_conversation_id"] for candidate in corpora[corpus_id]["candidates"]}:
+            raise CustodyError("custody_evidence_conversation_invalid")
         messages = _list(row.get("messages"), "custody_messages_invalid"); ids = set()
         for message in messages:
             message_row = _object(message, "custody_message_invalid")

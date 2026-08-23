@@ -179,6 +179,19 @@ other.
   records that evidence span mapping is unresolved/not attempted; it is the
   only place where answers, evidence labels, directory-derived metadata, and
   source locators may exist.
+  The protocol implementation is bound to the upstream
+  `SalesforceAIResearch/ConvoMem` commit
+  `624f582ecf0d336ae1d4539d19186089800774b1` and tree
+  `1699a58948e7ac4e3263110a40d06bab457bcf8b`.  ConvoMem has no single official
+  retriever serializer: its `MemoryAnswerer` receives ordered structured
+  conversations, while the official LongContext baseline renders messages as
+  `speaker: text`.  AERP-7 therefore preserves candidate-safe speaker, opaque
+  conversation boundaries, conversation/message order, declared context size,
+  actual conversation count, and actual message count.  It separately binds
+  the official-structure-compatible LongContext serializer, MemPalace's
+  text-only public-product serializer, and AERP's structured SixView event
+  serializer.  The opaque-ID adaptation is not a byte-exact reproduction of
+  the official LongContext prompt, which includes source conversation IDs.
   Before any labels are unsealed, AERP-7 must also freeze exact-only span
   mapping, a strong raw BM25+dense comparator, static-P5 ranking outputs, and a
   persona/context-stratified paired bootstrap.  Positive evidence retrieval and
@@ -194,6 +207,17 @@ other.
   before reading official inputs.  Content-digest bundle loaders remain
   portable beyond those builder platforms.  The process verifies the OS temp
   route and `PRAGMA temp_store=FILE` before reading official inputs.
+  Exact message-evidence mapping uses normalized `(speaker, text)` only within
+  the item's custody-only evidence-conversation set.  Zero matches are
+  unmatched and multiple matches are ambiguous; neither case admits a fuzzy
+  fallback.  The official primary ConvoMem metric is category-specific
+  LLM-judged answer accuracy by conversation-count context.  AERP-7's blinded
+  message-level exact-evidence Recall@10/NDCG@10/MRR@10 is an added retrieval
+  protocol, not an official ConvoMem metric.  The upstream
+  `retrievedRelevantConversations` count is reported separately as a
+  conversation-level diagnostic.  Official answer accuracy is outside Track A
+  unless an answer model, prompt, category-specific judge, and their source and
+  model digests are frozen before the run.
 - MemBench is the second retrieval confirmation dataset.  Split by `tid` because
   a `tid` recurs across task files.  `target_step_id`, answers, choices, and
   ground truth belong only to the label custodian.  Items with more than ten
@@ -207,11 +231,13 @@ other.
 ### Information-flow protocol
 
 For every dataset, the candidate producer receives only opaque item/group IDs,
-query text, and candidate text.  The label custodian receives the frozen ranking
-digest and then attaches exact evidence IDs.  Prediction and label payloads have
-separate digests and are joined only by an opaque crosswalk.  Any plaintext
-answer, evidence label, category, split label, or gold-derived feature observed
-by a candidate producer invalidates the run.
+query text, candidate text, and explicitly frozen candidate-safe source metadata
+needed by the retrieval adapter, such as ConvoMem speaker and opaque chronology.
+The label custodian receives the frozen ranking digest and then attaches exact
+evidence IDs.  Prediction and label payloads have separate digests and are joined
+only by an opaque crosswalk.  Any plaintext answer, evidence label, category,
+split label, source locator, raw conversation ID, or gold-derived feature
+observed by a candidate producer invalidates the run.
 
 Splits are group-disjoint and digest-bound.  Confirmation is executed exactly
 once after the static P5 method commit, model files, corpus unit, TopK,
@@ -224,6 +250,13 @@ Report question-macro and group/conversation-macro exact evidence Recall@10.
 Also report hard, adversarial or abstention, per-category, NDCG@10, and evidence
 micro recall as secondary endpoints.  Confidence intervals use paired bootstrap
 resampling at the dataset's leakage unit: conversation, persona, or `tid`.
+For ConvoMem, `changing_evidence + implicit_connection_evidence` is a declared
+derived hard-positive slice, not an upstream hard category; the dataset has no
+official adversarial retrieval endpoint.  Its abstention endpoint reports only
+threshold-free confidence separability for arms sharing the frozen normalized
+top-margin contract.  The original MemPalace public-product arm has no comparable
+confidence and is excluded from that secondary comparison with an explicit
+reason.
 
 The public, non-blind AERP-5 v2 product gate requires all of:
 
@@ -274,6 +307,14 @@ Each untouched confirmation dataset independently requires all of:
 - adversarial/abstention change versus the strong raw control has lower bound at
   least -0.01;
 - every safety/system guardrail passes.
+
+For ConvoMem specifically, the overall and derived hard-positive retrieval gates
+apply to the blinded message-level protocol above.  The abstention non-regression
+gate compares static P5 with the strong raw BM25+dense arm on paired
+persona-by-declared-context confidence separability; it does not compare against
+an invented confidence for the original public product.  Each context stratum
+also reports the declared target, actual conversation count, and actual message
+count rather than treating those quantities as interchangeable.
 
 ### Resource-matched reporting
 
