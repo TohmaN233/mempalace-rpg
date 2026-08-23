@@ -29,9 +29,10 @@ progress but not a paper-level result.
 ## Current status
 
 Track A is not complete.  The repository has engineering results on burned
-LoCoMo data and a tested seam for a direct original-product comparison, but it
-does not yet contain a valid AERP-4 `tau` freeze or a complete paired-product
-result.  The original repository benchmark candidate's historical result is not
+LoCoMo data, a frozen static-P5 primary arm, and an executable direct
+original-product comparison, but it does not yet contain a complete real-1,982
+paired-product result or untouched-dataset confirmation.  The original
+repository benchmark candidate's historical result is not
 interchangeable with the public-product result.  Track B has a protocol but no
 completed controlled story-generation experiment.  No current artifact is a
 paper-level result.
@@ -45,15 +46,32 @@ router-related output is rank-only preparation evidence for the existing
 `RawAnchoredP5Policy`; it cannot select `tau`, alter live ranking, or make a
 confirmation claim.
 
+### AERP-5 v2 public-product rehearsal
+
+The AERP-5 v2 specification harness binds the exact 1,982 AERP-4 members (and
+the four custody exclusions) for a public, non-blind product pairing.  Its
+intended arms are the pinned original public-product seam, fixed static P5,
+and secondary fixed six-view.  The implemented core enforces two frozen
+label-free repeats, P5-vs-AERP4 Top-10 equality, per-query cold-first latency,
+process-tree RSS, and score-after-freeze custody.  The subprocess runner
+constructs the pinned original/current product arms from that projection in
+fresh temporary backends.  No AERP-5 v2 real-1982 product result exists yet;
+this code is an executable protocol rather than evidence of a completed
+experiment.  The runner therefore reports product-comparison completion
+separately and keeps `resource_gate_eligible=false` until mixed-visibility,
+blind-180, 30k-event, SQLite/drawer failure-injection, and frozen resource
+threshold receipts are explicitly bound.  Any result remains `public_nonblind`
+and can never supply a confirmation claim.
+
 ## Track A: retrieval
 
 ### Frozen method and comparators
 
-The method under development is AERP-4: `SixViewRanker` with
-`RawAnchoredP5Policy`.  Its only selected policy parameter is threshold `tau`.
-That threshold still must be frozen on burned, source-separated engineering
-data; confirmation runners must accept the resulting immutable value as input
-and must never enumerate or select thresholds.
+The frozen primary retrieval method is now static P5: `SixViewRanker` with
+`FixedP5Policy`.  AERP-4b closed the low-complexity sparse routing branch as a
+controlled train-only null result, so the formal AERP-5 v2 product comparison
+has no `tau` or router selection surface.  `RawAnchoredP5Policy` remains a
+historical mechanism experiment rather than the method under confirmation.
 
 Every comparison table must distinguish these arms:
 
@@ -74,8 +92,9 @@ other.
 ### Data roles
 
 - LoCoMo and LongMemEval-S are burned engineering data.  They may be used for
-  adapter rehearsal, diagnosis, and the one-time train/dev `tau` freeze.  They
-  cannot support a blind confirmation claim.
+  adapter rehearsal and diagnosis; the completed AERP-4 train/dev work cannot
+  be reopened as a tuning surface.  They cannot support a blind confirmation
+  claim.
 - ConvoMem is the first retrieval confirmation dataset.  Split by persona, not
   by question or premixed context.  `message_evidences` belongs only to the
   label custodian.  Abstention items are a separate safety endpoint and do not
@@ -100,9 +119,9 @@ answer, evidence label, category, split label, or gold-derived feature observed
 by a candidate producer invalidates the run.
 
 Splits are group-disjoint and digest-bound.  Confirmation is executed exactly
-once after the method commit, `tau`, model files, corpus unit, TopK, tie-break,
-resource thresholds, and code/input digests are frozen.  No pooled statistic may
-rescue a dataset that fails separately.
+once after the static P5 method commit, model files, corpus unit, TopK,
+tie-break, resource thresholds, and code/input digests are frozen.  No pooled
+statistic may rescue a dataset that fails separately.
 
 ### Retrieval endpoints
 
@@ -111,24 +130,26 @@ Also report hard, adversarial or abstention, per-category, NDCG@10, and evidence
 micro recall as secondary endpoints.  Confidence intervals use paired bootstrap
 resampling at the dataset's leakage unit: conversation, persona, or `tid`.
 
-The calibration dev gate requires all of:
+The public, non-blind AERP-5 v2 product gate requires all of:
 
-- gated AERP-4 strictly exceeds both static Raw and static P5 for question-macro
-  and group-macro Recall@10;
-- paired 95% confidence-interval lower bounds versus both static experts are
-  greater than zero;
-- Raw and P5 each route at least 10% of queries;
+- static P5 is compared through the current product seam against the exact
+  pinned original public-product seam;
+- paired conversation-bootstrap 95% confidence-interval lower bounds for both
+  question-macro and conversation-macro Recall@10 are greater than zero;
+- hard Categories 1/2, adversarial Category 5, and every category are reported
+  separately even when they are not part of the primary GO rule;
 - authorization, trace replay, exact-span, performance, and failure-injection
   guardrails pass.
 
 Each untouched confirmation dataset independently requires all of:
 
-- versus frozen Product Six-View, overall point improvement is at least 0.01
-  and the paired group-bootstrap 95% lower bound is greater than zero;
+- versus the exact pinned original public product, overall point improvement is
+  at least 0.01 and the paired group-bootstrap 95% lower bound is greater than
+  zero; fixed Product Six-View remains a separately reported secondary arm;
 - hard-subset point change is nonnegative and its lower bound is at least -0.01;
 - adversarial/abstention change versus the strong raw control has lower bound at
   least -0.01;
-- both routes remain nondegenerate and every safety/system guardrail passes.
+- every safety/system guardrail passes.
 
 ### Resource-matched reporting
 

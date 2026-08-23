@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import pytest
 
-from mempalace_rpg import FixedSixViewPolicy, FusionRoutingDecision, FusionRoutingPolicy, RankingResult, RawAnchoredP5Policy, RpgMemoryKernel, SceneEventInput, SixViewRanker
+from mempalace_rpg import FixedP5Policy, FixedSixViewPolicy, FusionRoutingDecision, FusionRoutingPolicy, RankingResult, RawAnchoredP5Policy, RpgMemoryKernel, SceneEventInput, SixViewRanker
 from mempalace_rpg.retrieval import AuthorizedRetrievalCandidate, structured_observation
 
 
@@ -549,6 +549,81 @@ def test_explicit_fixed_adapter_matches_default_and_policy_mutations_fail_closed
     for mode in ("duplicate_totals", "wrong_total", "duplicate_weights", "wrong_weights"):
         with pytest.raises(ValueError, match="routing policy decision"):
             SixViewRanker(_CountingEncoder(), routing_policy=MutatedPolicy(mode)).rank(query="q", candidates=candidates)
+
+
+def test_fixed_p5_policy_is_explicit_and_product_trace_is_replayable():
+    candidates = [
+        _candidate("event-a", raw="raw alpha", observation="observation alpha", ranking_key="safe-a"),
+        _candidate("event-b", raw="raw beta", observation="observation beta", ranking_key="safe-b"),
+    ]
+    result = SixViewRanker(
+        _CountingEncoder(), diagnostic_ledger=True, routing_policy=FixedP5Policy()
+    ).rank(query="safe query", candidates=candidates)
+
+    receipt = result.trace["aerp5_fixed_p5"]
+    expected_config = {
+        "schema": "aerp5-fixed-p5-v1",
+        "policy": "fixed_p5",
+        "p5_weights": {
+            "raw_bm25": 2.0,
+            "observation_bm25": 0.5,
+            "raw_dense": 1.0,
+            "observation_dense": 2.0,
+            "checkpoint_dense": 0.0,
+            "combo_dense": 1.0,
+        },
+        "ordinary_sum_view_order": [
+            "raw_bm25", "observation_bm25", "raw_dense",
+            "observation_dense", "checkpoint_dense", "combo_dense",
+        ],
+        "rrf_k": 60,
+    }
+    ranking_key_hashes = {
+        candidate.source_event_id: hashlib.sha256(candidate.ranking_key.encode()).hexdigest()
+        for candidate in candidates
+    }
+
+    assert receipt["schema"] == "aerp5-fixed-p5-v1"
+    assert receipt["policy"] == "fixed_p5"
+    assert receipt["config"] == expected_config
+    assert receipt["config_sha256"] == _ledger_digest(expected_config)
+    assert receipt["effective_weights"] == expected_config["p5_weights"]
+    assert receipt["final_ranking_sha256"] == _ledger_digest(
+        [ranking_key_hashes[identifier] for identifier in result.ranked_event_ids]
+    )
+    assert "aerp4_raw_anchored_p5" not in result.trace
+    assert "tau" not in json.dumps(receipt, sort_keys=True)
+    assert result.trace["weights"] == expected_config["p5_weights"]
+
+    replay = SixViewRanker(
+        _CountingEncoder(), diagnostic_ledger=True, routing_policy=FixedP5Policy()
+    ).rank(query="safe query", candidates=candidates)
+    assert (replay.ranked_event_ids, replay.scores, replay.trace) == (
+        result.ranked_event_ids, result.scores, result.trace
+    )
+
+
+@pytest.mark.parametrize("mutation", ["config_digest", "totals", "weights"])
+def test_fixed_p5_policy_decision_mutations_fail_closed(mutation):
+    class TamperedFixedP5Policy(FixedP5Policy):
+        def decide(self, **kwargs):
+            decision = super().decide(**kwargs)
+            if mutation == "config_digest":
+                return replace(decision, config_sha256="0" * 64)
+            if mutation == "totals":
+                first, *rest = decision.totals
+                return replace(decision, totals=((first[0], first[1] + 1.0), *rest))
+            return replace(
+                decision,
+                effective_weights=tuple(
+                    {**dict(decision.effective_weights), "checkpoint_dense": 1.0}.items()
+                ),
+            )
+
+    with pytest.raises(ValueError, match="policy decision"):
+        SixViewRanker(
+            _CountingEncoder(), routing_policy=TamperedFixedP5Policy()
+        ).rank(query="q", candidates=[_candidate("event-a"), _candidate("event-b")])
 
 
 def test_explicit_policy_empty_and_duplicate_routing_keys_fail_closed():

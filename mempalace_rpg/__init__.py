@@ -13,7 +13,7 @@ from .adapter import (
 from .budget import RecallBudget, budget_for_tier
 from .kernel import RpgMemoryKernel
 from .models import MemoryPack, SceneEventInput
-from .retrieval import AuthorizedEventRanker, AuthorizedRetrievalCandidate, DenseEncoder, FixedSixViewPolicy, FusionRoutingDecision, FusionRoutingPolicy, RankingResult, RawAnchoredP5Policy, SixViewRanker
+from .retrieval import AuthorizedEventRanker, AuthorizedRetrievalCandidate, DenseEncoder, FixedP5Policy, FixedSixViewPolicy, FusionRoutingDecision, FusionRoutingPolicy, RankingResult, RawAnchoredP5Policy, SixViewRanker
 from .settings import DEFAULT_MEMO_SETTINGS, load_memo_settings
 from .tavern_importer import import_taverndb
 
@@ -22,6 +22,7 @@ __all__ = [
     "AuthorizedEventRanker",
     "AuthorizedRetrievalCandidate",
     "DenseEncoder",
+    "FixedP5Policy",
     "DrawerCompensationError",
     "FixedSixViewPolicy",
     "FusionRoutingDecision",

@@ -201,6 +201,56 @@ class FixedSixViewPolicy:
         )
 
 
+class FixedP5Policy:
+    """Explicit static P5 expert for paired product comparisons.
+
+    This policy is deliberately separate from :class:`RawAnchoredP5Policy`.
+    Static P5 is an arm of the comparison, not a threshold decision, so its
+    receipt must not invent an anchor value (including ``+/-inf``) merely to
+    reuse the gated policy's implementation.
+    """
+
+    schema = "aerp5-fixed-p5-v1"
+    policy = "fixed_p5"
+
+    @classmethod
+    def _config(cls, rrf_k: int) -> dict[str, Any]:
+        if not isinstance(rrf_k, int) or isinstance(rrf_k, bool) or rrf_k < 0:
+            raise ValueError("fixed P5 rrf_k is invalid")
+        return {
+            "schema": cls.schema,
+            "policy": cls.policy,
+            "p5_weights": dict(P5_EXPERT_WEIGHTS),
+            "ordinary_sum_view_order": list(SIX_VIEW_WEIGHTS),
+            "rrf_k": rrf_k,
+        }
+
+    def decide(
+        self, *, ranks: dict[str, dict[str, int]], ranking_keys_by_id: dict[str, str], rrf_k: int
+    ) -> FusionRoutingDecision:
+        ids = _validate_routing_inputs(ranks=ranks, ranking_keys_by_id=ranking_keys_by_id, rrf_k=rrf_k)
+        totals = _rrf_totals(ranks, P5_EXPERT_WEIGHTS, rrf_k)
+        config = self._config(rrf_k)
+        ranking_key_sha256 = {
+            identifier: hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest()
+            for identifier in ids
+        }
+        final_ranking_sha256 = _digest([
+            ranking_key_sha256[identifier] for identifier in _ordered(totals, ranking_keys_by_id)
+        ])
+        return FusionRoutingDecision(
+            route="p5",
+            totals=tuple(totals.items()),
+            effective_weights=tuple(P5_EXPERT_WEIGHTS.items()),
+            p5_totals=tuple(totals.items()),
+            final_ranking_sha256=final_ranking_sha256,
+            config_json=json.dumps(
+                config, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            ),
+            config_sha256=_digest(config),
+        )
+
+
 class RawAnchoredP5Policy:
     """A single pre-registered raw-anchored gate between Raw and P5 experts."""
 
@@ -384,6 +434,39 @@ def _validate_raw_anchored_decision(
     ):
         raise ValueError("raw-anchored policy decision is invalid")
     return expected_raw, expected_p5, raw_top, p5_top, config
+
+
+def _validate_fixed_p5_decision(
+    policy: FixedP5Policy,
+    decision: FusionRoutingDecision,
+    *,
+    ranks: dict[str, dict[str, int]],
+    ranking_keys_by_id: dict[str, str],
+    rrf_k: int,
+) -> dict[str, Any]:
+    """Validate the immutable receipt fields of the static P5 arm."""
+    expected = _rrf_totals(ranks, P5_EXPERT_WEIGHTS, rrf_k)
+    totals = _routing_pairs(decision.totals, set(ranking_keys_by_id), "totals")
+    p5_totals = _routing_pairs(decision.p5_totals, set(ranking_keys_by_id), "p5 totals")
+    config = policy._config(rrf_k)
+    ranking_key_sha256 = {
+        identifier: hashlib.sha256(ranking_keys_by_id[identifier].encode()).hexdigest()
+        for identifier in ranking_keys_by_id
+    }
+    expected_final_digest = _digest([
+        ranking_key_sha256[identifier] for identifier in _ordered(expected, ranking_keys_by_id)
+    ])
+    if (
+        decision.route != "p5"
+        or totals != expected
+        or p5_totals != expected
+        or dict(decision.effective_weights) != P5_EXPERT_WEIGHTS
+        or decision.config != config
+        or decision.config_sha256 != _digest(config)
+        or decision.final_ranking_sha256 != expected_final_digest
+    ):
+        raise ValueError("fixed P5 policy decision is invalid")
+    return config
 
 
 class SixViewRanker:
@@ -636,6 +719,7 @@ class SixViewRanker:
         effective_weights = self.weights
         decision: FusionRoutingDecision | None = None
         raw_audit: tuple[dict[str, float], dict[str, float], list[str], list[str], dict[str, Any]] | None = None
+        fixed_p5_config: dict[str, Any] | None = None
         if self.routing_policy is None:
             # Preserve the frozen default arithmetic and trace path exactly.
             totals = {identifier: sum(self.weights[name] / (self.rrf_k + ranks[name][identifier]) for name in self.weights) for identifier in ids}
@@ -650,6 +734,13 @@ class SixViewRanker:
             )
             if isinstance(self.routing_policy, RawAnchoredP5Policy):
                 raw_audit = _validate_raw_anchored_decision(
+                    self.routing_policy, decision, ranks=ranks,
+                    ranking_keys_by_id=ranking_keys_by_id, rrf_k=self.rrf_k,
+                )
+            if isinstance(self.routing_policy, FixedP5Policy):
+                if decision is None:
+                    raise ValueError("fixed P5 policy decision is incomplete")
+                fixed_p5_config = _validate_fixed_p5_decision(
                     self.routing_policy, decision, ranks=ranks,
                     ranking_keys_by_id=ranking_keys_by_id, rrf_k=self.rrf_k,
                 )
@@ -706,6 +797,17 @@ class SixViewRanker:
                 "effective_weights": dict(effective_weights),
                 "final_ranking_sha256": _digest([ranking_key_sha256[identifier] for identifier in ordered]),
             }
+        if isinstance(self.routing_policy, FixedP5Policy):
+            if decision is None or fixed_p5_config is None or decision.config_sha256 is None or decision.final_ranking_sha256 is None:
+                raise ValueError("fixed P5 policy decision is incomplete")
+            trace["aerp5_fixed_p5"] = {
+                "schema": FixedP5Policy.schema,
+                "policy": FixedP5Policy.policy,
+                "config": fixed_p5_config,
+                "config_sha256": decision.config_sha256,
+                "effective_weights": dict(effective_weights),
+                "final_ranking_sha256": decision.final_ranking_sha256,
+            }
         if self.diagnostic_ledger:
             trace["fcd1_diagnostic_ledger"] = self._fcd1_diagnostic_ledger(
                 input_sha256=input_sha256, candidates=candidates,
@@ -719,6 +821,6 @@ class SixViewRanker:
 
 __all__ = [
     "AuthorizedEventRanker", "AuthorizedRetrievalCandidate", "DenseEncoder",
-    "FixedSixViewPolicy", "FusionRoutingDecision", "FusionRoutingPolicy",
+    "FixedP5Policy", "FixedSixViewPolicy", "FusionRoutingDecision", "FusionRoutingPolicy",
     "RankingResult", "RawAnchoredP5Policy", "SixViewRanker", "structured_observation",
 ]
