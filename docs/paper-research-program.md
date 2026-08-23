@@ -259,6 +259,39 @@ other.
   allowlist are defense in depth, not that OS boundary; the same boundary is
   required before path-based recursive staging cleanup can be treated as safe
   against an actively hostile same-user process.
+  The next pre-formal execution-evidence checkpoint tightens those remaining
+  claims without changing either formal switch.  Current-arm ranking now emits
+  an out-of-artifact sidecar containing one wall-clock and process-CPU
+  measurement per exact projection item/query pair.  Resource receipts replay
+  those rows and bind their order, hashes, call/text counts, storage semantics,
+  model identity, provider, artifact, and percentile summaries.  Four current
+  executions (`strong_raw`, P5 primary, P5 repeat, and Six-View) each emit an
+  execution receipt bound to the protocol, projection, canonical worker config,
+  method input, code/model before-and-after observations, provider, process,
+  artifact file, resource receipt, and supervisor.  P5 still requires two
+  distinct process IDs and byte-identical canonical ranking artifacts.
+
+  Synthetic recovery evidence is now structurally incapable of masquerading as
+  a formal release.  It uses a separately signed rehearsal-release schema and a
+  separate open/audit path; the formal release validator has no synthetic opt-in.
+  Likewise, the synthetic isolation canary records only a plan-level rehearsal
+  (`live_evidence = false`), while its separate rehearsal attestation records
+  `formal_eligible = false`.  Formal isolation accepts only a live
+  container-probe canary, and the absent live runner fails closed.
+  The isolation plan itself freezes an image repository digest and config image
+  ID, non-root identity, read-only root filesystem, no network, no-new-privileges,
+  dropped capabilities, resource limits, role-specific command identity, and
+  least-privilege mounts, then cross-checks those claims against normalized raw
+  Docker inspect output.
+
+  This checkpoint is not a ConvoMem result.  The public MiniLM model has passed
+  a direct native-adapter smoke check without changing its model-file tree, but
+  the formal current workers are not yet wired through the live isolated runner.
+  The pinned original public product exposes wall time but not process-CPU time,
+  so its formal resource gate still fails rather than inventing a value.  The
+  local Docker daemon/fixed image/live denial probe are also not yet available.
+  Therefore formal ConvoMem data remains unopened, unenumerated, and unhashed
+  until those live gates pass and a fresh review authorizes the one-shot run.
 - MemBench is the second retrieval confirmation dataset.  Split by `tid` because
   a `tid` recurs across task files.  `target_step_id`, answers, choices, and
   ground truth belong only to the label custodian.  Items with more than ten

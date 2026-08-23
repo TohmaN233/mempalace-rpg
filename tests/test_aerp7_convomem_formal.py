@@ -14,14 +14,18 @@ from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha25
 def h(value): return hashlib.sha256(value.encode()).hexdigest()
 
 
+_MODEL_FILES = [{"path_role": "weights", "relative_path": "weights.onnx", "sha256": h("weights"), "bytes": 2}]
+_MODEL_TREE_SHA = rank._digest([{key: row[key] for key in ("relative_path", "sha256", "bytes")} for row in _MODEL_FILES])
+
+
 class Encoder:
-    identity = "synthetic-encoder"
+    identity = "chromadb-native-minilm:" + _MODEL_TREE_SHA
     def encode_passages(self, texts): return [[float(len(text) + index + 1), 1.0] for index, text in enumerate(texts)]
     def encode_query(self, text): return [float(len(text) + 1), 1.0]
 
 
 def receipts():
-    return ({"encoder_identity": "synthetic-encoder", "encoder_semantics": "deterministic", "files": [{"path_role": "weights", "sha256": h("weights"), "bytes": 2}]}, {"head": h("head"), "tree": h("tree"), "diff_digest": h("diff"), "dirty_policy": "clean_required"})
+    return ({"encoder_identity": Encoder.identity, "encoder_semantics": "deterministic", "files": copy.deepcopy(_MODEL_FILES)}, {"head": h("head"), "tree": h("tree"), "diff_digest": h("diff"), "dirty_policy": "clean_required"})
 
 
 def projection():
@@ -77,7 +81,12 @@ def resource(arm, artifact_sha, build_id=None, index_sha=None, p=None, execution
     q, c = (len(p["items"]), sum(len(corpus["candidates"]) for corpus in p["corpora"])) if p is not None else (6, 11)
     execution_role = execution_role or ("fresh_build" if arm == "original_public_product" else "primary")
     accounting = {"primary": "primary_excludes_repeat", "repeat": "repeat_measured_separately"}[execution_role] if arm == "static_p5" else "not_applicable"
-    row = {"schema": formal.RESOURCE_SCHEMA, "arm_id": arm, "execution_role": execution_role, "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm == "strong_raw" else "native_public_product" if arm == "original_public_product" else "all_six_views_computed_then_fixed_fusion", "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization", "p5_repeat_accounting": accounting, "ingest_seconds": 1.0, "index_seconds": 1.0, "query_latency_ns": {"count": q, "p50": 1, "p95": 2, "p99": 3, "max": 4}, "passage_embedding": {"calls": 1, "texts": c}, "query_embedding": {"calls": q, "texts": q}, "storage_bytes": 100, "peak_rss_bytes": 100, "artifact_sha256": artifact_sha, "build_id": build_id, "index_sha256": index_sha, "input_denominators": {"query_count": q, "candidate_text_count": c}, "hardware_runtime": {"python": "synthetic-python", "platform": "synthetic-platform", "processor": "synthetic-cpu"}}
+    query_rows = sorted(p["items"], key=lambda row: row["item_id"]) if p is not None else [{"item_id": h("resource-item-" + str(number)), "query_text": "resource-query-" + str(number)} for number in range(q)]
+    measurements = [{"item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"]), "wall_ns": number + 1, "cpu_ns": number + 2} for number, item in enumerate(query_rows)]
+    original = arm == "original_public_product"
+    passage = {"calls": 1, "texts": c, "measurement_kind": "public_upsert_request_proxy" if original else "encoder_adapter_api_calls", "native_embedding_observable": not original, "limitation": "synthetic public proxy" if original else None}
+    query = {"calls": q, "texts": q, "measurement_kind": "public_search_request_proxy" if original else "encoder_adapter_api_calls", "native_embedding_observable": not original, "limitation": "synthetic public proxy" if original else None}
+    row = {"schema": formal.RESOURCE_SCHEMA, "arm_id": arm, "execution_role": execution_role, "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm == "strong_raw" else "native_public_product" if original else "all_six_views_computed_then_fixed_fusion", "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization", "measurement_mode": "live_original_public_product" if original else "live_native_adapter", "p5_repeat_accounting": accounting, "ingest_seconds": 1.0, "index_seconds": 1.0, "query_measurements": measurements, "query_latency_ns": {"wall": formal._latency_percentiles([row["wall_ns"] for row in measurements]), "cpu": formal._latency_percentiles([row["cpu_ns"] for row in measurements])}, "passage_embedding": passage, "query_embedding": query, "storage_scope": "palace_directory_after_cold_reopen" if original else "no_persistent_index", "storage_bytes": 100 if original else 0, "peak_rss_bytes": 100, "artifact_sha256": artifact_sha, "build_id": build_id, "index_sha256": index_sha, "input_denominators": {"query_count": q, "candidate_text_count": c}, "hardware_runtime": {"python": "synthetic-python", "platform": "synthetic-platform", "processor": "synthetic-cpu"}}
     row["resource_sha256"] = formal.resource_digest(row)
     return row
 
@@ -102,6 +111,42 @@ def formal_resources(original_artifact, original, current, p=None):
         resource("static_p5", artifacts["static_p5"]["artifact_sha256"], p=p, execution_role="repeat"),
         resource("six_view_secondary", artifacts["six_view_secondary"]["artifact_sha256"], p=p),
     ]
+
+
+def bind_live_execution_receipts(current_receipt, proto, p, current, resources):
+    """Construct a deliberately complete live-shaped receipt for validator tests."""
+    artifact_by_arm = {row["arm_id"]: row for row in current}
+    resource_by_role = {(row["arm_id"], row["execution_role"]): row for row in resources if row["arm_id"] != "original_public_product"}
+    observed_model = {"model_file_tree_sha256": _MODEL_TREE_SHA, "model_file_tree_bytes": 2, "encoder_identity": proto["model_receipt"]["encoder_identity"], "runtime_identity": {"synthetic_test": "validator-shape-only"}}
+    execution = []
+    for number, (role, arm, resource_role) in enumerate((("raw", "strong_raw", "primary"), ("p5_primary", "static_p5", "primary"), ("p5_repeat", "static_p5", "repeat"), ("six", "six_view_secondary", "primary")), start=1):
+        artifact, resource = artifact_by_arm[arm], resource_by_role[(arm, resource_role)]
+        row = {"schema": formal.CURRENT_EXECUTION_RECEIPT_SCHEMA, "execution_mode": "live_native_adapter", "execution_role": role, "arm_id": arm, "protocol_sha256": proto["protocol_sha256"], "projection_sha256": canonical_sha256(p), "worker_config_sha256": formal._digest(formal.canonical_candidate_worker_config(proto)), "method_input_sha256": formal._digest({"arm_id": arm, "method_receipt": artifact["method_receipt"], "serializer_receipt": artifact["serializer_receipt"]}), "observed_code_before": proto["current_code_receipt"], "observed_code_after": proto["current_code_receipt"], "observed_model_before": observed_model, "observed_model_after": observed_model, "provider": {"model": "minilm", "device": "cpu", "providers": ["CPUExecutionProvider"], "model_file_tree_sha256": _MODEL_TREE_SHA}, "encoder_identity": proto["model_receipt"]["encoder_identity"], "artifact_file_sha256": hashlib.sha256(formal._bytes(artifact)).hexdigest(), "artifact_sha256": artifact["artifact_sha256"], "resource_sha256": resource["resource_sha256"], "process_id": number, "supervisor_sha256": h("supervisor-" + role), "execution_sha256": ""}
+        row["execution_sha256"] = formal._digest({key: value for key, value in row.items() if key != "execution_sha256"})
+        execution.append(row)
+    receipt = copy.deepcopy(current_receipt); receipt["execution_receipts"] = execution; receipt["worker_sha256"] = formal._digest({key: value for key, value in receipt.items() if key != "worker_sha256"})
+    return receipt
+
+
+def test_resource_v2_retains_raw_measurements_and_recomputes_both_percentiles():
+    p = projection(); proto = protocol(p)
+    good = resource("strong_raw", h("artifact"), p=p)
+    expected_queries = formal.projection_query_keys(p)
+    assert formal.validate_resource_receipt(good, arm_id="strong_raw", thresholds=proto["resource_thresholds"], expected_denominators=formal.projection_denominators(p), expected_query_keys=expected_queries)["storage_bytes"] == 0
+    forged = copy.deepcopy(good); forged["query_latency_ns"]["wall"]["p95"] += 1; forged["resource_sha256"] = formal.resource_digest(forged)
+    with pytest.raises(CustodyError, match="percentile_recompute_invalid"):
+        formal.validate_resource_receipt(forged, arm_id="strong_raw", thresholds=proto["resource_thresholds"], expected_denominators=formal.projection_denominators(p), expected_query_keys=expected_queries)
+    forged = copy.deepcopy(good); forged["passage_embedding"]["measurement_kind"] = "estimate"; forged["resource_sha256"] = formal.resource_digest(forged)
+    with pytest.raises(CustodyError, match="current_embedding_semantics_invalid"):
+        formal.validate_resource_receipt(forged, arm_id="strong_raw", thresholds=proto["resource_thresholds"], expected_denominators=formal.projection_denominators(p), expected_query_keys=expected_queries)
+    for mutate in (
+        lambda rows: rows[0].__setitem__("item_id", h("forged-item")),
+        lambda rows: rows[0].__setitem__("query_sha256", h("forged-query")),
+        lambda rows: rows.reverse(),
+    ):
+        forged = copy.deepcopy(good); mutate(forged["query_measurements"]); forged["resource_sha256"] = formal.resource_digest(forged)
+        with pytest.raises(CustodyError, match="query_binding_invalid"):
+            formal.validate_resource_receipt(forged, arm_id="strong_raw", thresholds=proto["resource_thresholds"], expected_denominators=formal.projection_denominators(p), expected_query_keys=expected_queries)
 
 
 def scoring_custody(p):
@@ -152,6 +197,7 @@ def test_original_lifecycle_endpoint_and_release_cross_bind_everything(tmp_path,
     checked = formal.validate_original_worker_receipt(sealed, projection=p, protocol=proto)
     endpoint = formal.freeze_endpoint_manifest(projection=p, protocol=proto, ranking_artifacts=[checked["artifact"], *current])
     resources = formal_resources(checked["artifact"], original, current, p)
+    current_receipt = bind_live_execution_receipts(current_receipt, proto, p, current, resources)
     resource_digests = resource_map(resources)
     original_map = {row["build_id"]: row["index_sha256"] for row in original}
     secret, custody_ready, custody_bundle = b"c" * 32, h("custody-ready"), h("custody-bundle")
@@ -159,6 +205,39 @@ def test_original_lifecycle_endpoint_and_release_cross_bind_everything(tmp_path,
     release = formal.sign_release_authorization(release, custody_capability_secret=secret)
     artifacts = [checked["artifact"], *current]
     assert formal.validate_release_authorization(release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle, custody_capability_secret=secret)["release_sha256"] == release["release_sha256"]
+    def reseal_worker(receipt):
+        receipt = copy.deepcopy(receipt)
+        for item in receipt.get("execution_receipts", []):
+            item["execution_sha256"] = formal._digest({key: value for key, value in item.items() if key != "execution_sha256"})
+        receipt["worker_sha256"] = formal._digest({key: value for key, value in receipt.items() if key != "worker_sha256"})
+        return receipt
+    def reseal_release(receipt):
+        candidate = copy.deepcopy(release); candidate["current_worker_sha256"] = receipt["worker_sha256"]
+        return formal.sign_release_authorization(candidate, custody_capability_secret=secret)
+    deleted = copy.deepcopy(current_receipt); del deleted["execution_receipts"]; deleted = reseal_worker(deleted)
+    with pytest.raises(CustodyError, match="current_worker_receipt_invalid"):
+        formal.validate_release_authorization(reseal_release(deleted), projection=p, ranking_artifacts=artifacts, current_worker_receipt=deleted, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle, custody_capability_secret=secret)
+    for mutate, code in (
+        (lambda row: row.__setitem__("resource_sha256", h("forged-resource")), "resource_binding_invalid"),
+        (lambda row: row.__setitem__("artifact_file_sha256", h("forged-artifact-file")), "receipt_digest_invalid"),
+        (lambda row: row.__setitem__("execution_mode", "synthetic_rehearsal"), "synthetic_not_formal"),
+        (lambda row: row.__setitem__("observed_code_before", {"forged": True}), "live_code_binding_invalid"),
+        (lambda row: row.__setitem__("observed_model_before", {"forged": True}), "live_model_binding_invalid"),
+        (lambda row: row.__setitem__("provider", {"forged": True}), "live_provider_invalid"),
+        (lambda row: row.__setitem__("worker_config_sha256", h("forged-worker-config")), "replay_binding_invalid"),
+        (lambda row: row.__setitem__("method_input_sha256", h("forged-method-input")), "replay_binding_invalid"),
+    ):
+        forged = reseal_worker(current_receipt); mutate(forged["execution_receipts"][0]); forged = reseal_worker(forged)
+        with pytest.raises(CustodyError, match=code):
+            formal.validate_release_authorization(reseal_release(forged), projection=p, ranking_artifacts=artifacts, current_worker_receipt=forged, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle, custody_capability_secret=secret)
+    wrong_mode_resources = copy.deepcopy(resources); changed = next(item for item in wrong_mode_resources if item["arm_id"] == "strong_raw")
+    changed["measurement_mode"] = "synthetic_rehearsal"; changed["resource_sha256"] = formal.resource_digest(changed)
+    wrong_mode_worker = reseal_worker(current_receipt); next(item for item in wrong_mode_worker["execution_receipts"] if item["execution_role"] == "raw")["resource_sha256"] = changed["resource_sha256"]; wrong_mode_worker = reseal_worker(wrong_mode_worker)
+    with pytest.raises(CustodyError, match="resource_mode_invalid"):
+        formal.validate_release_authorization(reseal_release(wrong_mode_worker), projection=p, ranking_artifacts=artifacts, current_worker_receipt=wrong_mode_worker, protocol=proto, endpoint_manifest=endpoint, resource_receipts=wrong_mode_resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle, custody_capability_secret=secret)
+    wrong_original_resources = copy.deepcopy(resources); changed = wrong_original_resources[0]; changed["measurement_mode"] = "synthetic_rehearsal"; changed["resource_sha256"] = formal.resource_digest(changed)
+    with pytest.raises(CustodyError, match="original_resource_mode_invalid"):
+        formal.validate_release_authorization(release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=wrong_original_resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle, custody_capability_secret=secret)
     with pytest.raises(CustodyError, match="release_resource_replicate_coverage_invalid"):
         formal.validate_release_authorization(release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=[item for item in resources if not (item["arm_id"] == "static_p5" and item["execution_role"] == "repeat")], custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle, custody_capability_secret=secret)
     forged_worker = copy.deepcopy(current_receipt); forged_worker["static_p5_repeat_sha256"] = h("forged-repeat"); forged_worker["worker_sha256"] = formal._digest({key: item for key, item in forged_worker.items() if key != "worker_sha256"})
@@ -219,6 +298,7 @@ def test_audit_envelope_requires_fresh_post_score_attestation_for_a_valid_scored
     original_artifact = formal.validate_original_worker_receipt(sealed, projection=p, protocol=proto)["artifact"]
     artifacts = [original_artifact, *current]; endpoint = formal.freeze_endpoint_manifest(projection=p, protocol=proto, ranking_artifacts=artifacts)
     resources = formal_resources(original_artifact, original, current, p)
+    current_receipt = bind_live_execution_receipts(current_receipt, proto, p, current, resources)
     custody_ready, custody_bundle, release_secret, scorer_secret = h("custody-ready"), h("custody-bundle"), b"r" * 32, b"s" * 32
     release = {"schema": formal.RELEASE_SCHEMA, "protocol_sha256": proto["protocol_sha256"], "endpoint_manifest_sha256": endpoint["manifest_sha256"], "candidate_ready_sha256": candidate["ready_sha256"], "projection_raw_sha256": candidate["projection_raw_sha256"], "projection_canonical_sha256": candidate["projection_canonical_sha256"], "custody_ready_sha256": custody_ready, "custody_bundle_sha256": custody_bundle, "ranking_artifact_sha256": {arm["arm_id"]: arm["ranking_artifact_sha256"] for arm in endpoint["arms"]}, "resource_sha256": resource_map(resources), "original_build_index_sha256": {row["build_id"]: row["index_sha256"] for row in original}, "current_worker_sha256": current_receipt["worker_sha256"]}
     release = formal.sign_release_authorization(release, custody_capability_secret=release_secret)
@@ -283,6 +363,7 @@ def test_open_custody_after_release_uses_actual_confirmation_bundles(tmp_path, m
     original = original_replicates(p); sealed = {"replicates": original, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": proto["original_code_receipt"], "original_code_after": proto["original_code_receipt"]}; sealed["worker_sha256"] = formal._digest({key: sealed[key] for key in ("replicates", "lifecycle", "original_code_before", "original_code_after")}); original_artifact = formal.validate_original_worker_receipt(sealed, projection=p, protocol=proto)["artifact"]
     artifacts = [original_artifact, *current]; endpoint = formal.freeze_endpoint_manifest(projection=p, protocol=proto, ranking_artifacts=artifacts)
     resources = formal_resources(original_artifact, original, current, p)
+    current_receipt = bind_live_execution_receipts(current_receipt, proto, p, current, resources)
     custody_ready = hashlib.sha256((custody / "READY.json").read_bytes()).hexdigest(); custody_raw = hashlib.sha256((custody / "sealed-custody.json").read_bytes()).hexdigest(); resource_digests = resource_map(resources)
     release = {"schema": formal.RELEASE_SCHEMA, "protocol_sha256": proto["protocol_sha256"], "endpoint_manifest_sha256": endpoint["manifest_sha256"], "candidate_ready_sha256": candidate_receipt["ready_sha256"], "projection_raw_sha256": candidate_receipt["projection_raw_sha256"], "projection_canonical_sha256": candidate_receipt["projection_canonical_sha256"], "custody_ready_sha256": custody_ready, "custody_bundle_sha256": custody_raw, "ranking_artifact_sha256": {arm["arm_id"]: arm["ranking_artifact_sha256"] for arm in endpoint["arms"]}, "resource_sha256": resource_digests, "original_build_index_sha256": {row["build_id"]: row["index_sha256"] for row in original}, "current_worker_sha256": current_receipt["worker_sha256"]}
     release = formal.sign_release_authorization(release, custody_capability_secret=b"c" * 32)

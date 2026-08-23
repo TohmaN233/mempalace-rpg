@@ -63,6 +63,29 @@ def test_current_freeze_is_deterministic_and_public_validator_recomputes_receipt
         with pytest.raises(CustodyError): rank.validate_frozen_ranking(bad, projection=p)
 
 
+def test_query_latency_observer_records_each_rank_call_without_changing_artifact():
+    p = projection(); model, code = receipts(); measurements = []
+    observed = rank.rank_projection(
+        projection=p, encoder=Encoder(), arm_id="strong_raw",
+        model_receipt=model, code_receipt=code, query_measurements=measurements,
+    )
+    unobserved = rank.rank_projection(
+        projection=p, encoder=Encoder(), arm_id="strong_raw",
+        model_receipt=model, code_receipt=code,
+    )
+    assert rank._bytes(observed) == rank._bytes(unobserved)
+    assert [row["item_id"] for row in measurements] == [row["item_id"] for row in sorted(p["items"], key=lambda row: row["item_id"])]
+    assert all(set(row) == {"item_id", "query_sha256", "wall_ns", "cpu_ns"} and row["wall_ns"] > 0 and row["cpu_ns"] > 0 for row in measurements)
+    with pytest.raises(CustodyError, match="prefilled"):
+        rank.rank_projection(projection=p, encoder=Encoder(), arm_id="strong_raw", model_receipt=model, code_receipt=code, query_measurements=[{}])
+
+
+def test_rank_projection_fails_closed_when_encoder_identity_disagrees_with_receipt():
+    p = projection(); model, code = receipts(); encoder = Encoder(); encoder.identity = "wrong-encoder"
+    with pytest.raises(CustodyError, match="identity_mismatch"):
+        rank.rank_projection(projection=p, encoder=encoder, arm_id="strong_raw", model_receipt=model, code_receipt=code)
+
+
 def test_original_artifact_contains_five_complete_fresh_outputs_and_rejects_single_replicate_tamper():
     p = projection(); model, code = receipts(); artifact = rank.wrap_original_public_rankings(projection=p, replicates=original_replicates(p), model_receipt=model, code_receipt=code)
     assert len(artifact["replicates"]) == 5

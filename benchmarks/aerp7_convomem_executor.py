@@ -124,28 +124,38 @@ def _percentiles(values: Sequence[int]) -> dict[str, int]:
     return {"count": len(rows), "p50": at(.50), "p95": at(.95), "p99": at(.99), "max": rows[-1]}
 
 
-def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], elapsed_ns: int, build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1) -> dict[str, Any]:
+def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], query_measurements: Sequence[Mapping[str, Any]], build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1, passage_embedding: Mapping[str, Any] | None = None, query_embedding: Mapping[str, Any] | None = None, measurement_mode: str = "synthetic_rehearsal", storage_bytes: int = 0, storage_scope: str | None = None) -> dict[str, Any]:
     execution_role = role or ("fresh_build" if arm_id == "original_public_product" else "primary")
     accounting = {"primary": "primary_excludes_repeat", "repeat": "repeat_measured_separately"}[execution_role] if arm_id == "static_p5" else "not_applicable"
-    count = int(denominators["query_count"])
-    # The synthetic worker has one measured ranking pass.  It has no per-query
-    # wall-clock API, so it records an even conservative allocation rather than
-    # inventing a query trace.  Formal integration must replace this seam with
-    # exact upstream per-query timing before the constant is enabled.
-    each = max(1, int(elapsed_ns) // count)
+    measurements = [dict(item) for item in query_measurements]
+    walls = [item.get("wall_ns") for item in measurements]; cpus = [item.get("cpu_ns") for item in measurements]
+    if len(measurements) != int(denominators["query_count"]) or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in [*walls, *cpus]):
+        raise RuntimeError("executor raw query measurements invalid")
+    current_arm = arm_id != "original_public_product"
+    passage = dict(passage_embedding or {"calls": 0, "texts": 0})
+    query = dict(query_embedding or {"calls": 0, "texts": 0})
+    if current_arm:
+        for item in (passage, query):
+            item.update({"measurement_kind": "encoder_adapter_api_calls", "native_embedding_observable": True, "limitation": None})
+    else:
+        passage.update({"measurement_kind": "public_upsert_request_proxy", "native_embedding_observable": False, "limitation": "native_internal_embedding_calls_unobservable; public upsert request ledger only"})
+        query.update({"measurement_kind": "public_search_request_proxy", "native_embedding_observable": False, "limitation": "native_internal_embedding_calls_unobservable; public search request ledger only"})
     receipt = {
         "schema": formal.RESOURCE_SCHEMA,
         "arm_id": arm_id,
         "execution_role": execution_role,
         "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm_id == "strong_raw" else "native_public_product" if arm_id == "original_public_product" else "all_six_views_computed_then_fixed_fusion",
         "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization",
+        "measurement_mode": measurement_mode,
         "p5_repeat_accounting": accounting,
         "ingest_seconds": 0.0,
         "index_seconds": 0.0,
-        "query_latency_ns": _percentiles([each] * count),
-        "passage_embedding": {"calls": 1, "texts": int(denominators["candidate_text_count"])},
-        "query_embedding": {"calls": count, "texts": count},
-        "storage_bytes": 1,
+        "query_measurements": measurements,
+        "query_latency_ns": {"wall": _percentiles(walls), "cpu": _percentiles(cpus)},
+        "passage_embedding": passage,
+        "query_embedding": query,
+        "storage_scope": storage_scope or ("no_persistent_index" if current_arm else "palace_directory_after_cold_reopen"),
+        "storage_bytes": int(storage_bytes),
         "peak_rss_bytes": max(1, int(peak_rss_bytes)),
         "artifact_sha256": artifact_sha256,
         "build_id": build_id,
@@ -175,6 +185,18 @@ class _CountingSyntheticEncoder(_SyntheticEncoder):
     def encode_query(self, text: str) -> list[float]:
         self.query_calls += 1; self.query_texts += 1
         return super().encode_query(text)
+
+
+def _synthetic_query_measurements(projection: Mapping[str, Any], elapsed_ns: int) -> list[dict[str, Any]]:
+    """Explicitly synthetic fallback timing for the original shape-oracle only.
+
+    The current worker never uses this helper: it passes ranker's per-query
+    sidecar measurements.  Keeping this separate makes a synthetic original
+    receipt incapable of being misread as a live timing result.
+    """
+    items = sorted(validate_candidate_projection(projection)["items"], key=lambda row: row["item_id"])
+    each = max(1, int(elapsed_ns) // len(items))
+    return [{"item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"]), "wall_ns": each, "cpu_ns": each} for item in items]
 
 
 class _LiveOriginalObserver:
@@ -249,31 +271,13 @@ def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDr
     if not isinstance(latencies, list) or len(latencies) != int(denominators["query_count"]):
         raise CustodyError("executor_original_resource_invalid")
     latency_ns = [max(1, int(float(value) * 1_000_000_000)) for value in latencies]
-    passage, query = telemetry.get("passage_embedding"), telemetry.get("query_embedding")
-    if not isinstance(passage, Mapping) or not isinstance(query, Mapping):
+    rankings = replicate.get("rankings")
+    if not isinstance(rankings, list) or len(rankings) != len(latency_ns):
         raise CustodyError("executor_original_resource_invalid")
-    receipt = {
-        "schema": formal.RESOURCE_SCHEMA,
-        "arm_id": "original_public_product",
-        "execution_role": "fresh_build",
-        "resource_semantics": "native_public_product",
-        "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization",
-        "p5_repeat_accounting": "not_applicable",
-        "ingest_seconds": float(telemetry["ingest_seconds"]),
-        "index_seconds": float(telemetry["index_seconds"]),
-        "query_latency_ns": _percentiles(latency_ns),
-        "passage_embedding": {"calls": int(passage["calls"]), "texts": int(passage["texts"])},
-        "query_embedding": {"calls": int(query["calls"]), "texts": int(query["texts"])},
-        "storage_bytes": int(telemetry["storage_bytes"]),
-        "peak_rss_bytes": int(telemetry["peak_rss_bytes"]),
-        "artifact_sha256": "0" * 64,
-        "build_id": str(replicate["build_id"]),
-        "index_sha256": str(replicate["index_sha256"]),
-        "input_denominators": dict(denominators),
-        "hardware_runtime": _runtime(),
-    }
-    receipt["resource_sha256"] = formal.resource_digest(receipt)
-    return receipt
+    # Upstream's current draft telemetry provides only wall-clock per query.  A
+    # CPU number copied from wall time would be fabricated evidence, so the live
+    # original route remains fail-closed until its runner exposes CPU sidecars.
+    raise CustodyError("executor_original_cpu_timing_unobservable")
 
 
 def _sanitized_env() -> dict[str, str]:
@@ -318,6 +322,120 @@ def live_executor_code_receipt() -> dict[str, Any]:
         "diff_digest": state["worktree_diff_sha256"], "git_dirty": state["git_dirty"],
         "state_policy": "synthetic_exact_worktree_state_bound",
     }
+
+
+def _current_execution_receipt(*, role: str, arm_id: str, protocol: Mapping[str, Any], projection: Mapping[str, Any], worker_config: Mapping[str, Any], encoder: Any, artifact: Mapping[str, Any], resource: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the non-ranking execution sidecar for one current subprocess.
+
+    Synthetic workers bind their observed synthetic encoder explicitly.  The
+    future live helper replaces these model observations with a complete native
+    MiniLM tree receipt; it cannot borrow this synthetic receipt.
+    """
+    code = live_executor_code_receipt()
+    model = {"mode": "synthetic_rehearsal", "protocol_model_sha256": _digest(protocol["model_receipt"]), "encoder_identity": getattr(encoder, "identity", None)}
+    receipt = {
+        "schema": formal.CURRENT_EXECUTION_RECEIPT_SCHEMA,
+        "execution_mode": "synthetic_rehearsal",
+        "execution_role": role,
+        "arm_id": arm_id,
+        "protocol_sha256": protocol["protocol_sha256"],
+        "projection_sha256": canonical_sha256(projection),
+        "worker_config_sha256": _digest(worker_config),
+        "method_input_sha256": _digest({"arm_id": arm_id, "method_receipt": artifact["method_receipt"], "serializer_receipt": artifact["serializer_receipt"]}),
+        "observed_code_before": code,
+        "observed_code_after": code,
+        "observed_model_before": model,
+        "observed_model_after": model,
+        "provider": {"mode": "synthetic", "providers": []},
+        "encoder_identity": getattr(encoder, "identity", None),
+        "artifact_file_sha256": hashlib.sha256(_bytes(artifact)).hexdigest(),
+        "artifact_sha256": artifact["artifact_sha256"],
+        "resource_sha256": resource["resource_sha256"],
+        "process_id": os.getpid(),
+        # Coordinator fills this with the independent supervisor digest before
+        # aggregate validation; the worker output itself remains immutable.
+        "supervisor_sha256": "0" * 64,
+        "execution_sha256": "",
+    }
+    receipt["execution_sha256"] = _digest({key: item for key, item in receipt.items() if key != "execution_sha256"})
+    return receipt
+
+
+def _clean_protocol_code_observation(*, expected: Mapping[str, Any]) -> dict[str, Any]:
+    state = v1.git_state(Path(__file__).resolve().parents[1])
+    observed = {"head": state["git_head"], "tree": state["git_tree"], "diff_digest": state["worktree_diff_sha256"], "dirty_policy": "clean_required"}
+    if state["git_dirty"] or observed != dict(expected):
+        raise CustodyError("executor_current_live_code_drift")
+    return observed
+
+
+def _live_model_observation(*, model_dir: Path, expected: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
+    """Bind a live native adapter to every pinned model file, fail-closed.
+
+    The ranking receipt historically permits logical-only file entries for old
+    synthetic fixtures.  This helper does not: each live receipt must name every
+    relative path before it is allowed to select the native MiniLM adapter.
+    """
+    actual = v1.file_tree_receipt(model_dir)
+    expected_files = expected.get("files") if isinstance(expected, Mapping) else None
+    if not isinstance(expected_files, list) or not expected_files or any(not isinstance(row, Mapping) or set(row) != {"path_role", "relative_path", "sha256", "bytes"} for row in expected_files):
+        raise CustodyError("executor_current_live_model_relative_paths_required")
+    expected_tree = sorted(({"relative_path": row["relative_path"], "sha256": row["sha256"], "bytes": row["bytes"]} for row in expected_files), key=lambda row: row["relative_path"])
+    if actual["files"] != expected_tree:
+        raise CustodyError("executor_current_live_model_tree_drift")
+    encoder = v1.native_minilm_adapter(model_dir)
+    if encoder.identity != expected.get("encoder_identity"):
+        raise CustodyError("executor_current_live_encoder_identity_mismatch")
+    observation = {
+        "model_file_tree_sha256": actual["sha256"], "model_file_tree_bytes": actual["bytes"],
+        "encoder_identity": encoder.identity,
+        "runtime_identity": {"model": "minilm", "device": "cpu", "providers": ["CPUExecutionProvider"], "model_file_tree_sha256": actual["sha256"]},
+    }
+    return observation, encoder
+
+
+def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projection: Mapping[str, Any], worker_config: Mapping[str, Any], model_dir: Path) -> dict[str, Any]:
+    """Disabled-by-default exact current-arm execution seam.
+
+    It is intentionally not reachable from a synthetic packet: both global
+    switches must be authorized and protocol remains non-synthetic.  Keeping it
+    separate lets tests exercise the receipt shape without accidentally touching
+    formal ConvoMem data.
+    """
+    if SYNTHETIC_EXECUTION_ONLY or not FORMAL_CURRENT_EXECUTION_ENABLED:
+        raise CustodyError("executor_current_live_execution_blocked")
+    frozen = formal.validate_formal_protocol(protocol)
+    if role not in {"raw", "p5_primary", "p5_repeat", "six"}:
+        raise CustodyError("executor_current_role_invalid")
+    arm_id = {"raw": "strong_raw", "p5_primary": "static_p5", "p5_repeat": "static_p5", "six": "six_view_secondary"}[role]
+    code_before = _clean_protocol_code_observation(expected=frozen["current_code_receipt"])
+    model_before, encoder = _live_model_observation(model_dir=model_dir, expected=frozen["model_receipt"])
+    measurements: list[dict[str, Any]] = []
+    with RssMonitor(os.getpid()) as monitor:
+        artifact = rank.rank_projection(projection=projection, encoder=encoder, arm_id=arm_id, model_receipt=frozen["model_receipt"], code_receipt=frozen["current_code_receipt"], query_measurements=measurements)
+    model_after, _unused = _live_model_observation(model_dir=model_dir, expected=frozen["model_receipt"])
+    code_after = _clean_protocol_code_observation(expected=frozen["current_code_receipt"])
+    adapter = encoder.receipt()
+    resource = _resource(
+        arm_id=arm_id, artifact_sha256=artifact["artifact_sha256"], denominators=formal.projection_denominators(projection),
+        query_measurements=measurements, role={"p5_primary": "primary", "p5_repeat": "repeat"}.get(role),
+        peak_rss_bytes=monitor.peak_bytes,
+        passage_embedding={"calls": adapter["passage_call_count"], "texts": adapter["passage_text_count"]},
+        query_embedding={"calls": adapter["query_call_count"], "texts": adapter["query_text_count"]},
+        measurement_mode="live_native_adapter", storage_bytes=0,
+    )
+    receipt = _current_execution_receipt(role=role, arm_id=arm_id, protocol=frozen, projection=projection, worker_config=worker_config, encoder=encoder, artifact=artifact, resource=resource)
+    receipt.update({
+        "execution_mode": "live_native_adapter",
+        "observed_code_before": code_before, "observed_code_after": code_after,
+        "observed_model_before": model_before, "observed_model_after": model_after,
+        # Normalize away adapter cache topology.  Each isolated worker owns its
+        # object lifecycle, and the formal contract is CPU provider + pinned
+        # model tree, not an in-process sharing implementation detail.
+        "provider": {"model": "minilm", "device": "cpu", "providers": ["CPUExecutionProvider"], "model_file_tree_sha256": model_before["model_file_tree_sha256"]},
+    })
+    receipt["execution_sha256"] = _digest({key: item for key, item in receipt.items() if key != "execution_sha256"})
+    return {"artifact": artifact, "resource_receipt": resource, "execution_receipt": receipt}
 
 
 def _operator_secret() -> bytes:
@@ -476,22 +594,28 @@ def current_worker(config: Mapping[str, Any]) -> dict[str, Any]:
     role = str(config["execution_role"])
     role_to_arm = {"raw": "strong_raw", "p5_primary": "static_p5", "p5_repeat": "static_p5", "six": "six_view_secondary"}
     if role not in role_to_arm: raise CustodyError("executor_current_role_invalid")
-    started = time.perf_counter_ns(); encoder = _CountingSyntheticEncoder()
+    encoder = _CountingSyntheticEncoder(); encoder.identity = protocol["model_receipt"]["encoder_identity"]; query_measurements: list[dict[str, Any]] = []
     with RssMonitor(os.getpid()) as monitor:
         projection = _candidate_projection(protocol, bundle, worker_config, staging_parent)
-        artifact = rank.rank_projection(projection=projection, encoder=encoder, arm_id=role_to_arm[role], model_receipt=protocol["model_receipt"], code_receipt=protocol["current_code_receipt"])
-    elapsed = max(1, time.perf_counter_ns() - started)
+        artifact = rank.rank_projection(projection=projection, encoder=encoder, arm_id=role_to_arm[role], model_receipt=protocol["model_receipt"], code_receipt=protocol["current_code_receipt"], query_measurements=query_measurements)
     denominators = formal.projection_denominators(projection)
-    resource = _resource(arm_id=role_to_arm[role], artifact_sha256=artifact["artifact_sha256"], denominators=denominators, elapsed_ns=elapsed, role={"p5_primary": "primary", "p5_repeat": "repeat"}.get(role), peak_rss_bytes=monitor.peak_bytes)
-    resource["passage_embedding"] = {"calls": encoder.passage_calls, "texts": encoder.passage_texts}; resource["query_embedding"] = {"calls": encoder.query_calls, "texts": encoder.query_texts}; resource["resource_sha256"] = formal.resource_digest(resource)
-    packet = {"schema": CURRENT_PACKET_SCHEMA, "execution_role": role, "artifact": artifact, "resource_receipt": resource, "process_id": os.getpid(), "packet_sha256": ""}
+    resource = _resource(
+        arm_id=role_to_arm[role], artifact_sha256=artifact["artifact_sha256"], denominators=denominators,
+        query_measurements=query_measurements, role={"p5_primary": "primary", "p5_repeat": "repeat"}.get(role),
+        peak_rss_bytes=monitor.peak_bytes,
+        passage_embedding={"calls": encoder.passage_calls, "texts": encoder.passage_texts},
+        query_embedding={"calls": encoder.query_calls, "texts": encoder.query_texts},
+    )
+    execution_receipt = _current_execution_receipt(role=role, arm_id=role_to_arm[role], protocol=protocol, projection=projection, worker_config=worker_config, encoder=encoder, artifact=artifact, resource=resource)
+    packet = {"schema": CURRENT_PACKET_SCHEMA, "execution_role": role, "artifact": artifact, "resource_receipt": resource, "execution_receipt": execution_receipt, "process_id": os.getpid(), "packet_sha256": ""}
     packet["packet_sha256"] = _digest({key: item for key, item in packet.items() if key != "packet_sha256"})
     _write_new(output, packet); return packet
 
 
 def _synthetic_original_replicate(projection: Mapping[str, Any], protocol: Mapping[str, Any], build_id: str) -> dict[str, Any]:
     """Synthetic-only shape oracle for subprocess isolation tests, not product output."""
-    current = rank.rank_projection(projection=projection, encoder=_SyntheticEncoder(), arm_id="strong_raw", model_receipt=protocol["model_receipt"], code_receipt=protocol["current_code_receipt"])
+    encoder = _SyntheticEncoder(); encoder.identity = protocol["model_receipt"]["encoder_identity"]
+    current = rank.rank_projection(projection=projection, encoder=encoder, arm_id="strong_raw", model_receipt=protocol["model_receipt"], code_receipt=protocol["current_code_receipt"])
     corpora = {corpus["corpus_id"]: corpus for corpus in projection["corpora"]}; items = {item["item_id"]: item for item in projection["items"]}
     rows = [{**{key: value for key, value in row.items() if key not in {"confidence", "confidence_receipt"}}, "candidate_input_sha256": rank._candidate_input(corpora[items[row["item_id"]]["corpus_id"]], rank.ORIGINAL_MEMPALACE_SERIALIZER), "confidence": None, "confidence_receipt": None} for row in current["rankings"]]
     traces = [{key: value for key, value in row.items() if key in {"item_id", "query_sha256", "ranked_count", "ranking_sha256"}} for row in current["trace_receipt"]]
@@ -523,7 +647,15 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         with RssMonitor(os.getpid()) as monitor:
             replicate = _synthetic_original_replicate(projection, protocol, build_id)
         elapsed = max(1, time.perf_counter_ns() - started)
-        resource = _resource(arm_id="original_public_product", artifact_sha256="0" * 64, denominators=denominators, elapsed_ns=elapsed, build_id=replicate["build_id"], index_sha256=replicate["index_sha256"], peak_rss_bytes=monitor.peak_bytes)
+        resource = _resource(
+            arm_id="original_public_product", artifact_sha256="0" * 64, denominators=denominators,
+            query_measurements=_synthetic_query_measurements(projection, elapsed),
+            build_id=replicate["build_id"], index_sha256=replicate["index_sha256"],
+            peak_rss_bytes=monitor.peak_bytes,
+            passage_embedding={"calls": len(projection["corpora"]), "texts": denominators["candidate_text_count"]},
+            query_embedding={"calls": denominators["query_count"], "texts": denominators["query_count"]},
+            storage_bytes=1,
+        )
         packet = {"schema": ORIGINAL_PACKET_SCHEMA, "replicate": replicate, "resource_receipt": resource, "process_id": os.getpid(), "packet_sha256": ""}
     else:
         draft_path = Path(str(config["draft_path"])); palace_path = Path(str(config["palace_path"]))
@@ -651,7 +783,7 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
         if not source.is_file() or source.is_symlink(): raise CustodyError("executor_candidate_capability_invalid")
         _write_bytes_new(public_bundle / name, source.read_bytes())
     # The only persistent child configs are purpose-minimal label-free files.
-    worker = {"role": "candidate_ranker", "projection_sha256": protocol["candidate"]["projection_canonical_sha256"], "projection_raw_sha256": protocol["candidate"]["projection_raw_sha256"], "projection_path": "projection.json", "model_receipt": protocol["model_receipt"], "code_receipt": protocol["current_code_receipt"], "staging_root": "staging", "arms": ["strong_raw", "static_p5", "six_view_secondary"], "top_k": 10, "tie_break": "stable_ranking_key_ascending", "serializer_contract": protocol["serializer_contract"]}
+    worker = formal.canonical_candidate_worker_config(protocol)
     worker_path = staging / "current-worker-config.json"; _write_new(worker_path, worker)
     executable = str(config["python_executable"])
     if Path(executable).resolve() != Path(sys.executable).resolve(): raise CustodyError("executor_python_not_pinned")
@@ -706,7 +838,13 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
     if set(current_by_role) != {"raw", "p5_primary", "p5_repeat", "six"}: raise CustodyError("executor_current_role_coverage_invalid")
     if _bytes(current_by_role["p5_primary"]["artifact"]) != _bytes(current_by_role["p5_repeat"]["artifact"]): raise CustodyError("executor_current_p5_nondeterministic")
     current_artifacts = [current_by_role["raw"]["artifact"], current_by_role["p5_primary"]["artifact"], current_by_role["six"]["artifact"]]
-    current_receipt = {"schema": formal.CURRENT_WORKER_SCHEMA, "lifecycle": list(formal.CURRENT_LIFECYCLE), "projection_sha256": canonical_sha256(projection), "artifact_sha256": {row["arm_id"]: row["artifact_sha256"] for row in current_artifacts}, "static_p5_primary_sha256": current_by_role["p5_primary"]["artifact"]["artifact_sha256"], "static_p5_repeat_sha256": current_by_role["p5_repeat"]["artifact"]["artifact_sha256"], "static_p5_byte_identical": True, "static_p5_execution_count": 2}
+    execution_receipts = []
+    for role, supervisor_name in (("raw", "current-raw"), ("p5_primary", "current-p5_primary"), ("p5_repeat", "current-p5_repeat"), ("six", "current-six")):
+        receipt = dict(current_by_role[role]["execution_receipt"])
+        receipt["supervisor_sha256"] = _digest(supervisors[supervisor_name])
+        receipt["execution_sha256"] = _digest({key: item for key, item in receipt.items() if key != "execution_sha256"})
+        execution_receipts.append(receipt)
+    current_receipt = {"schema": formal.CURRENT_WORKER_SCHEMA, "lifecycle": list(formal.CURRENT_LIFECYCLE), "projection_sha256": canonical_sha256(projection), "artifact_sha256": {row["arm_id"]: row["artifact_sha256"] for row in current_artifacts}, "static_p5_primary_sha256": current_by_role["p5_primary"]["artifact"]["artifact_sha256"], "static_p5_repeat_sha256": current_by_role["p5_repeat"]["artifact"]["artifact_sha256"], "static_p5_byte_identical": True, "static_p5_execution_count": 2, "execution_receipts": execution_receipts}
     current_receipt["worker_sha256"] = formal._digest(current_receipt)
     artifacts = [checked_original["artifact"], *current_artifacts]
     endpoint = formal.freeze_endpoint_manifest(projection=projection, protocol=protocol, ranking_artifacts=artifacts)
@@ -716,8 +854,15 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
     for packet in original_packets:
         receipt = dict(packet["resource_receipt"]); receipt["artifact_sha256"] = checked_original["artifact"]["artifact_sha256"]; receipt["resource_sha256"] = formal.resource_digest(receipt); original_resources.append(receipt)
     resources = [*original_resources, *(row["resource_receipt"] for row in current_packets)]
+    expected_queries = formal.projection_query_keys(projection)
     for receipt in resources:
-        formal.validate_resource_receipt(receipt, arm_id=receipt["arm_id"], thresholds=protocol["resource_thresholds"], expected_denominators=formal.projection_denominators(projection))
+        formal.validate_resource_receipt(receipt, arm_id=receipt["arm_id"], thresholds=protocol["resource_thresholds"], expected_denominators=formal.projection_denominators(projection), expected_query_keys=expected_queries)
+    if any(receipt["measurement_mode"] != "synthetic_rehearsal" for receipt in resources):
+        raise CustodyError("executor_synthetic_resource_mode_invalid")
+    formal.validate_current_execution_receipts(
+        execution_receipts, current_worker_receipt=current_receipt, protocol=protocol, projection=projection,
+        resources=resources, ranking_artifacts=current_artifacts, supervisors=supervisors, allow_synthetic=True,
+    )
     packet = {
         "schema": FREEZE_PACKET_SCHEMA, "synthetic_test_mode": True,
         "formal_eligible": False, "authorization_sha256": authorization["authorization_sha256"],

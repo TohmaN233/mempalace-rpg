@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256, validate_candidate_projection
@@ -112,7 +114,13 @@ def _validate_model_receipt(value: Any) -> dict[str, Any]:
     roles: set[str] = set()
     for item in files:
         item = _object(item, "model_receipt_file_invalid")
-        if set(item) != {"path_role", "sha256", "bytes"} or not isinstance(item["path_role"], str) or not item["path_role"].strip() or item["path_role"] in roles:
+        # Historical synthetic receipts deliberately contain only a logical file
+        # role.  A live executor must additionally require ``relative_path`` so
+        # it can bind this receipt to a real model tree; accepting both here
+        # keeps frozen synthetic fixtures readable without weakening live mode.
+        if set(item) not in ({"path_role", "sha256", "bytes"}, {"path_role", "relative_path", "sha256", "bytes"}) or not isinstance(item["path_role"], str) or not item["path_role"].strip() or item["path_role"] in roles:
+            raise CustodyError("model_receipt_file_invalid")
+        if "relative_path" in item and (not isinstance(item["relative_path"], str) or not item["relative_path"].strip() or Path(item["relative_path"]).is_absolute() or ".." in Path(item["relative_path"]).parts):
             raise CustodyError("model_receipt_file_invalid")
         roles.add(item["path_role"]); _hex(item["sha256"], "model_receipt_file_invalid"); _int(item["bytes"], "model_receipt_file_invalid", positive=True)
     return row
@@ -187,13 +195,32 @@ def _current_row(item: Mapping[str, Any], corpus: Mapping[str, Any], result: Any
     return row, trace
 
 
-def rank_projection(*, projection: Any, encoder: Any, arm_id: str, model_receipt: Mapping[str, Any] | None = None, code_receipt: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def rank_projection(*, projection: Any, encoder: Any, arm_id: str, model_receipt: Mapping[str, Any] | None = None, code_receipt: Mapping[str, Any] | None = None, query_measurements: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     frozen = validate_candidate_projection(projection)
     if arm_id not in CURRENT_ARMS or model_receipt is None or code_receipt is None: raise CustodyError("ranking_receipt_required")
-    model = _validate_model_receipt(model_receipt); code = _validate_code_receipt(code_receipt); ranker = _ranker(encoder, arm_id)
+    model = _validate_model_receipt(model_receipt); code = _validate_code_receipt(code_receipt)
+    # A valid receipt is not an assertion about an arbitrary encoder instance.
+    # The identity check is deliberately before ranker construction, so an
+    # accidental fallback encoder cannot emit even a partial artifact.
+    if getattr(encoder, "identity", None) != model["encoder_identity"]:
+        raise CustodyError("ranking_encoder_identity_mismatch")
+    if query_measurements is not None and query_measurements:
+        raise CustodyError("ranking_query_measurement_prefilled")
+    ranker = _ranker(encoder, arm_id)
     candidates = authorized_candidates(frozen); corpora = {row["corpus_id"]: row for row in frozen["corpora"]}; rows = []; trace = []
     for item in sorted(frozen["items"], key=lambda row: row["item_id"]):
-        row, trace_row = _current_row(item, corpora[item["corpus_id"]], ranker.rank(query=item["query_text"], candidates=candidates[item["corpus_id"]]))
+        started_ns = time.perf_counter_ns(); cpu_started_ns = time.process_time_ns()
+        result = ranker.rank(query=item["query_text"], candidates=candidates[item["corpus_id"]])
+        elapsed_ns = max(1, time.perf_counter_ns() - started_ns)
+        cpu_elapsed_ns = max(1, time.process_time_ns() - cpu_started_ns)
+        if query_measurements is not None:
+            query_measurements.append({
+                "item_id": item["item_id"],
+                "query_sha256": _query_digest(item["query_text"]),
+                "wall_ns": elapsed_ns,
+                "cpu_ns": cpu_elapsed_ns,
+            })
+        row, trace_row = _current_row(item, corpora[item["corpus_id"]], result)
         rows.append(row); trace.append(trace_row)
     value = {"schema": RANKING_SCHEMA, "arm_id": arm_id, "projection_sha256": canonical_sha256(frozen), "input_receipt": _input_receipt(frozen, CURRENT_SERIALIZER), "model_receipt": model, "method_receipt": _arm_method(arm_id), "source_receipt": PROTOCOL_SOURCE, "serializer_receipt": CURRENT_SERIALIZER, "code_receipt": code, "trace_receipt": trace, "rankings": rows}
     for field, receipt in (("input_sha256", "input_receipt"), ("model_sha256", "model_receipt"), ("method_sha256", "method_receipt"), ("source_commit_sha256", "source_receipt"), ("serializer_sha256", "serializer_receipt"), ("code_sha256", "code_receipt"), ("trace_sha256", "trace_receipt")):

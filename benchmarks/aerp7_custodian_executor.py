@@ -251,7 +251,7 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
         raise CustodyError("custodian_projection_packet_binding_invalid")
     if protocol["candidate"]["ready_sha256"] != cfg["candidate_ready_sha256"]:
         raise CustodyError("custodian_candidate_ready_public_binding_invalid")
-    current = formal.validate_current_worker_receipt(packet["current_worker_receipt"], projection=projection)
+    current = formal.validate_current_worker_receipt(packet["current_worker_receipt"], projection=projection, require_execution_receipts=True)
     artifacts = [rank.validate_frozen_ranking(item, projection=projection) for item in packet["ranking_artifacts"]]
     if tuple(item["arm_id"] for item in artifacts) != score.FORMAL_ARMS:
         raise CustodyError("custodian_ranking_arm_coverage_invalid")
@@ -260,11 +260,11 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
     if {item["arm_id"]: item["ranking_artifact_sha256"] for item in endpoint["arms"]} != artifact_digests or current["artifact_sha256"] != {arm: artifact_digests[arm] for arm in ("strong_raw", "static_p5", "six_view_secondary")}:
         raise CustodyError("custodian_endpoint_artifact_binding_invalid")
     resources = list(packet["resource_receipts"])
-    expected = formal.projection_denominators(projection)
+    expected = formal.projection_denominators(projection); expected_queries = formal.projection_query_keys(projection)
     for receipt in resources:
         if not isinstance(receipt, Mapping):
             raise CustodyError("custodian_resource_receipt_invalid")
-        formal.validate_resource_receipt(receipt, arm_id=receipt.get("arm_id"), thresholds=protocol["resource_thresholds"], expected_denominators=expected)
+        formal.validate_resource_receipt(receipt, arm_id=receipt.get("arm_id"), thresholds=protocol["resource_thresholds"], expected_denominators=expected, expected_query_keys=expected_queries)
     # Release validation also verifies every resource/replicate cross-binding;
     # this local coverage check catches incomplete public packets before custody.
     by_arm: dict[str, list[Mapping[str, Any]]] = {}
@@ -273,6 +273,11 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
     if set(by_arm) != set(score.FORMAL_ARMS) or len(by_arm["original_public_product"]) != 5 or len(by_arm["strong_raw"]) != 1 or len(by_arm["six_view_secondary"]) != 1 or len(by_arm["static_p5"]) != 2:
         raise CustodyError("custodian_resource_coverage_invalid")
     supervisors = _validate_supervisors(packet["supervisors"])
+    formal.validate_current_execution_receipts(
+        current["execution_receipts"], current_worker_receipt=current, protocol=protocol, projection=projection,
+        resources=resources, ranking_artifacts=[item for item in artifacts if item["arm_id"] != "original_public_product"],
+        supervisors=supervisors, allow_synthetic=True,
+    )
     return {"config": cfg, "packet": packet, "protocol": protocol, "projection": projection, "current_worker_receipt": current, "ranking_artifacts": artifacts, "endpoint_manifest": endpoint, "resource_receipts": resources, "supervisors": supervisors}
 
 
@@ -294,7 +299,7 @@ def _release(*, public: Mapping[str, Any], custody_ready_sha256: str, custody_bu
     resources, artifacts = public["resource_receipts"], public["ranking_artifacts"]
     originals = next(item for item in artifacts if item["arm_id"] == "original_public_product")["replicates"]
     unsigned = {
-        "schema": formal.RELEASE_SCHEMA,
+        "schema": formal.REHEARSAL_RELEASE_SCHEMA,
         "protocol_sha256": protocol["protocol_sha256"],
         "endpoint_manifest_sha256": endpoint["manifest_sha256"],
         "candidate_ready_sha256": protocol["candidate"]["ready_sha256"],
@@ -307,7 +312,7 @@ def _release(*, public: Mapping[str, Any], custody_ready_sha256: str, custody_bu
         "original_build_index_sha256": {item["build_id"]: item["index_sha256"] for item in originals},
         "current_worker_sha256": public["current_worker_receipt"]["worker_sha256"],
     }
-    return formal.sign_release_authorization(unsigned, custody_capability_secret=capability)
+    return formal.sign_rehearsal_release_authorization(unsigned, custody_capability_secret=capability)
 
 
 def scientific_gate_decision(report: Mapping[str, Any], protocol: Mapping[str, Any]) -> dict[str, Any]:
@@ -464,7 +469,7 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
         public=public, custody_ready_sha256=cfg["custody_ready_sha256"],
         custody_bundle_sha256=cfg["custody_bundle_sha256"], capability=private["custody_capability_secret"],
     )
-    formal.validate_release_authorization(
+    formal.validate_rehearsal_release_authorization(
         release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
         endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
@@ -481,7 +486,7 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     if release["custody_ready_sha256"] != custody_ready or release["custody_bundle_sha256"] != custody_bundle:
         raise CustodyError("custodian_release_actual_custody_binding_invalid")
     scorer_before = live_custodian_code_receipt()
-    opened = formal.open_custody_after_release(
+    opened = formal.open_custody_after_rehearsal_release(
         release_authorization=release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
         endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
@@ -517,7 +522,7 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     scorer_after = live_custodian_code_receipt()
     if scorer_before != scorer_after:
         raise CustodyError("custodian_live_code_drift")
-    envelope = formal.audit_envelope(
+    envelope = formal.rehearsal_audit_envelope(
         report=report, post_score_attestation=post, scorer_attestation_secret=private["scorer_attestation_secret"],
         release_authorization=release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],

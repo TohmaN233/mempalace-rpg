@@ -130,12 +130,53 @@ def _public_run(tmp_path: Path, monkeypatch):
 def test_public_packet_failure_precedes_custody_open_and_leaves_no_output(tmp_path, monkeypatch):
     config, _config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
     opened = []
-    monkeypatch.setattr(custodian.formal, "open_custody_after_release", lambda **_kwargs: opened.append(True))
+    monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: opened.append(True))
     config = dict(config); config["freeze_packet_file_sha256"] = "0" * 64
     with pytest.raises(CustodyError, match="freeze_packet_file_digest"):
         custodian.execute_custodian(config, private)
     assert opened == []
     assert not Path(config["output_path"]).exists()
+
+
+def test_rehearsal_authorization_cannot_validate_as_a_formal_release(tmp_path, monkeypatch):
+    config, _config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
+    public = custodian.validate_public_freeze(config)
+    rehearsal = custodian._release(
+        public=public, custody_ready_sha256=config["custody_ready_sha256"],
+        custody_bundle_sha256=config["custody_bundle_sha256"], capability=private["custody_capability_secret"].encode(),
+    )
+    assert rehearsal["schema"] == custodian.formal.REHEARSAL_RELEASE_SCHEMA
+    assert custodian.formal.validate_rehearsal_release_authorization(
+        rehearsal, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
+        current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
+        endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
+        custody_ready_sha256=config["custody_ready_sha256"], custody_bundle_sha256=config["custody_bundle_sha256"],
+        custody_capability_secret=private["custody_capability_secret"].encode(),
+    )["schema"] == custodian.formal.REHEARSAL_RELEASE_SCHEMA
+    with pytest.raises(CustodyError, match="release_authorization_invalid"):
+        custodian.formal.validate_release_authorization(
+            rehearsal, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
+            current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
+            endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
+            custody_ready_sha256=config["custody_ready_sha256"], custody_bundle_sha256=config["custody_bundle_sha256"],
+            custody_capability_secret=private["custody_capability_secret"].encode(),
+        )
+
+
+def test_resealed_supervisor_tamper_is_rejected_by_public_freeze(tmp_path, monkeypatch):
+    config, _config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
+    freeze_path = Path(config["public_freeze_packet"]); packet = json.loads(freeze_path.read_text(encoding="utf-8"))
+    execution = packet["current_worker_receipt"]["execution_receipts"]
+    execution[0]["supervisor_sha256"] = _h("forged-supervisor")
+    execution[0]["execution_sha256"] = custodian.formal._digest({key: value for key, value in execution[0].items() if key != "execution_sha256"})
+    packet["current_worker_receipt"]["worker_sha256"] = custodian.formal._digest({key: value for key, value in packet["current_worker_receipt"].items() if key != "worker_sha256"})
+    packet["packet_sha256"] = executor._digest({key: value for key, value in packet.items() if key != "packet_sha256"})
+    freeze_path.write_bytes(executor._bytes(packet)); config = dict(config)
+    config["freeze_packet_file_sha256"] = hashlib.sha256(freeze_path.read_bytes()).hexdigest()
+    private = dict(private); private["public_packet_sha256"] = packet["packet_sha256"]; private["freeze_packet_file_sha256"] = config["freeze_packet_file_sha256"]
+    private = custodian.sign_private_payload(private, custody_capability_secret=private["custody_capability_secret"].encode())
+    with pytest.raises(CustodyError, match="supervisor_binding_invalid"):
+        custodian.validate_public_freeze(config)
 
 
 def test_real_synthetic_bundle_scores_in_a_distinct_subprocess_and_is_idempotent(tmp_path, monkeypatch):
@@ -168,7 +209,7 @@ def test_same_authorization_replay_does_not_snapshot_or_open_custody(tmp_path, m
             custody_reads.append(Path(path))
         return original_snapshot(path, *args, **kwargs)
     monkeypatch.setattr(confirmation, "_snapshot", spy)
-    monkeypatch.setattr(custodian.formal, "open_custody_after_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("replay must not open custody")))
+    monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("replay must not open custody")))
     replay = custodian.execute_custodian(config, private)
     assert replay["retry_idempotent"] is True
     assert replay["packet_sha256"] == first["packet_sha256"]
@@ -185,7 +226,7 @@ def test_consumed_authorization_with_deleted_result_never_reopens_custody(tmp_pa
             raise AssertionError("consumed replay must not snapshot custody")
         return real_snapshot(path, *args, **kwargs)
     monkeypatch.setattr(confirmation, "_snapshot", reject_custody_snapshot)
-    monkeypatch.setattr(custodian.formal, "open_custody_after_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("consumed replay must not open custody")))
+    monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("consumed replay must not open custody")))
     with pytest.raises(CustodyError, match="consumed_result_missing"):
         custodian.execute_custodian(config, private)
 
@@ -204,7 +245,7 @@ def test_publication_before_consumed_marker_crash_is_healed_without_rescore(tmp_
             raise AssertionError("healing retry must not snapshot custody")
         return real_snapshot(path, *args, **kwargs)
     monkeypatch.setattr(confirmation, "_snapshot", reject_custody_snapshot)
-    monkeypatch.setattr(custodian.formal, "open_custody_after_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("healing retry must not open custody")))
+    monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("healing retry must not open custody")))
     replay = custodian.execute_custodian(config, private)
     assert replay["retry_idempotent"] is True
 
@@ -229,7 +270,7 @@ def test_expired_authorization_is_rejected_before_custody_or_marker(tmp_path, mo
     private = dict(private); private["expires_at_unix"] = int(time.time()) - 1
     private = custodian.sign_private_payload(private, custody_capability_secret=private["custody_capability_secret"].encode())
     opened = []
-    monkeypatch.setattr(custodian.formal, "open_custody_after_release", lambda **_kwargs: opened.append(True))
+    monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: opened.append(True))
     with pytest.raises(CustodyError, match="capability_expired"):
         custodian.execute_custodian(config, private)
     output = Path(config["output_path"])
@@ -241,7 +282,7 @@ def test_wrong_private_hmac_never_publishes_and_subprocess_output_has_no_secret(
     config, config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
     private = dict(private); private["authorization_hmac"] = "0" * 64
     opened = []
-    monkeypatch.setattr(custodian.formal, "open_custody_after_release", lambda **_kwargs: opened.append(True))
+    monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: opened.append(True))
     with pytest.raises(CustodyError, match="private_capability_hmac"):
         custodian.execute_custodian(config, private)
     assert opened == []
@@ -277,7 +318,7 @@ def test_tampered_resource_chain_is_rejected_before_any_custody_snapshot(tmp_pat
             custody_snapshots.append(Path(path))
         return original_snapshot(path, *args, **kwargs)
     monkeypatch.setattr(confirmation, "_snapshot", spy)
-    with pytest.raises(CustodyError, match="release_resource_artifact_binding_invalid"):
+    with pytest.raises(CustodyError, match="current_execution_resource_binding_invalid"):
         custodian.execute_custodian(config, private)
     assert custody_snapshots == []
     assert not Path(config["output_path"]).exists()

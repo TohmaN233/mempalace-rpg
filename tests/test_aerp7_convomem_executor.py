@@ -166,10 +166,27 @@ def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, m
     assert len({row["pid"] for row in packet["supervisors"].values()}) == 9
     assert packet["current_worker_receipt"]["static_p5_execution_count"] == 2
     assert packet["current_worker_receipt"]["static_p5_primary_sha256"] == packet["current_worker_receipt"]["static_p5_repeat_sha256"]
+    execution = packet["current_worker_receipt"]["execution_receipts"]
+    assert [row["execution_role"] for row in execution] == ["raw", "p5_primary", "p5_repeat", "six"]
+    assert len({row["process_id"] for row in execution}) == 4
+    assert execution[1]["artifact_file_sha256"] == execution[2]["artifact_file_sha256"]
+    projection = runpy.run_path("tests/test_aerp7_convomem_formal.py")["projection"]()
+    current_artifacts = [row for row in packet["ranking_artifacts"] if row["arm_id"] != "original_public_product"]
+    assert executor.formal.validate_current_execution_receipts(execution, current_worker_receipt=packet["current_worker_receipt"], protocol=packet["protocol"], projection=projection, resources=packet["resource_receipts"], ranking_artifacts=current_artifacts, supervisors=packet["supervisors"], allow_synthetic=True) == execution
+    tampered = [dict(row) for row in execution]; tampered[0]["supervisor_sha256"] = "0" * 64; tampered[0]["execution_sha256"] = executor._digest({key: value for key, value in tampered[0].items() if key != "execution_sha256"})
+    with pytest.raises(CustodyError, match="receipt_coverage_invalid"):
+        executor.formal.validate_current_execution_receipts(tampered, current_worker_receipt=packet["current_worker_receipt"], protocol=packet["protocol"], projection=projection, resources=packet["resource_receipts"], ranking_artifacts=current_artifacts, supervisors=packet["supervisors"], allow_synthetic=True)
     assert (output / "public-freeze.json").is_file()
     assert all("CUSTODY" not in key and "BINDING" not in key for row in packet["supervisors"].values() for key in [])
     with pytest.raises(CustodyError, match="output_present"):
         executor.public_coordinator(config)
+
+
+def test_live_current_helper_is_not_reachable_from_synthetic_execution(tmp_path):
+    fixture = runpy.run_path("tests/test_aerp7_convomem_formal.py")
+    projection = fixture["projection"](); protocol = fixture["protocol"](projection)
+    with pytest.raises(CustodyError, match="live_execution_blocked"):
+        executor.run_live_current_execution(role="raw", protocol=protocol, projection=projection, worker_config=fixture["worker_config"](projection, protocol), model_dir=tmp_path)
 
 
 def test_worker_failure_discards_staging_and_consumes_authorization(tmp_path, monkeypatch):
