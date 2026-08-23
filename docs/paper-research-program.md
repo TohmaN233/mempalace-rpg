@@ -49,13 +49,35 @@ confirmation claim.
 ### AERP-5 v2 public-product rehearsal
 
 The AERP-5 v2 specification harness binds the exact 1,982 AERP-4 members (and
-the four custody exclusions) for a public, non-blind product pairing.  Its
+the four custody exclusions) and consumes one independently byte-pinned,
+label-free projection for a public, non-blind product pairing.  Its
 intended arms are the pinned original public-product seam, fixed static P5,
 and secondary fixed six-view.  The implemented core enforces two frozen
-label-free repeats, P5-vs-AERP4 Top-10 equality, per-query cold-first latency,
+label-free repeats, AERP4 membership/query/input/policy-lineage binding, and a
+two-repeat MiniLM-P5 checkpoint before label custody, per-query cold-first latency,
 process-tree RSS, and score-after-freeze custody.  The subprocess runner
 constructs the pinned original/current product arms from that projection in
-fresh temporary backends.  No AERP-5 v2 real-1982 product result exists yet;
+fresh temporary backends.  The formal coordinator may not rebuild projection
+from, hash, parse, or load the full official LoCoMo bundle: that bundle remains
+custodian-only until both the AERP4 BGE-lineage anchor and the two-repeat
+MiniLM-P5 checkpoint have passed.  Before the custodian may even hash the
+official bundle, it re-binds the score-config projection path and both
+projection digests, dataset path and digest, MiniLM tree digest, and clean
+original checkout to the canonical manifest; config-local matching hashes cannot
+redirect any input.  It also cross-binds the lineage and MiniLM checkpoint's
+membership/query-input identities and canonical fixed-P5 semantics.  The label
+consumer itself is independently anchored in that manifest by normalized source
+digests of scoring, aggregation, bootstrap, replicate-report, and decision
+functions plus exact AERP1/original-protocol dependencies; a live receipt and
+its score-config copy cannot jointly authorize a scorer change.  The post-label
+item/token join, score computation, unresolved-ledger check,
+slice aggregation, decision, and scored-result assembly are one pure pinned
+score core; its source digest is part of the same contract, while the custodian
+shell only performs label loading, postchecks, and publication.  Before any
+freeze bytes are hashed or parsed, the custodian also requires every dynamic
+freeze to be a unique non-symlink, non-hard-linked regular file named
+`{arm}-{repeat}.json` under the coordinator's external work namespace, with no
+filesystem alias to projection, dataset, manifest, or scorer inputs.  No AERP-5 v2 real-1982 product result exists yet;
 this code is an executable protocol rather than evidence of a completed
 experiment.  The runner therefore reports product-comparison completion
 separately and keeps `resource_gate_eligible=false` until mixed-visibility,
@@ -73,6 +95,28 @@ representation-only normalization that stores each conversation corpus once,
 keeps the 1,982 query membership and frozen rankings unchanged, and retains the
 same 2 GiB threshold.  Raising the threshold or using labels during this repair
 is forbidden.
+
+The formal coordinator likewise never opens the AERP4 study or custody bundle:
+the custody bundle is label-bearing.  It derives allowed membership solely from
+the two immutable, label-free train/dev ranking freezes, whose byte digests and
+`study_sha256` fields are checked against the canonical manifest; the manifest's
+four exclusion tokens are the only exclusion input available before custody.
+
+The later `retry5` at checkpoint
+`982252aa85cbcff2fca200a8725fb24b9da7806a` reached all nine completed label-free
+workers but stopped before label custody because its then-current gate demanded
+byte-identical Top-10 output from the historical AERP4 BGE-fp32 freeze and the
+matched-encoder native-MiniLM product arm.  That is a protocol-gate error, not
+a quality result: the 1,982 item membership plus every query and input digest
+matched, while the encoders are intentionally different.  The corrected v2
+protocol keeps the immutable AERP4 freeze as BGE lineage (including its model
+pins and fixed-P5 semantics), never as a cross-encoder ranking oracle.  It
+instead freezes two exact label-free native-MiniLM P5 repeats as the
+`AERP5-MiniLM-P5` checkpoint and binds that checkpoint into the scoring config
+before any official evidence labels are read.  A BGE replay, if run, is an
+optional lineage check and cannot become the primary comparison.
+The immutable external failure receipt is SHA-256
+`da7051d79bd8e434d40480c9a6df492beafd2c5d88ea4e4ef69fece1502f221a`.
 
 ## Track A: retrieval
 

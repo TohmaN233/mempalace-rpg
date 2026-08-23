@@ -16,6 +16,9 @@ from benchmarks import aerp5_product_paired_locomo_v2 as runner
 from mempalace_rpg.retrieval import AuthorizedRetrievalCandidate
 
 
+MODEL_SHA = "a" * 64
+
+
 def _token(number: int) -> str:
     return f"{number:064x}"
 
@@ -108,6 +111,9 @@ def _valid_worker_freeze(arm: str) -> tuple[dict, tuple[str, ...]]:
                 "authorized_dialog_universe_sha256": _token(index + 3),
                 "selected_dialog_order_sha256": runner.canonical_sha256(items[token]["dialog_top10"]),
                 "retrieval_ranking": {
+                    "encoder_identity": runner.expected_minilm_encoder_identity(MODEL_SHA),
+                    "query_sha256": _token(index + 4),
+                    "input_sha256": _token(index + 5),
                     "selected": [{"ranking_key_sha256": key} for key in selected_keys],
                 },
             }
@@ -161,14 +167,14 @@ def _valid_worker_freeze(arm: str) -> tuple[dict, tuple[str, ...]]:
         "policy_receipts": policies,
         "policy_receipts_sha256": policy_sha,
         "onnx_providers": ["CPUExecutionProvider"],
-        "model_file_tree_sha256": "m" * 64,
+        "model_file_tree_sha256": MODEL_SHA,
         "original_product_configuration": {
             "backend": "chroma",
             "collection": runner.v1.ORIGINAL_COLLECTION,
             "embedding_model": "minilm",
             "embedding_device": "cpu",
             "providers": ["CPUExecutionProvider"],
-            "model_file_tree_sha256": "m" * 64,
+            "model_file_tree_sha256": MODEL_SHA,
             "same_cached_embedding_object_for_both_arms": True,
         },
         "identity_namespace_receipt": identity_namespace,
@@ -194,6 +200,24 @@ def test_manifest_rejects_noncanonical_path_and_gate_bytes(tmp_path):
     alternate.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="canonical manifest bytes"):
         runner.load_manifest(alternate)
+
+
+def test_pinned_label_free_projection_is_exact_and_fails_closed_on_path_or_byte_drift(tmp_path):
+    manifest = runner.load_manifest()
+    pin = manifest["projection"]
+    projection, file_digest, content_digest = runner.load_pinned_projection(
+        projection_path=Path(pin["path"]), manifest=manifest
+    )
+    assert file_digest == content_digest == pin["file_sha256"]
+    assert len(projection["items"]) == pin["item_count"] == 1982
+    with pytest.raises(ValueError, match="canonical label-free projection path"):
+        runner.load_pinned_projection(projection_path=tmp_path / "same-name.json", manifest=manifest)
+    drifted = tmp_path / "drifted.json"
+    drifted.write_bytes(runner._canonical(projection) + b"\n")
+    forged = copy.deepcopy(manifest)
+    forged["projection"]["path"] = str(drifted)
+    with pytest.raises(RuntimeError, match="bytes drifted"):
+        runner.load_pinned_projection(projection_path=drifted, manifest=forged)
 
 
 def test_custodian_rejects_self_consistent_noncanonical_scientific_gate():
@@ -320,11 +344,22 @@ def test_stable_trace_repeats_through_real_kernel_with_fresh_random_event_ids(tm
 
 def test_aerp4_membership_requires_1982_allowed_and_four_exclusions(monkeypatch):
     manifest = runner.load_manifest()
-    study, custody, train, dev = {}, {"label_custody": {"exclusion_receipt": {"excluded_item_tokens": manifest["aerp4"]["excluded_item_tokens"]}}}, {"partition": "train", "status": "complete", "items": [_row(i) for i in range(937)]}, {"partition": "dev", "status": "complete", "items": [_row(i) for i in range(937, 1982)]}
-    study_digest = runner.canonical_sha256(study); custody["study_sha256"] = study_digest
-    digests = [study_digest, runner.canonical_sha256(custody), runner.canonical_sha256(train), runner.canonical_sha256(dev)]
-    monkeypatch.setitem(manifest["aerp4"], "study_sha256", digests[0]); monkeypatch.setitem(manifest["aerp4"], "custody_bundle_sha256", digests[1]); monkeypatch.setitem(manifest["aerp4"], "train_ranking_freeze_sha256", digests[2]); monkeypatch.setitem(manifest["aerp4"], "dev_ranking_freeze_sha256", digests[3])
-    assert runner.validate_aerp4_membership(study=study, custody=custody, train_freeze=train, dev_freeze=dev, manifest=manifest)["count"] == 1982
+    study_digest = "a" * 64
+    train = {"partition": "train", "status": "complete", "study_sha256": study_digest, "items": [_row(i) for i in range(937)]}
+    dev = {"partition": "dev", "status": "complete", "study_sha256": study_digest, "items": [_row(i) for i in range(937, 1982)]}
+    monkeypatch.setitem(manifest["aerp4"], "study_sha256", study_digest)
+    monkeypatch.setitem(manifest["aerp4"], "train_ranking_freeze_sha256", runner.canonical_sha256(train))
+    monkeypatch.setitem(manifest["aerp4"], "dev_ranking_freeze_sha256", runner.canonical_sha256(dev))
+    assert runner.validate_aerp4_membership(train_freeze=train, dev_freeze=dev, manifest=manifest)["count"] == 1982
+    dev["study_sha256"] = "b" * 64
+    monkeypatch.setitem(manifest["aerp4"], "dev_ranking_freeze_sha256", runner.canonical_sha256(dev))
+    with pytest.raises(ValueError, match="does not bind"):
+        runner.validate_aerp4_membership(train_freeze=train, dev_freeze=dev, manifest=manifest)
+    dev["study_sha256"] = study_digest
+    monkeypatch.setitem(manifest["aerp4"], "dev_ranking_freeze_sha256", runner.canonical_sha256(dev))
+    manifest["aerp4"]["excluded_item_tokens"] = manifest["aerp4"]["excluded_item_tokens"][:3]
+    with pytest.raises(ValueError, match="count"):
+        runner.validate_aerp4_membership(train_freeze=train, dev_freeze=dev, manifest=manifest)
 
 
 def test_pinned_json_uses_file_bytes_digest_not_reserialized_json(tmp_path):
@@ -484,11 +519,282 @@ def test_original_worker_keeps_one_loader_and_cold_reopen_barrier_in_same_proces
     assert source.index("cold_reopen_cleanup = v1.reset_original_product_backends(original_palace)") < source.index("original_product_query_namespaced(")
 
 
-def test_p5_validation_fails_on_any_freeze_drift():
-    row = _row(1)
-    runner.validate_p5_against_aerp4({_token(1): row["p5_top10"]}, [row])
-    with pytest.raises(RuntimeError, match="differs"):
-        runner.validate_p5_against_aerp4({_token(1): row["raw_top10"]}, [row])
+def _aerp4_lineage_rows(p5_freeze: dict) -> list[dict]:
+    rows = []
+    for token, trace in p5_freeze["trace_receipt"]["items"].items():
+        retrieval = trace["stable_trace"]["retrieval_ranking"]
+        rows.append({
+            "item_token": token,
+            "query_sha256": retrieval["query_sha256"],
+            "input_sha256": retrieval["input_sha256"],
+            "p5_top10": [f"historical-bge-{token}-{rank}" for rank in range(10)],
+        })
+    return rows
+
+
+def test_aerp4_lineage_binds_query_input_policy_and_bge_without_cross_encoder_top10_equality():
+    p5, tokens = _valid_worker_freeze(runner.ARM_P5)
+    manifest = copy.deepcopy(runner.load_manifest())
+    manifest["run"]["model"]["file_tree_sha256"] = MODEL_SHA
+    receipt = runner.validate_aerp4_lineage(
+        frozen_rows=_aerp4_lineage_rows(p5), current_p5=p5, manifest=manifest
+    )
+    assert receipt["historical_encoder"] == runner.AERP4_HISTORICAL_BGE
+    assert receipt["membership_sha256"] == runner.canonical_sha256(sorted(tokens))
+
+
+@pytest.mark.parametrize("mutation", ["query", "input", "policy", "bge_identity"])
+def test_aerp4_lineage_fails_closed_on_query_input_policy_or_encoder_drift(mutation):
+    p5, _tokens = _valid_worker_freeze(runner.ARM_P5)
+    rows = _aerp4_lineage_rows(p5)
+    manifest = copy.deepcopy(runner.load_manifest())
+    manifest["run"]["model"]["file_tree_sha256"] = MODEL_SHA
+    if mutation == "query":
+        rows[0]["query_sha256"] = "0" * 64
+    elif mutation == "input":
+        rows[0]["input_sha256"] = "0" * 64
+    elif mutation == "policy":
+        manifest["aerp4"]["fixed_p5_semantics"]["rrf_k"] = 0
+    else:
+        manifest["aerp4"]["historical_encoder"]["family"] = "native_minilm"
+    with pytest.raises((RuntimeError, ValueError), match="query/input|P5 semantics|BGE"):
+        runner.validate_aerp4_lineage(frozen_rows=rows, current_p5=p5, manifest=manifest)
+
+
+def test_minilm_p5_checkpoint_fails_closed_on_repeat_or_encoder_drift_and_binds_scorer_config():
+    p5, tokens = _valid_worker_freeze(runner.ARM_P5)
+    p5["input_projection_sha256"] = "b" * 64
+    repeats = [copy.deepcopy(p5), copy.deepcopy(p5)]
+    checkpoint = runner.build_minilm_p5_checkpoint(
+        repeats, expected_model_sha256=MODEL_SHA, expected_item_tokens=tokens
+    )
+    runner.validate_minilm_p5_checkpoint(
+        checkpoint, expected_checkpoint_sha256=runner.canonical_sha256(checkpoint), repeats=repeats,
+        expected_model_sha256=MODEL_SHA, expected_item_tokens=tokens,
+    )
+    repeats[1]["trace_receipt"]["trace_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="repeat trace drift"):
+        runner.build_minilm_p5_checkpoint(repeats, expected_model_sha256=MODEL_SHA, expected_item_tokens=tokens)
+    with pytest.raises(ValueError, match="missing"):
+        runner.validate_minilm_p5_checkpoint(
+            None, expected_checkpoint_sha256=None, repeats=[p5, copy.deepcopy(p5)],
+            expected_model_sha256=MODEL_SHA, expected_item_tokens=tokens,
+        )
+
+
+def test_worker_parser_rejects_bge_identity_in_the_matched_minilm_primary_arm():
+    value, tokens = _valid_worker_freeze(runner.ARM_P5)
+    value["trace_receipt"]["items"][tokens[0]]["stable_trace"]["retrieval_ranking"]["encoder_identity"] = "historical-bge-fp32"
+    item = value["trace_receipt"]["items"][tokens[0]]
+    item["trace_sha256"] = runner.canonical_sha256(item["stable_trace"])
+    value["trace_receipt"]["trace_sha256"] = runner.canonical_sha256(value["trace_receipt"]["items"])
+    with pytest.raises(ValueError, match="native MiniLM"):
+        runner.parse_worker_freeze(
+            value, arm=runner.ARM_P5, projection_sha256="p" * 64,
+            projection_content_sha256="c" * 64, item_tokens=tokens, model_sha256=MODEL_SHA,
+        )
+
+
+def test_custodian_validates_lineage_and_minilm_checkpoint_before_loading_label_bearing_protocol():
+    source = inspect.getsource(runner.custodian_score_run)
+    label_load = source.index("v1.load_original_product")
+    dataset_hash = source.index("sha256_file(dataset_path)")
+    assert source.index("validate_custodian_canonical_inputs") < dataset_hash
+    assert source.index("preflight_custodian_freeze_paths") < dataset_hash
+    assert source.index("validate_scorer_contract") < dataset_hash
+    assert source.index("validate_aerp4_lineage_receipt") < label_load
+    assert source.index("validate_minilm_p5_checkpoint") < label_load
+    assert source.index("validate_aerp4_minilm_checkpoint_binding") < dataset_hash
+    assert dataset_hash > source.index("validate_minilm_p5_checkpoint")
+    assert source.index("assemble_custodian_scored_report") > label_load
+
+
+def test_custodian_rejects_config_self_attested_alternate_paths_before_any_dataset_read(monkeypatch, tmp_path):
+    manifest = runner.load_manifest()
+    alternate_projection = tmp_path / "projection.json"; alternate_projection.write_text("{}", encoding="utf-8")
+    alternate_dataset = tmp_path / "dataset.json"; alternate_dataset.write_text("labels must stay unread", encoding="utf-8")
+    base = {
+        "projection": manifest["projection"]["path"],
+        "expected_projection_sha256": manifest["projection"]["file_sha256"],
+        "expected_projection_content_sha256": manifest["projection"]["content_sha256"],
+        "dataset": manifest["dataset"]["path"],
+        "expected_dataset_sha256": manifest["dataset"]["sha256"],
+        "expected_model_sha256": manifest["run"]["model"]["file_tree_sha256"],
+        "original_root": manifest["original"]["repo"],
+        "scientific_gates": runner.EXPECTED_SCIENTIFIC_GATES,
+        "expected_scientific_gates_sha256": runner.canonical_sha256(runner.EXPECTED_SCIENTIFIC_GATES),
+        "manifest_sha256": runner.canonical_sha256(manifest),
+    }
+    monkeypatch.setattr(runner, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(runner, "sha256_file", lambda _path: pytest.fail("dataset/projection bytes must not be read"))
+    monkeypatch.setattr(runner.v1, "load_original_product", lambda *_: pytest.fail("label-bearing loader must not run"))
+    forged_projection = {**base, "projection": str(alternate_projection), "expected_projection_sha256": "a" * 64, "expected_projection_content_sha256": "a" * 64}
+    with pytest.raises(RuntimeError, match="projection path"):
+        runner.custodian_score_run(forged_projection)
+    forged_dataset = {**base, "dataset": str(alternate_dataset), "expected_dataset_sha256": "b" * 64}
+    with pytest.raises(RuntimeError, match="dataset path"):
+        runner.custodian_score_run(forged_dataset)
+    with pytest.raises(RuntimeError, match="projection file digest"):
+        runner.custodian_score_run({**base, "expected_projection_sha256": "a" * 64})
+    with pytest.raises(RuntimeError, match="projection content digest"):
+        runner.custodian_score_run({**base, "expected_projection_content_sha256": "a" * 64})
+    with pytest.raises(RuntimeError, match="dataset digest"):
+        runner.custodian_score_run({**base, "expected_dataset_sha256": "b" * 64})
+    with pytest.raises(RuntimeError, match="MiniLM model digest"):
+        runner.custodian_score_run({**base, "expected_model_sha256": "c" * 64})
+    with pytest.raises(RuntimeError, match="original root"):
+        runner.custodian_score_run({**base, "original_root": str(tmp_path / "alternate-original")})
+    monkeypatch.setattr(runner.v1, "git_state", lambda _root: {
+        "git_head": manifest["original"]["commit"], "git_tree": manifest["original"]["tree"], "git_dirty": True,
+    })
+    with pytest.raises(RuntimeError, match="clean canonical manifest checkout"):
+        runner.custodian_score_run(base)
+
+
+def test_custodian_rejects_live_and_config_matched_score_core_drift_before_dataset_read(monkeypatch):
+    manifest = runner.load_manifest()
+    forged_contract = copy.deepcopy(manifest["scorer_contract"]["receipt"])
+    assert "assemble_custodian_scored_report" in forged_contract["runner_functions"]
+    forged_contract["runner_functions"]["assemble_custodian_scored_report"] = "a" * 64
+    config = {
+        "projection": manifest["projection"]["path"],
+        "expected_projection_sha256": manifest["projection"]["file_sha256"],
+        "expected_projection_content_sha256": manifest["projection"]["content_sha256"],
+        "dataset": manifest["dataset"]["path"],
+        "expected_dataset_sha256": manifest["dataset"]["sha256"],
+        "expected_model_sha256": manifest["run"]["model"]["file_tree_sha256"],
+        "original_root": manifest["original"]["repo"],
+        "work": "C:/not-reached",
+        "scorer_implementation_receipt": forged_contract,
+        "scientific_gates": runner.EXPECTED_SCIENTIFIC_GATES,
+        "expected_scientific_gates_sha256": runner.canonical_sha256(runner.EXPECTED_SCIENTIFIC_GATES),
+        "manifest_sha256": runner.canonical_sha256(manifest),
+    }
+    monkeypatch.setattr(runner, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(runner.v1, "git_state", lambda _root: {
+        "git_head": manifest["original"]["commit"], "git_tree": manifest["original"]["tree"], "git_dirty": False,
+    })
+    monkeypatch.setattr(runner, "preflight_custodian_freeze_paths", lambda *_args, **_kwargs: (Path("C:/not-reached"), {}))
+    monkeypatch.setattr(runner, "scorer_implementation_receipt", lambda _root: forged_contract)
+    monkeypatch.setattr(runner, "sha256_file", lambda _path: pytest.fail("dataset bytes must not be read"))
+    monkeypatch.setattr(runner.v1, "load_original_product", lambda *_: pytest.fail("dataset loader must not run"))
+    with pytest.raises(RuntimeError, match="live scorer contract differs"):
+        runner.custodian_score_run(config)
+
+
+def test_freeze_preflight_rejects_hardlink_alias_before_hash_or_json_read(monkeypatch, tmp_path):
+    manifest = copy.deepcopy(runner.load_manifest())
+    projection = tmp_path / "projection.json"; projection.write_text("public projection", encoding="utf-8")
+    dataset = tmp_path / "dataset.json"; dataset.write_text("official labels", encoding="utf-8")
+    manifest["projection"]["path"] = str(projection)
+    manifest["dataset"]["path"] = str(dataset)
+    work = tmp_path / "work"; work.mkdir()
+    freezes = {}
+    for arm in runner.ALL_ARMS:
+        paths = []
+        for repeat in range(runner.REPEATS_BY_ARM[arm]):
+            path = work / f"{arm}-{repeat}.json"
+            if arm == runner.ARM_ORIGINAL and repeat == 0:
+                os.link(dataset, path)
+            else:
+                path.write_text("freeze", encoding="utf-8")
+            paths.append(str(path))
+        freezes[arm] = paths
+    config = {
+        "projection": str(projection),
+        "expected_projection_sha256": manifest["projection"]["file_sha256"],
+        "expected_projection_content_sha256": manifest["projection"]["content_sha256"],
+        "dataset": str(dataset),
+        "expected_dataset_sha256": manifest["dataset"]["sha256"],
+        "expected_model_sha256": manifest["run"]["model"]["file_tree_sha256"],
+        "original_root": manifest["original"]["repo"],
+        "work": str(work),
+        "freezes": freezes,
+        "scorer_implementation_receipt": {"not": "reached"},
+        "scientific_gates": runner.EXPECTED_SCIENTIFIC_GATES,
+        "expected_scientific_gates_sha256": runner.canonical_sha256(runner.EXPECTED_SCIENTIFIC_GATES),
+        "manifest_sha256": runner.canonical_sha256(manifest),
+    }
+    monkeypatch.setattr(runner, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(runner.v1, "git_state", lambda _root: {
+        "git_head": manifest["original"]["commit"], "git_tree": manifest["original"]["tree"], "git_dirty": False,
+    })
+    monkeypatch.setattr(runner, "sha256_file", lambda _path: pytest.fail("freeze/dataset bytes must not be hashed"))
+    monkeypatch.setattr(runner, "_json", lambda _path: pytest.fail("freeze JSON must not be read"))
+    monkeypatch.setattr(runner.v1, "load_original_product", lambda *_: pytest.fail("dataset loader must not run"))
+    with pytest.raises(RuntimeError, match="hard-linked|aliases a protected"):
+        runner.custodian_score_run(config)
+
+
+def test_aerp4_lineage_and_minilm_checkpoint_cross_binding_rejects_self_consistent_trace_drift():
+    p5, tokens = _valid_worker_freeze(runner.ARM_P5)
+    p5["input_projection_sha256"] = "b" * 64
+    p5["input_projection_content_sha256"] = "c" * 64
+    canonical_checkpoint = runner.build_minilm_p5_checkpoint(
+        [copy.deepcopy(p5), copy.deepcopy(p5)], expected_model_sha256=MODEL_SHA, expected_item_tokens=tokens
+    )
+    canonical_lineage = {
+        "membership_sha256": canonical_checkpoint["membership_sha256"],
+        "query_input_sha256": canonical_checkpoint["query_input_sha256"],
+    }
+    runner.validate_aerp4_minilm_checkpoint_binding(canonical_lineage, canonical_checkpoint)
+    drifted_repeats = [copy.deepcopy(p5), copy.deepcopy(p5)]
+    token = tokens[0]
+    for repeat in drifted_repeats:
+        trace = repeat["trace_receipt"]["items"][token]
+        trace["stable_trace"]["retrieval_ranking"]["query_sha256"] = "f" * 64
+        trace["trace_sha256"] = runner.canonical_sha256(trace["stable_trace"])
+        repeat["trace_receipt"]["trace_sha256"] = runner.canonical_sha256(repeat["trace_receipt"]["items"])
+    drifted_checkpoint = runner.build_minilm_p5_checkpoint(
+        drifted_repeats, expected_model_sha256=MODEL_SHA, expected_item_tokens=tokens
+    )
+    with pytest.raises(RuntimeError, match="query_input_sha256 differ"):
+        runner.validate_aerp4_minilm_checkpoint_binding(canonical_lineage, drifted_checkpoint)
+    semantics_drift = {**canonical_checkpoint, "fixed_p5_semantics_sha256": "0" * 64}
+    with pytest.raises(RuntimeError, match="fixed-P5 semantics drifted"):
+        runner.validate_aerp4_minilm_checkpoint_binding(canonical_lineage, semantics_drift)
+
+
+def test_formal_coordinator_consumes_only_pinned_label_free_projection_before_custody():
+    source = inspect.getsource(runner.coordinator_run)
+    assert "build_public_projection(" not in source
+    assert "v1.load_original_product" not in source
+    assert "load_official_locomo10" not in source
+    assert "sha256_file(dataset)" not in source
+    assert source.index("load_pinned_projection") < source.index("supervise_worker")
+
+
+def test_formal_coordinator_and_cli_never_accept_aerp4_study_or_custody_label_bundle():
+    assert "study" not in inspect.signature(runner.coordinator_run).parameters
+    assert "custody" not in inspect.signature(runner.coordinator_run).parameters
+    source = inspect.getsource(runner.main)
+    assert '"--study"' not in source and '"--custody"' not in source
+
+
+def test_aerp4_lineage_anchor_rejects_self_consistent_forged_score_config_receipt():
+    tokens = tuple(_token(index) for index in range(1982))
+    legitimate = {
+        "schema": "aerp5-aerp4-bge-lineage-v1",
+        "historical_encoder": runner.AERP4_HISTORICAL_BGE,
+        "fixed_p5_semantics": runner._fixed_p5_semantics(),
+        "membership_sha256": runner.canonical_sha256(sorted(tokens)),
+        "query_input_sha256": "a" * 64,
+    }
+    manifest = {"aerp4": {"lineage_anchor": {
+        "schema": legitimate["schema"],
+        "membership_sha256": legitimate["membership_sha256"],
+        "query_input_sha256": legitimate["query_input_sha256"],
+        "receipt_sha256": runner.canonical_sha256(legitimate),
+    }}}
+    forged = {**legitimate, "query_input_sha256": "b" * 64}
+    # A sibling config hash can be recomputed by an attacker; it is intentionally
+    # not an input to the custodian validator.
+    forged_self_hash = runner.canonical_sha256(forged)
+    assert forged_self_hash != manifest["aerp4"]["lineage_anchor"]["receipt_sha256"]
+    with pytest.raises(RuntimeError, match="canonical manifest anchor"):
+        runner.validate_aerp4_lineage_receipt(
+            forged, manifest=manifest, expected_item_tokens=tokens
+        )
 
 
 @pytest.mark.parametrize("arm", runner.ALL_ARMS)
@@ -500,7 +806,7 @@ def test_strict_worker_parser_binds_projection_trace_policy_and_product_config(a
         projection_sha256="p" * 64,
         projection_content_sha256="c" * 64,
         item_tokens=tokens,
-        model_sha256="m" * 64,
+        model_sha256=MODEL_SHA,
         identity_namespace=_expected_identity_namespace() if arm == runner.ARM_ORIGINAL else None,
     )
     assert parsed["arm"] == arm
@@ -521,7 +827,7 @@ def test_strict_worker_parser_binds_projection_trace_policy_and_product_config(a
             projection_sha256="p" * 64,
             projection_content_sha256="c" * 64,
             item_tokens=tokens,
-            model_sha256="m" * 64,
+            model_sha256=MODEL_SHA,
             identity_namespace=_expected_identity_namespace() if arm == runner.ARM_ORIGINAL else None,
         )
 
@@ -536,7 +842,7 @@ def test_strict_worker_parser_recomputes_trace_and_projection_content_receipts()
             projection_sha256="p" * 64,
             projection_content_sha256="c" * 64,
             item_tokens=tokens,
-            model_sha256="m" * 64,
+            model_sha256=MODEL_SHA,
             identity_namespace=None,
         )
 
@@ -567,7 +873,7 @@ def test_strict_worker_parser_binds_dialog_evidence_trace_and_p5_final_receipt(m
             projection_sha256="p" * 64,
             projection_content_sha256="c" * 64,
             item_tokens=tokens,
-            model_sha256="m" * 64,
+            model_sha256=MODEL_SHA,
             identity_namespace=None,
         )
     value, tokens = _valid_worker_freeze(runner.ARM_P5)
@@ -578,7 +884,7 @@ def test_strict_worker_parser_binds_dialog_evidence_trace_and_p5_final_receipt(m
             projection_sha256="p" * 64,
             projection_content_sha256="wrong",
             item_tokens=tokens,
-            model_sha256="m" * 64,
+            model_sha256=MODEL_SHA,
             identity_namespace=None,
         )
 
@@ -602,7 +908,7 @@ def test_strict_worker_parser_rejects_unreplayable_latency_receipt():
             projection_sha256="p" * 64,
             projection_content_sha256="c" * 64,
             item_tokens=tokens,
-            model_sha256="m" * 64,
+            model_sha256=MODEL_SHA,
         )
 
 
@@ -685,7 +991,7 @@ def test_supervisor_sidecar_binds_command_and_completed_freeze(monkeypatch, tmp_
 
 
 def test_coordinator_vertical_slice_launches_six_then_custodian_then_nonreplace_publish(monkeypatch, tmp_path):
-    manifest = runner.load_manifest(); dataset = tmp_path / "dataset.json"; dataset.write_bytes(b"dataset")
+    manifest = runner.load_manifest(); projection = tmp_path / "pinned-projection.json"; dataset = tmp_path / "dataset.json"; dataset.write_bytes(b"dataset")
     model = tmp_path / "model"; model.mkdir(); (model / "m").write_bytes(b"m")
     original = tmp_path / "original"; original.mkdir(); work = tmp_path / "work"; output = tmp_path / "final.json"
     tokens = tuple(_token(index) for index in range(1982)); timeline = []
@@ -697,12 +1003,16 @@ def test_coordinator_vertical_slice_launches_six_then_custodian_then_nonreplace_
     monkeypatch.setattr(runner, "environment_receipt", lambda **_: {"ok": True})
     monkeypatch.setattr(runner, "validate_environment_receipt", lambda *_: None)
     monkeypatch.setattr(runner, "scorer_implementation_receipt", lambda *_: {"scorer": "pinned"})
+    monkeypatch.setattr(runner, "validate_scorer_contract", lambda **_: {"scorer": "pinned"})
     monkeypatch.setattr(runner.v1, "file_tree_receipt", lambda *_: {"model": "same"})
-    monkeypatch.setattr(runner, "build_public_projection", lambda **_: _compact_projection(tokens))
+    monkeypatch.setattr(runner, "load_pinned_projection", lambda **_: (_compact_projection(tokens), "f" * 64, "e" * 64))
     monkeypatch.setattr(runner, "original_identity_namespace", lambda *_: {"expected_unique_count": 5882, "mapping_sha256": "n" * 64})
     monkeypatch.setattr(runner, "_sqlite_embedding_count", lambda *_: 5882)
     monkeypatch.setattr(runner, "coordinator_original_index_build_receipt", lambda **_: {"receipt": "coordinator"})
-    monkeypatch.setattr(runner, "validate_p5_against_aerp4", lambda *_: None)
+    monkeypatch.setattr(runner, "validate_aerp4_lineage", lambda **_: {"lineage": "pinned"})
+    monkeypatch.setattr(runner, "validate_aerp4_lineage_anchor", lambda *_args, **_kwargs: {"lineage": "pinned"})
+    monkeypatch.setattr(runner, "build_minilm_p5_checkpoint", lambda *_args, **_kwargs: {"checkpoint": "pinned"})
+    monkeypatch.setattr(runner, "validate_aerp4_minilm_checkpoint_binding", lambda *_args, **_kwargs: None)
     def fake_parse(_value, *, arm, **_kwargs):
         return {"projection_sha256": "repeat", "onnx_providers": ["CPUExecutionProvider"], "model_file_tree_sha256": manifest["run"]["model"]["file_tree_sha256"], "dialog_ranking_sha256": "dialog", "evidence_ranking_sha256": "evidence", "policy_receipts_sha256": "policy" if arm != runner.ARM_ORIGINAL else "unsupported", "trace_receipt": {"trace_sha256": "trace" if arm != runner.ARM_ORIGINAL else "unsupported"}, "items": {token: {"evidence_top10": []} for token in tokens}}
     monkeypatch.setattr(runner, "parse_worker_freeze", fake_parse)
@@ -715,12 +1025,12 @@ def test_coordinator_vertical_slice_launches_six_then_custodian_then_nonreplace_
     def fake_run(command, **_kwargs):
         assert len(timeline) == 9; timeline.append("scorer")
         config = json.loads((work / "custodian-config.json").read_text())
-        (work / "custodian-score.json").write_text(json.dumps({"scorer_implementation_receipt": config["scorer_implementation_receipt"], "input_receipts": {"dataset_sha256": config["expected_dataset_sha256"], "projection_sha256": config["expected_projection_sha256"], "projection_content_sha256": config["expected_projection_content_sha256"], "freeze_sha256": config["expected_freeze_sha256"], "original_index_receipts_sha256": config["expected_original_index_receipts_sha256"], "scientific_gates_sha256": config["expected_scientific_gates_sha256"], "manifest_sha256": config["manifest_sha256"]}}), encoding="utf-8")
+        (work / "custodian-score.json").write_text(json.dumps({"scorer_implementation_receipt": config["scorer_implementation_receipt"], "input_receipts": {"dataset_sha256": config["expected_dataset_sha256"], "projection_sha256": config["expected_projection_sha256"], "projection_content_sha256": config["expected_projection_content_sha256"], "freeze_sha256": config["expected_freeze_sha256"], "original_index_receipts_sha256": config["expected_original_index_receipts_sha256"], "aerp4_lineage_sha256": runner.canonical_sha256(config["aerp4_lineage"]), "minilm_p5_checkpoint_sha256": config["expected_minilm_p5_checkpoint_sha256"], "scientific_gates_sha256": config["expected_scientific_gates_sha256"], "manifest_sha256": config["manifest_sha256"]}}), encoding="utf-8")
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
     train_json = {"partition": "train", "status": "complete", "items": []}; dev_json = {"partition": "dev", "status": "complete", "items": []}
-    pins = [SimpleNamespace(load=lambda: {}), SimpleNamespace(load=lambda: {}), SimpleNamespace(load=lambda: train_json), SimpleNamespace(load=lambda: dev_json)]
-    result = runner.coordinator_run(dataset=dataset, original_root=original, model_dir=model, study=pins[0], custody=pins[1], train=pins[2], dev=pins[3], work=work, output=output, manifest=manifest)
+    pins = [SimpleNamespace(load=lambda: train_json), SimpleNamespace(load=lambda: dev_json)]
+    result = runner.coordinator_run(projection_path=projection, dataset=dataset, original_root=original, model_dir=model, train=pins[0], dev=pins[1], work=work, output=output, manifest=manifest)
     assert timeline == ["worker"] * 9 + ["scorer"] and output.is_file() and result["score"]["input_receipts"] == json.loads((work / "custodian-score.json").read_text())["input_receipts"]
 
 

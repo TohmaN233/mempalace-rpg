@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import math
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 import platform
 import random
 import sqlite3
+import stat
 import statistics
 import struct
 import subprocess
@@ -36,18 +38,21 @@ from mempalace_rpg.retrieval import SIX_VIEW_WEIGHTS
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_MANIFEST_PATH = Path(__file__).with_name("aerp5_product_paired_locomo_v2_manifest.json")
 TOP_K = 10
 EXPECTED_ORIGINAL_DIALOG_COUNT = 5882
 CURRENT_REPEATS = 2
 ORIGINAL_REPEATS = 5
 RSS_CAP_BYTES = 2_147_483_648
 SCHEMA = "aerp5-product-paired-locomo-v2"
-EXPECTED_DEFAULT_MANIFEST_SHA256 = "adc038716b656f7139e2383cdc0e791503285605900a3a8ed4882260936a4eb1"
+EXPECTED_DEFAULT_MANIFEST_SHA256 = "1f76246e627909bbb67adcb8f3809de2b40c3432b0feeb80ed38425884dac388"
 EXPECTED_SCIENTIFIC_GATES = {
     "projected_member_count": 1982,
     "original_dialog_count": EXPECTED_ORIGINAL_DIALOG_COUNT,
     "strict_top_k": 10,
-    "p5_matches_aerp4_freeze": True,
+    "aerp4_lineage_membership_query_input_and_policy_bound": True,
+    "minilm_p5_checkpoint_before_label_custody": True,
+    "coordinator_never_opens_aerp4_study_or_custody": True,
     "rerun_projection_digest_equal": True,
     "score_only_after_freeze": True,
     "original_index_build_replicates": ORIGINAL_REPEATS,
@@ -68,6 +73,17 @@ ARM_SIX_VIEW = "current_fixed_six_view_product_secondary"
 ALL_ARMS = (ARM_ORIGINAL, ARM_P5, ARM_SIX_VIEW)
 REPEATS_BY_ARM = {ARM_ORIGINAL: ORIGINAL_REPEATS, ARM_P5: CURRENT_REPEATS, ARM_SIX_VIEW: CURRENT_REPEATS}
 PROJECTION_SCHEMA = SCHEMA + "-projection-v2"
+# AERP4's historical frozen P5 stream used the byte-pinned BGE fp32 adapter.
+# AERP5's fair product comparison instead pins every primary arm to the native
+# MiniLM product encoder.  These are deliberately distinct identities: an
+# exact ranking equality check across them is not a reproducibility check.
+AERP4_HISTORICAL_BGE = {
+    "family": "historical_bge",
+    "precision": "fp32",
+    "model_manifest_sha256": "454d14761089976b0437135fd70c6da49fc836ad9344d43b0a693d343fc0ea85",
+    "model_onnx_sha256": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+}
+MINILM_P5_CHECKPOINT_SCHEMA = "aerp5-minilm-p5-checkpoint-v1"
 # This asserts implementation availability, never experimental completion.
 END_TO_END_PRODUCT_WORKER_IMPLEMENTED = True
 
@@ -126,17 +142,34 @@ class PinnedJson:
 
 
 def load_manifest(path: Path | None = None) -> dict[str, Any]:
-    manifest_path = path or Path(__file__).with_name("aerp5_product_paired_locomo_v2_manifest.json")
+    manifest_path = path or CANONICAL_MANIFEST_PATH
     if sha256_file(manifest_path) != EXPECTED_DEFAULT_MANIFEST_SHA256:
         raise ValueError("AERP5 v2 canonical manifest bytes drifted")
     manifest = _json(manifest_path)
-    required = {"schema", "dataset", "original", "aerp4", "run", "arms", "scientific_gates"}
+    required = {"schema", "dataset", "projection", "original", "aerp4", "run", "arms", "scorer_contract", "scientific_gates"}
     if set(manifest) != required or manifest["schema"] != SCHEMA:
         raise ValueError("AERP5 v2 manifest schema is malformed")
     if manifest["run"].get("repeats_by_arm") != REPEATS_BY_ARM or manifest["run"].get("top_k") != TOP_K:
         raise ValueError("AERP5 v2 repeat/TopK contract drifted")
     if manifest["run"].get("rss_cap_bytes") != RSS_CAP_BYTES:
         raise ValueError("AERP5 v2 RSS contract drifted")
+    projection = manifest.get("projection")
+    if not isinstance(projection, Mapping) or set(projection) != {
+        "path", "bytes", "file_sha256", "content_sha256", "schema", "conversation_count", "item_count"
+    } or projection.get("schema") != PROJECTION_SCHEMA or projection.get("conversation_count") != 10 or projection.get("item_count") != 1982:
+        raise ValueError("AERP5 v2 canonical label-free projection pin is malformed")
+    if not isinstance(projection.get("path"), str) or not isinstance(projection.get("bytes"), int) or projection["bytes"] <= 0:
+        raise ValueError("AERP5 v2 canonical label-free projection path/bytes are malformed")
+    _token(projection.get("file_sha256"), "canonical label-free projection file digest")
+    _token(projection.get("content_sha256"), "canonical label-free projection content digest")
+    scorer_contract = manifest.get("scorer_contract")
+    if not isinstance(scorer_contract, Mapping) or set(scorer_contract) != {"receipt", "receipt_sha256"}:
+        raise ValueError("AERP5 v2 canonical scorer contract is malformed")
+    if not isinstance(scorer_contract["receipt"], Mapping):
+        raise ValueError("AERP5 v2 canonical scorer contract receipt is malformed")
+    _token(scorer_contract["receipt_sha256"], "canonical scorer contract receipt digest")
+    if canonical_sha256(scorer_contract["receipt"]) != scorer_contract["receipt_sha256"]:
+        raise ValueError("AERP5 v2 canonical scorer contract receipt digest drifted")
     if set(manifest["arms"]) != set(ALL_ARMS) or manifest["arms"].get(ARM_P5, {}).get("primary") is not True:
         raise ValueError("AERP5 v2 arms contract is malformed")
     if manifest.get("scientific_gates") != EXPECTED_SCIENTIFIC_GATES:
@@ -181,26 +214,20 @@ def _pinned_value(value: PinnedJson | Mapping[str, Any]) -> tuple[dict[str, Any]
 
 
 def validate_aerp4_membership(
-    *, study: PinnedJson | Mapping[str, Any], custody: PinnedJson | Mapping[str, Any], train_freeze: PinnedJson | Mapping[str, Any], dev_freeze: PinnedJson | Mapping[str, Any], manifest: Mapping[str, Any]
+    *, train_freeze: PinnedJson | Mapping[str, Any], dev_freeze: PinnedJson | Mapping[str, Any], manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Validate exact AERP4 1,982 membership without loading labels."""
+    """Validate exact AERP4 membership using only label-free ranking freezes."""
     pins = manifest["aerp4"]
-    study, study_sha = _pinned_value(study); custody, custody_sha = _pinned_value(custody)
     train_freeze, train_sha = _pinned_value(train_freeze); dev_freeze, dev_sha = _pinned_value(dev_freeze)
-    if study_sha != pins["study_sha256"]:
-        raise ValueError("AERP4 study digest mismatch")
-    if custody_sha != pins["custody_bundle_sha256"]:
-        raise ValueError("AERP4 custody digest mismatch")
     if train_sha != pins["train_ranking_freeze_sha256"]:
         raise ValueError("AERP4 train ranking freeze digest mismatch")
     if dev_sha != pins["dev_ranking_freeze_sha256"]:
         raise ValueError("AERP4 dev ranking freeze digest mismatch")
-    if custody.get("study_sha256") != pins["study_sha256"]:
-        raise ValueError("AERP4 custody does not bind study")
-    exclusion = custody.get("label_custody", {}).get("exclusion_receipt", {})
-    excluded = exclusion.get("excluded_item_tokens")
-    if not isinstance(excluded, list) or sorted(excluded) != sorted(pins["excluded_item_tokens"]):
-        raise ValueError("AERP4 four-exclusion receipt mismatch")
+    if train_freeze.get("study_sha256") != pins["study_sha256"] or dev_freeze.get("study_sha256") != pins["study_sha256"]:
+        raise ValueError("AERP4 ranking freeze does not bind the canonical study")
+    excluded = pins.get("excluded_item_tokens")
+    if not isinstance(excluded, list) or any(_token(token, "AERP4 exclusion token") != token for token in excluded):
+        raise ValueError("AERP4 manifest exclusion receipt is malformed")
     if len(excluded) != 4 or len(set(excluded)) != 4:
         raise ValueError("AERP4 exclusion count must equal four")
     train = _freeze_items(train_freeze, "train")
@@ -209,6 +236,113 @@ def validate_aerp4_membership(
     if len(tokens) != 1982 or len(set(tokens)) != 1982 or set(tokens) & set(excluded):
         raise ValueError("AERP4 frozen membership is not exactly 1,982 allowed items")
     return {"item_tokens": tuple(sorted(tokens)), "excluded_item_tokens": tuple(sorted(excluded)), "count": len(tokens)}
+
+
+def _fixed_p5_semantics() -> dict[str, Any]:
+    """The static P5 policy contract shared by the historical lineage and v2."""
+    return {
+        "schema": FixedP5Policy.schema,
+        "policy": FixedP5Policy.policy,
+        "p5_weights": dict(FixedP5Policy._config(60)["p5_weights"]),
+        "ordinary_sum_view_order": list(SIX_VIEW_WEIGHTS),
+        "rrf_k": 60,
+        "tie_break": "descending_rrf_then_lexicographic_ranking_key",
+    }
+
+
+def expected_minilm_encoder_identity(model_sha256: str) -> str:
+    _token(model_sha256, "MiniLM model digest")
+    return f"chromadb-native-minilm:{model_sha256}"
+
+
+def _aerp4_query_input_digests(frozen_rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    for row in frozen_rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("AERP4 lineage row is malformed")
+        token = row.get("item_token")
+        _token(token, "AERP4 lineage item token")
+        if token in result:
+            raise ValueError("AERP4 lineage has duplicate item tokens")
+        result[token] = {
+            "query_sha256": _token(row.get("query_sha256"), "AERP4 query digest"),
+            "input_sha256": _token(row.get("input_sha256"), "AERP4 input digest"),
+        }
+    if len(result) != 1982:
+        raise ValueError("AERP4 lineage must contain exactly 1,982 query/input digests")
+    return result
+
+
+def _current_p5_query_input_digests(freeze: Mapping[str, Any], *, expected_model_sha256: str) -> dict[str, dict[str, str]]:
+    expected_encoder = expected_minilm_encoder_identity(expected_model_sha256)
+    trace_items = freeze.get("trace_receipt", {}).get("items")
+    if not isinstance(trace_items, Mapping) or len(trace_items) != 1982:
+        raise ValueError("current P5 trace items are unavailable for checkpointing")
+    result: dict[str, dict[str, str]] = {}
+    for token, receipt in trace_items.items():
+        _token(token, "current P5 item token")
+        if not isinstance(receipt, Mapping):
+            raise ValueError("current P5 trace item is malformed")
+        retrieval = receipt.get("stable_trace", {}).get("retrieval_ranking")
+        if not isinstance(retrieval, Mapping) or retrieval.get("encoder_identity") != expected_encoder:
+            raise RuntimeError("current P5 encoder identity is not the pinned native MiniLM identity")
+        result[token] = {
+            "query_sha256": _token(retrieval.get("query_sha256"), "current P5 query digest"),
+            "input_sha256": _token(retrieval.get("input_sha256"), "current P5 input digest"),
+        }
+    return result
+
+
+def validate_aerp4_lineage(
+    *, frozen_rows: Iterable[Mapping[str, Any]], current_p5: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Bind AERP4's historical inputs/semantics without comparing BGE and MiniLM rankings."""
+    pins = manifest.get("aerp4")
+    if not isinstance(pins, Mapping):
+        raise ValueError("AERP4 lineage pins are malformed")
+    if pins.get("historical_encoder") != AERP4_HISTORICAL_BGE:
+        raise ValueError("AERP4 historical BGE identity/pins differ from the frozen lineage")
+    if pins.get("fixed_p5_semantics") != _fixed_p5_semantics():
+        raise ValueError("AERP4 fixed P5 semantics differ from the frozen lineage")
+    historical = _aerp4_query_input_digests(frozen_rows)
+    current = _current_p5_query_input_digests(
+        current_p5, expected_model_sha256=manifest["run"]["model"]["file_tree_sha256"]
+    )
+    if set(historical) != set(current):
+        raise RuntimeError("current P5 membership differs from the AERP4 lineage")
+    for token in historical:
+        if historical[token] != current[token]:
+            raise RuntimeError(f"current P5 query/input differs from AERP4 lineage: {token}")
+    return {
+        "schema": "aerp5-aerp4-bge-lineage-v1",
+        "historical_encoder": dict(AERP4_HISTORICAL_BGE),
+        "fixed_p5_semantics": _fixed_p5_semantics(),
+        "membership_sha256": canonical_sha256(sorted(historical)),
+        "query_input_sha256": canonical_sha256(historical),
+    }
+
+
+def validate_aerp4_lineage_anchor(receipt: Any, *, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare a candidate lineage receipt to the immutable manifest anchor."""
+    if not isinstance(receipt, Mapping):
+        raise ValueError("AERP4 lineage receipt is malformed")
+    pins = manifest.get("aerp4")
+    anchor = pins.get("lineage_anchor") if isinstance(pins, Mapping) else None
+    if not isinstance(anchor, Mapping) or set(anchor) != {
+        "schema", "membership_sha256", "query_input_sha256", "receipt_sha256"
+    }:
+        raise ValueError("canonical AERP4 lineage anchor is malformed")
+    expected = {
+        "schema": "aerp5-aerp4-bge-lineage-v1",
+        "membership_sha256": receipt.get("membership_sha256"),
+        "query_input_sha256": receipt.get("query_input_sha256"),
+        "receipt_sha256": canonical_sha256(dict(receipt)),
+    }
+    for name in ("membership_sha256", "query_input_sha256", "receipt_sha256"):
+        _token(anchor.get(name), f"canonical AERP4 lineage anchor {name}")
+    if expected != dict(anchor):
+        raise RuntimeError("AERP4 lineage receipt differs from the canonical manifest anchor")
+    return dict(receipt)
 
 
 def _reject_projection_label_or_scorer_fields(value: Any) -> None:
@@ -316,7 +450,7 @@ def project_public_items(
 
 
 def build_public_projection(*, dataset: Path, original_root: Path, allowed_item_tokens: Iterable[str]) -> dict[str, Any]:
-    """Build the sole worker input from official query/session bytes, no scorer."""
+    """Offline projection producer only; formal coordinators never call it."""
     _palace, _searcher, protocol, _state = v1.load_original_product(original_root)
     loaded = protocol.load_official_locomo10(dataset)
     allowed = set(allowed_item_tokens); result = []; ordinal = 0
@@ -330,6 +464,36 @@ def build_public_projection(*, dataset: Path, original_root: Path, allowed_item_
     if ordinal != 1986:
         raise ValueError("official LoCoMo source denominator drifted")
     return project_public_items(public_items=result, allowed_item_tokens=allowed)
+
+
+def load_pinned_projection(*, projection_path: Path, manifest: Mapping[str, Any]) -> tuple[dict[str, Any], str, str]:
+    """Load the one immutable label-free worker input permitted to formal runs."""
+    pin = manifest.get("projection")
+    if not isinstance(pin, Mapping):
+        raise ValueError("canonical label-free projection pin is missing")
+    expected_path = Path(str(pin.get("path"))).resolve()
+    actual_path = projection_path.resolve()
+    if actual_path != expected_path:
+        raise ValueError("formal coordinator requires the canonical label-free projection path")
+    if not actual_path.is_file() or actual_path.stat().st_size != pin.get("bytes"):
+        raise RuntimeError("canonical label-free projection bytes drifted")
+    file_sha256 = sha256_file(actual_path)
+    if file_sha256 != pin.get("file_sha256"):
+        raise RuntimeError("canonical label-free projection file digest drifted")
+    try:
+        projection = _json(actual_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("canonical label-free projection is not valid JSON") from exc
+    items, conversations = _validate_public_projection(projection)
+    content_sha256 = canonical_sha256(projection)
+    if (
+        content_sha256 != pin.get("content_sha256")
+        or projection.get("schema") != pin.get("schema")
+        or len(items) != pin.get("item_count")
+        or len(conversations) != pin.get("conversation_count")
+    ):
+        raise RuntimeError("canonical label-free projection content/schema drifted")
+    return projection, file_sha256, content_sha256
 
 
 def _evidence_tokens(dialog_ids: Sequence[str]) -> list[str]:
@@ -907,15 +1071,104 @@ class _NullContext:
     def __exit__(self, *_: Any) -> None: return None
 
 
-def validate_p5_against_aerp4(
-    produced: Mapping[str, Sequence[str]], frozen_rows: Iterable[Mapping[str, Any]]
+def build_minilm_p5_checkpoint(
+    repeats: Sequence[Mapping[str, Any]], *, expected_model_sha256: str, expected_item_tokens: Iterable[str]
+) -> dict[str, Any]:
+    """Freeze the two exact label-free MiniLM P5 repeats before custody may score."""
+    validate_repeat_identity(ARM_P5, repeats)
+    if len(repeats) != CURRENT_REPEATS:
+        raise RuntimeError("MiniLM P5 checkpoint requires exactly two repeats")
+    expected_tokens = tuple(sorted(expected_item_tokens))
+    first = repeats[0]
+    if set(first.get("items", {})) != set(expected_tokens):
+        raise RuntimeError("MiniLM P5 checkpoint membership is not the projected 1,982 items")
+    query_input = _current_p5_query_input_digests(first, expected_model_sha256=expected_model_sha256)
+    if set(query_input) != set(expected_tokens):
+        raise RuntimeError("MiniLM P5 checkpoint query/input membership drifted")
+    fields = {
+        "input_projection_sha256": first.get("input_projection_sha256"),
+        "input_projection_content_sha256": first.get("input_projection_content_sha256"),
+        "ranking_projection_sha256": first.get("projection_sha256"),
+        "dialog_ranking_sha256": first.get("dialog_ranking_sha256"),
+        "evidence_ranking_sha256": first.get("evidence_ranking_sha256"),
+        "trace_sha256": first.get("trace_receipt", {}).get("trace_sha256"),
+        "policy_receipts_sha256": first.get("policy_receipts_sha256"),
+    }
+    for name, value in fields.items():
+        _token(value, f"MiniLM P5 checkpoint {name}")
+    if first.get("model_file_tree_sha256") != expected_model_sha256:
+        raise RuntimeError("MiniLM P5 checkpoint model drifted")
+    expected_encoder = expected_minilm_encoder_identity(expected_model_sha256)
+    if any(_current_p5_query_input_digests(repeat, expected_model_sha256=expected_model_sha256) != query_input for repeat in repeats[1:]):
+        raise RuntimeError("MiniLM P5 checkpoint query/input repeat drift")
+    return {
+        "schema": MINILM_P5_CHECKPOINT_SCHEMA,
+        "arm": ARM_P5,
+        "repeat_count": CURRENT_REPEATS,
+        "encoder_identity": expected_encoder,
+        "model_file_tree_sha256": expected_model_sha256,
+        "membership_sha256": canonical_sha256(list(expected_tokens)),
+        "query_input_sha256": canonical_sha256(query_input),
+        "fixed_p5_semantics_sha256": canonical_sha256(_fixed_p5_semantics()),
+        **fields,
+    }
+
+
+def validate_minilm_p5_checkpoint(
+    checkpoint: Any, *, expected_checkpoint_sha256: Any, repeats: Sequence[Mapping[str, Any]],
+    expected_model_sha256: str, expected_item_tokens: Iterable[str],
+) -> dict[str, Any]:
+    """Fail closed if custody's declared MiniLM checkpoint differs from frozen workers."""
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("custodian MiniLM P5 checkpoint is missing")
+    rebuilt = build_minilm_p5_checkpoint(
+        repeats, expected_model_sha256=expected_model_sha256, expected_item_tokens=expected_item_tokens
+    )
+    if dict(checkpoint) != rebuilt:
+        raise RuntimeError("custodian MiniLM P5 checkpoint differs from frozen repeats")
+    if expected_checkpoint_sha256 != canonical_sha256(rebuilt):
+        raise RuntimeError("custodian MiniLM P5 checkpoint digest drifted")
+    return rebuilt
+
+
+def validate_aerp4_minilm_checkpoint_binding(
+    aerp4_lineage: Mapping[str, Any], minilm_p5_checkpoint: Mapping[str, Any]
 ) -> None:
-    expected = {str(row["item_token"]): list(row["p5_top10"]) for row in frozen_rows}
-    if set(produced) != set(expected):
-        raise RuntimeError("current P5 production output membership differs from AERP4 freeze")
-    for token, ranking in produced.items():
-        if list(ranking) != expected[token]:
-            raise RuntimeError(f"current P5 Top-10 differs from frozen AERP4 P5 row: {token}")
+    """Bind the historical lineage and live MiniLM checkpoint before custody.
+
+    The two receipts are independently rebuilt: AERP4 proves historical BGE
+    provenance while the checkpoint proves the two native-MiniLM executions.
+    Neither may substitute for the other.  Their shared item/query-input
+    identity, and the fixed-P5 semantic digest carried by the checkpoint, are
+    therefore checked explicitly at the label-custody boundary.
+    """
+    for field in ("membership_sha256", "query_input_sha256"):
+        lineage_value = aerp4_lineage.get(field)
+        checkpoint_value = minilm_p5_checkpoint.get(field)
+        _token(lineage_value, f"AERP4 lineage {field}")
+        _token(checkpoint_value, f"MiniLM P5 checkpoint {field}")
+        if lineage_value != checkpoint_value:
+            raise RuntimeError(f"AERP4 lineage and MiniLM P5 checkpoint {field} differ")
+    if minilm_p5_checkpoint.get("fixed_p5_semantics_sha256") != canonical_sha256(_fixed_p5_semantics()):
+        raise RuntimeError("MiniLM P5 checkpoint fixed-P5 semantics drifted")
+
+
+def validate_aerp4_lineage_receipt(
+    receipt: Any, *, manifest: Mapping[str, Any], expected_item_tokens: Iterable[str]
+) -> dict[str, Any]:
+    """Require the coordinator's BGE lineage receipt before the custodian opens labels."""
+    if not isinstance(receipt, Mapping):
+        raise ValueError("custodian AERP4 lineage receipt is missing")
+    expected_membership = canonical_sha256(sorted(expected_item_tokens))
+    if (
+        receipt.get("schema") != "aerp5-aerp4-bge-lineage-v1"
+        or receipt.get("historical_encoder") != AERP4_HISTORICAL_BGE
+        or receipt.get("fixed_p5_semantics") != _fixed_p5_semantics()
+        or receipt.get("membership_sha256") != expected_membership
+    ):
+        raise RuntimeError("custodian AERP4 BGE lineage receipt is malformed")
+    _token(receipt.get("query_input_sha256"), "AERP4 lineage query/input digest")
+    return validate_aerp4_lineage_anchor(receipt, manifest=manifest)
 
 
 def _expected_policy_receipt(arm: str) -> dict[str, Any]:
@@ -1049,6 +1302,9 @@ def parse_worker_freeze(
                 or stable_trace.get("selected_dialog_order_sha256") != canonical_sha256(dialogs[token])
             ):
                 raise ValueError("current worker stable trace receipt is malformed")
+            retrieval = stable_trace.get("retrieval_ranking", {})
+            if not isinstance(retrieval, Mapping) or retrieval.get("encoder_identity") != expected_minilm_encoder_identity(model_sha256):
+                raise ValueError("current worker encoder identity is not the pinned native MiniLM identity")
             _token(stable_trace.get("authorized_dialog_universe_sha256"), "authorized dialog universe digest")
             selected_evidence = receipt.get("selected_evidence_top10")
             selected_keys = receipt.get("selected_ranking_key_sha256")
@@ -1188,23 +1444,25 @@ class RssMonitor:
         if self.error: raise RuntimeError(self.error)
 
 
-def coordinator_run(*, dataset: Path, original_root: Path, model_dir: Path, study: PinnedJson, custody: PinnedJson, train: PinnedJson, dev: PinnedJson, work: Path, output: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
-    """Create projection, launch five original and two-per-current disposable workers."""
+def coordinator_run(*, projection_path: Path, dataset: Path, original_root: Path, model_dir: Path, train: PinnedJson, dev: PinnedJson, work: Path, output: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Launch label-free workers from the immutable projection, then hand off scoring."""
     canonical_manifest = load_manifest()
     if dict(manifest) != canonical_manifest:
         raise ValueError("coordinator requires the canonical AERP5 v2 manifest")
     v1.require_external_output(work, ROOT, original_root); v1.require_external_output(output, ROOT, original_root)
     before_current, before_original = v1.git_state(ROOT), v1.require_clean_pinned_original(original_root)
-    dataset_before, model_before = sha256_file(dataset), v1.file_tree_receipt(model_dir)
-    membership = validate_aerp4_membership(study=study, custody=custody, train_freeze=train, dev_freeze=dev, manifest=manifest)
-    receipt = environment_receipt(dataset=dataset, model_dir=model_dir, original_root=original_root); validate_environment_receipt(receipt, manifest)
+    model_before = v1.file_tree_receipt(model_dir)
+    membership = validate_aerp4_membership(train_freeze=train, dev_freeze=dev, manifest=manifest)
+    receipt = environment_receipt(model_dir=model_dir, original_root=original_root); validate_environment_receipt(receipt, manifest)
     if work.exists() or output.exists(): raise FileExistsError("AERP5 coordinator refuses to clobber work/output")
-    work.mkdir(parents=True); projection = build_public_projection(dataset=dataset, original_root=original_root, allowed_item_tokens=membership["item_tokens"])
-    projection_path = work / "projection.json"; projection_path.write_bytes(_canonical(projection))
-    projection_file_sha256 = sha256_file(projection_path)
-    projection_content_sha256 = canonical_sha256(projection)
+    projection, projection_file_sha256, projection_content_sha256 = load_pinned_projection(
+        projection_path=projection_path, manifest=manifest
+    )
+    work.mkdir(parents=True)
     projection_tokens, _projection_conversations = _validate_public_projection(projection)
     projection_tokens = tuple(row["item_token"] for row in projection_tokens)
+    if tuple(sorted(projection_tokens)) != membership["item_tokens"]:
+        raise RuntimeError("canonical label-free projection membership differs from AERP4 lineage")
     identity_namespace = original_identity_namespace(_projection_conversations)
     coordinator_index_receipts: list[dict[str, Any]] = []
     outputs: dict[str, list[dict[str, Any]]] = {arm: [] for arm in ALL_ARMS}
@@ -1239,27 +1497,36 @@ def coordinator_run(*, dataset: Path, original_root: Path, model_dir: Path, stud
         for arm, repeats in outputs.items():
             validate_repeat_identity(arm, repeats)
         frozen_rows = [*_freeze_items(train.load(), "train"), *_freeze_items(dev.load(), "dev")]
-        validate_p5_against_aerp4({key: row["evidence_top10"] for key, row in outputs[ARM_P5][0]["items"].items()}, frozen_rows)
+        aerp4_lineage = validate_aerp4_lineage(
+            frozen_rows=frozen_rows, current_p5=outputs[ARM_P5][0], manifest=manifest
+        )
+        validate_aerp4_lineage_anchor(aerp4_lineage, manifest=manifest)
+        minilm_p5_checkpoint = build_minilm_p5_checkpoint(
+            outputs[ARM_P5], expected_model_sha256=manifest["run"]["model"]["file_tree_sha256"],
+            expected_item_tokens=projection_tokens,
+        )
+        validate_aerp4_minilm_checkpoint_binding(aerp4_lineage, minilm_p5_checkpoint)
+        minilm_p5_checkpoint_sha256 = canonical_sha256(minilm_p5_checkpoint)
         freeze_paths = {arm: [str(work / f"{arm}-{repeat}.json") for repeat in range(REPEATS_BY_ARM[arm])] for arm in ALL_ARMS}; freeze_hashes = {arm: [sha256_file(Path(path)) for path in paths] for arm, paths in freeze_paths.items()}
-        scorer_receipt = scorer_implementation_receipt(original_root)
-        score_path = work / "custodian-score.json"; score_config = {"projection": str(projection_path), "expected_projection_sha256": projection_file_sha256, "expected_projection_content_sha256": projection_content_sha256, "expected_model_sha256": manifest["run"]["model"]["file_tree_sha256"], "freezes": freeze_paths, "expected_freeze_sha256": freeze_hashes, "expected_original_index_receipts": coordinator_index_receipts, "expected_original_index_receipts_sha256": canonical_sha256(coordinator_index_receipts), "dataset": str(dataset), "expected_dataset_sha256": manifest["dataset"]["sha256"], "scorer_implementation_receipt": scorer_receipt, "original_root": str(original_root), "scientific_gates": manifest["scientific_gates"], "expected_scientific_gates_sha256": canonical_sha256(manifest["scientific_gates"]), "manifest_sha256": canonical_sha256(manifest), "output": str(score_path)}
+        scorer_receipt = validate_scorer_contract(manifest=manifest, original_root=original_root)
+        score_path = work / "custodian-score.json"; score_config = {"projection": str(projection_path), "expected_projection_sha256": projection_file_sha256, "expected_projection_content_sha256": projection_content_sha256, "expected_model_sha256": manifest["run"]["model"]["file_tree_sha256"], "freezes": freeze_paths, "work": str(work.resolve()), "expected_freeze_sha256": freeze_hashes, "expected_original_index_receipts": coordinator_index_receipts, "expected_original_index_receipts_sha256": canonical_sha256(coordinator_index_receipts), "aerp4_lineage": aerp4_lineage, "minilm_p5_checkpoint": minilm_p5_checkpoint, "expected_minilm_p5_checkpoint_sha256": minilm_p5_checkpoint_sha256, "dataset": str(dataset), "expected_dataset_sha256": manifest["dataset"]["sha256"], "scorer_implementation_receipt": scorer_receipt, "original_root": str(original_root), "scientific_gates": manifest["scientific_gates"], "expected_scientific_gates_sha256": canonical_sha256(manifest["scientific_gates"]), "manifest_sha256": canonical_sha256(manifest), "output": str(score_path)}
         score_config_path = work / "custodian-config.json"; score_config_path.write_bytes(_canonical(score_config))
         subprocess.run([sys.executable, "-m", "benchmarks.aerp5_product_paired_locomo_v2", "--score-config", str(score_config_path)], cwd=ROOT, check=True)
         after_current, after_original = v1.git_state(ROOT), v1.git_state(original_root)
         if after_current != before_current or after_original != before_original: raise RuntimeError("measured repository state drifted during formal run")
-        if sha256_file(dataset) != dataset_before or v1.file_tree_receipt(model_dir) != model_before: raise RuntimeError("dataset/model file tree drifted during formal run")
+        if v1.file_tree_receipt(model_dir) != model_before: raise RuntimeError("model file tree drifted during formal run")
         score = _json(score_path)
-        expected_score_receipts = {"dataset_sha256": manifest["dataset"]["sha256"], "projection_sha256": projection_file_sha256, "projection_content_sha256": projection_content_sha256, "freeze_sha256": freeze_hashes, "original_index_receipts_sha256": canonical_sha256(coordinator_index_receipts), "scientific_gates_sha256": canonical_sha256(manifest["scientific_gates"]), "manifest_sha256": canonical_sha256(manifest)}
+        expected_score_receipts = {"dataset_sha256": manifest["dataset"]["sha256"], "projection_sha256": projection_file_sha256, "projection_content_sha256": projection_content_sha256, "freeze_sha256": freeze_hashes, "original_index_receipts_sha256": canonical_sha256(coordinator_index_receipts), "aerp4_lineage_sha256": canonical_sha256(aerp4_lineage), "minilm_p5_checkpoint_sha256": minilm_p5_checkpoint_sha256, "scientific_gates_sha256": canonical_sha256(manifest["scientific_gates"]), "manifest_sha256": canonical_sha256(manifest)}
         if score.get("input_receipts") != expected_score_receipts: raise RuntimeError("custodian score receipts do not match pre-score inputs")
         if score.get("scorer_implementation_receipt") != scorer_receipt: raise RuntimeError("custodian scorer implementation receipt drifted")
-        report = {"engineering_gates_passed": True, "environment": receipt, "repository_state_before": {"current": before_current, "original": before_original}, "repository_state_after": {"current": after_current, "original": after_original}, "projection_sha256": sha256_file(projection_path), "freezes": outputs, "coordinator_original_index_receipts": coordinator_index_receipts, "score": score, "freeze_file_sha256": freeze_hashes}
+        report = {"engineering_gates_passed": True, "environment": receipt, "repository_state_before": {"current": before_current, "original": before_original}, "repository_state_after": {"current": after_current, "original": after_original}, "projection_sha256": projection_file_sha256, "aerp4_lineage": aerp4_lineage, "minilm_p5_checkpoint": minilm_p5_checkpoint, "freezes": outputs, "coordinator_original_index_receipts": coordinator_index_receipts, "score": score, "freeze_file_sha256": freeze_hashes}
         publish_report(output=output, manifest=manifest, report=report); return report
     except BaseException:
         # No partial formal report is published; work is retained for diagnosis.
         raise
 
 
-def environment_receipt(*, dataset: Path, model_dir: Path, original_root: Path) -> dict[str, Any]:
+def environment_receipt(*, model_dir: Path, original_root: Path) -> dict[str, Any]:
     package_names = ("chromadb", "onnxruntime", "psutil", "mempalace-rpg")
     packages = {}
     for name in package_names:
@@ -1271,13 +1538,11 @@ def environment_receipt(*, dataset: Path, model_dir: Path, original_root: Path) 
     try:
         import numpy; numpy_version = numpy.__version__
     except ImportError: numpy_version = "not-installed"
-    return {"python": sys.version, "executable": sys.executable, "platform": platform.platform(), "hardware": hardware, "packages": packages | {"numpy": numpy_version, "sqlite": sqlite3.sqlite_version}, "dataset_sha256": sha256_file(dataset), "model": v1.file_tree_receipt(model_dir), "original": v1.git_state(original_root), "latest": v1.git_state(ROOT), "lockfiles": {path.name: sha256_file(path) for path in sorted(ROOT.glob("*lock*")) if path.is_file()}}
+    return {"python": sys.version, "executable": sys.executable, "platform": platform.platform(), "hardware": hardware, "packages": packages | {"numpy": numpy_version, "sqlite": sqlite3.sqlite_version}, "model": v1.file_tree_receipt(model_dir), "original": v1.git_state(original_root), "latest": v1.git_state(ROOT), "lockfiles": {path.name: sha256_file(path) for path in sorted(ROOT.glob("*lock*")) if path.is_file()}}
 
 
 def validate_environment_receipt(receipt: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
-    """Reject unpinned corpus/model/provider/repository environments."""
-    if receipt.get("dataset_sha256") != manifest["dataset"]["sha256"]:
-        raise ValueError("official LoCoMo dataset digest mismatch")
+    """Reject unpinned model/provider/repository environments before custody."""
     model = receipt.get("model", {})
     if model.get("sha256") != manifest["run"]["model"]["file_tree_sha256"]:
         raise ValueError("MiniLM file tree digest mismatch")
@@ -1331,9 +1596,187 @@ def paired_cluster_bootstrap(rows: list[dict[str, Any]], *, current: str, origin
     }
 
 
+def _normalized_function_sha256(function: Any) -> str:
+    source = inspect.getsource(function).replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def build_scientific_decision(
+    aggregate: Mapping[str, Any], gates: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Apply the frozen, manifest-bound primary comparison decision rule."""
+    question = aggregate["paired_cluster_bootstrap"]["p5_vs_original_question"]
+    conversation = aggregate["paired_cluster_bootstrap"]["p5_vs_original_conversation"]
+    return {
+        "rule": "both P5-vs-original overall paired CI lower bounds strictly exceed frozen zero",
+        "question_ci_lower": question["lower_95"],
+        "conversation_ci_lower": conversation["lower_95"],
+        "go": (
+            question["lower_95"] > gates["p5_vs_original_question_ci_lower_strictly_gt"]
+            and conversation["lower_95"] > gates["p5_vs_original_conversation_ci_lower_strictly_gt"]
+        ),
+    }
+
+
 def scorer_implementation_receipt(original_root: Path) -> dict[str, Any]:
+    """Independent semantic anchor for every function that consumes score labels.
+
+    This deliberately does not hash the complete runner: that would create a
+    circular pin around unrelated orchestration code.  It hashes normalized
+    source for the scoring/aggregation/decision functions and the two external
+    scorer dependencies that can affect official metrics.
+    """
     protocol = original_root / "benchmarks" / "locomo_story_protocol.py"
-    return {"files": {"aerp5_runner": sha256_file(Path(__file__)), "aerp1_scorer": sha256_file(Path(aerp1.__file__)), "original_locomo_protocol": sha256_file(protocol)}, "current_git": v1.git_state(ROOT), "original_git": v1.git_state(original_root)}
+    return {
+        "schema": "aerp5-v2-scorer-contract-v1",
+        "runner_functions": {
+            name: _normalized_function_sha256(function)
+            for name, function in (
+                ("score_after_all_freezes", score_after_all_freezes),
+                ("summarize_scored_rows", summarize_scored_rows),
+                ("paired_cluster_bootstrap", paired_cluster_bootstrap),
+                ("original_replicate_reports", original_replicate_reports),
+                ("build_scientific_decision", build_scientific_decision),
+                ("assemble_custodian_scored_report", assemble_custodian_scored_report),
+            )
+        },
+        "dependencies": {
+            "aerp1_scorer_sha256": sha256_file(Path(aerp1.__file__)),
+            "original_locomo_story_protocol_sha256": sha256_file(protocol),
+        },
+        "contract": {
+            "schemas": {
+                "runner": SCHEMA,
+                "custodian_score": SCHEMA + "-custodian-score",
+                "minilm_checkpoint": MINILM_P5_CHECKPOINT_SCHEMA,
+            },
+            "top_k": TOP_K,
+            "repeats_by_arm": dict(REPEATS_BY_ARM),
+            "bootstrap": {"seed": 20260822, "resamples": 5000},
+            "primary_decision": "p5_vs_original_question_and_conversation_ci_lower_strictly_gt_frozen_zero",
+        },
+    }
+
+
+def validate_scorer_contract(*, manifest: Mapping[str, Any], original_root: Path) -> dict[str, Any]:
+    """Require the live label consumer to equal the independent manifest anchor."""
+    anchor = manifest.get("scorer_contract")
+    if not isinstance(anchor, Mapping) or set(anchor) != {"receipt", "receipt_sha256"}:
+        raise ValueError("canonical scorer contract anchor is malformed")
+    expected = anchor["receipt"]
+    if canonical_sha256(expected) != anchor["receipt_sha256"]:
+        raise RuntimeError("canonical scorer contract anchor digest drifted")
+    actual = scorer_implementation_receipt(original_root)
+    if actual != expected:
+        raise RuntimeError("live scorer contract differs from the canonical manifest anchor")
+    return actual
+
+
+def validate_custodian_canonical_inputs(
+    config: Mapping[str, Any], *, manifest: Mapping[str, Any]
+) -> tuple[Path, Path, Path]:
+    """Reject mutable score-config aliases before the custodian can read labels.
+
+    A score config is transport metadata, not an authority to redirect the
+    formal run.  Every public projection, official dataset, MiniLM identity,
+    and original-product root is re-bound to the canonical manifest here.  In
+    particular, a matching hash supplied beside an alternate path cannot make
+    that path authoritative.
+    """
+    projection_pin = manifest["projection"]
+    dataset_pin = manifest["dataset"]
+    canonical_projection = Path(str(projection_pin["path"])).resolve()
+    canonical_dataset = Path(str(dataset_pin["path"])).resolve()
+    canonical_original = Path(str(manifest["original"]["repo"])).resolve()
+    projection_path = Path(str(config.get("projection"))).resolve()
+    dataset_path = Path(str(config.get("dataset"))).resolve()
+    configured_original = Path(str(config.get("original_root"))).resolve()
+    if projection_path != canonical_projection:
+        raise RuntimeError("custodian projection path is not the canonical manifest artifact")
+    if config.get("expected_projection_sha256") != projection_pin["file_sha256"]:
+        raise RuntimeError("custodian projection file digest is not the canonical manifest pin")
+    if config.get("expected_projection_content_sha256") != projection_pin["content_sha256"]:
+        raise RuntimeError("custodian projection content digest is not the canonical manifest pin")
+    if dataset_path != canonical_dataset:
+        raise RuntimeError("custodian dataset path is not the canonical manifest artifact")
+    if config.get("expected_dataset_sha256") != dataset_pin["sha256"]:
+        raise RuntimeError("custodian dataset digest is not the canonical manifest pin")
+    if config.get("expected_model_sha256") != manifest["run"]["model"]["file_tree_sha256"]:
+        raise RuntimeError("custodian MiniLM model digest is not the canonical manifest pin")
+    if configured_original != canonical_original:
+        raise RuntimeError("custodian original root is not the canonical manifest repository")
+    original_state = v1.git_state(canonical_original)
+    if (
+        original_state.get("git_head") != manifest["original"]["commit"]
+        or original_state.get("git_tree") != manifest["original"]["tree"]
+        or original_state.get("git_dirty") is not False
+    ):
+        raise RuntimeError("custodian original repository is not the clean canonical manifest checkout")
+    return projection_path, dataset_path, canonical_original
+
+
+def preflight_custodian_freeze_paths(
+    config: Mapping[str, Any], *, projection_path: Path, dataset_path: Path, canonical_original_root: Path
+) -> tuple[Path, dict[str, list[Path]]]:
+    """Validate the complete dynamic freeze batch before reading any of it.
+
+    Worker output is dynamic, but it cannot choose an arbitrary source path.
+    Every freeze must be a unique, ordinary file in the coordinator's external
+    work namespace.  Metadata-only identity checks reject symlink/hard-link
+    aliases to protected static inputs before any hash, JSON parse, or label
+    access can occur.
+    """
+    raw_work = config.get("work")
+    if not isinstance(raw_work, str) or not raw_work:
+        raise ValueError("custodian requires the coordinator work namespace")
+    work = Path(raw_work).resolve()
+    v1.require_external_output(work, ROOT, canonical_original_root)
+    if not work.is_dir():
+        raise ValueError("custodian work namespace is missing")
+    raw_freezes = config.get("freezes")
+    if not isinstance(raw_freezes, Mapping) or set(raw_freezes) != set(ALL_ARMS):
+        raise ValueError("custodian input contract is malformed")
+    protected_inputs = (
+        projection_path,
+        dataset_path,
+        CANONICAL_MANIFEST_PATH.resolve(),
+        Path(__file__).resolve(),
+        Path(aerp1.__file__).resolve(),
+        (canonical_original_root / "benchmarks" / "locomo_story_protocol.py").resolve(),
+    )
+    normalized: dict[str, list[Path]] = {}
+    for arm in ALL_ARMS:
+        raw_paths = raw_freezes[arm]
+        if not isinstance(raw_paths, list) or len(raw_paths) != REPEATS_BY_ARM[arm]:
+            raise ValueError("custodian freeze repeat count is malformed")
+        paths: list[Path] = []
+        for repeat, raw_path in enumerate(raw_paths):
+            if not isinstance(raw_path, str) or not raw_path:
+                raise ValueError("custodian freeze path is malformed")
+            declared = Path(raw_path)
+            path = declared.resolve()
+            expected_name = f"{arm}-{repeat}.json"
+            if path.parent != work or path.name != expected_name:
+                raise RuntimeError("custodian freeze path is outside the coordinator work namespace")
+            if declared.is_symlink() or path.is_symlink():
+                raise RuntimeError("custodian freeze path must not be a symlink")
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError as exc:
+                raise RuntimeError("custodian freeze file is missing") from exc
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("custodian freeze path must be a regular file")
+            if metadata.st_nlink != 1:
+                raise RuntimeError("custodian freeze file must not be hard-linked")
+            for protected in protected_inputs:
+                try:
+                    if os.path.samefile(path, protected):
+                        raise RuntimeError("custodian freeze file aliases a protected static input")
+                except FileNotFoundError as exc:
+                    raise RuntimeError("custodian protected static input is missing") from exc
+            paths.append(path)
+        normalized[arm] = paths
+    return work, normalized
 
 
 def score_after_all_freezes(*, scorer: Any, freezes: Mapping[str, Sequence[Mapping[str, Any]]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1434,22 +1877,86 @@ def original_replicate_reports(rows: Sequence[Mapping[str, Any]]) -> dict[str, A
     return {"replicate_count": ORIGINAL_REPEATS, "replicates": replicates, "variability": variability}
 
 
+def assemble_custodian_scored_report(
+    *,
+    scorer: Any,
+    projection_items: Sequence[Mapping[str, Any]],
+    freezes: Mapping[str, Sequence[Mapping[str, Any]]],
+    gates: Mapping[str, Any],
+    scorer_receipt: Mapping[str, Any],
+    input_receipts: Mapping[str, Any],
+    aerp4_lineage: Mapping[str, Any],
+    minilm_p5_checkpoint: Mapping[str, Any],
+    coordinator_original_index_receipts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Pure post-label score core: join, score, aggregate, decide, and report.
+
+    All filesystem validation and label loading remain in the custodian shell.
+    This function receives only already-loaded scorer objects and frozen,
+    explicit receipts, which makes every operation that can change reported
+    quality part of the independent scorer contract.
+    """
+    item_to_token = {row["item_id"]: row["item_token"] for row in projection_items}
+    scorer_items = {
+        item_to_token[item_id]: item
+        for item_id, item in scorer.scorer_items.items()
+        if item_id in item_to_token
+    }
+    scorer_view = type("ScorerView", (), {"scorer_items": scorer_items})()
+    aggregate, rows = score_after_all_freezes(scorer=scorer_view, freezes=freezes)
+    unresolved_from_rows = sum(row["unresolved"] for row in rows)
+    unresolved_from_ledger = sum(
+        scorer.scorer_items[item_id].official_exact.unresolved_evidence_item_count
+        for item_id in item_to_token
+    )
+    if unresolved_from_rows != unresolved_from_ledger:
+        raise RuntimeError("unresolved evidence disappeared from score ledger")
+    categories = {
+        str(category): summarize_scored_rows([row for row in rows if row["category"] == category])
+        for category in sorted({row["category"] for row in rows})
+    }
+    return {
+        "schema": SCHEMA + "-custodian-score",
+        "scorer_implementation_receipt": dict(scorer_receipt),
+        "input_receipts": dict(input_receipts),
+        "aerp4_lineage": dict(aerp4_lineage),
+        "minilm_p5_checkpoint": dict(minilm_p5_checkpoint),
+        "coordinator_original_index_receipts": [dict(receipt) for receipt in coordinator_original_index_receipts],
+        "aggregate": aggregate,
+        "overall": summarize_scored_rows(rows),
+        "hard_cat1_2": summarize_scored_rows([row for row in rows if row["category"] in {1, 2}]),
+        "cat5": summarize_scored_rows([row for row in rows if row["category"] == 5]),
+        "per_category": categories,
+        "original_replicate_variability": original_replicate_reports(rows),
+        "scientific_decision": build_scientific_decision(aggregate, gates),
+        "unresolved_evidence_item_count": unresolved_from_rows,
+        "freeze_digests": dict(input_receipts["freeze_sha256"]),
+    }
+
+
 def custodian_score_run(config: Mapping[str, Any]) -> dict[str, Any]:
     """The only stage that reads official evidence labels, after all freezes."""
-    projection_path = Path(str(config["projection"])); dataset_path = Path(str(config["dataset"])); freeze_paths = config.get("freezes")
     gates = config.get("scientific_gates")
     if not isinstance(gates, Mapping) or dict(gates) != EXPECTED_SCIENTIFIC_GATES:
         raise ValueError("custodian needs the canonical frozen scientific gates")
     if canonical_sha256(gates) != config.get("expected_scientific_gates_sha256"):
         raise RuntimeError("custodian scientific gates drifted")
-    if config.get("manifest_sha256") != canonical_sha256(load_manifest()):
+    canonical_manifest = load_manifest()
+    if config.get("manifest_sha256") != canonical_sha256(canonical_manifest):
         raise RuntimeError("custodian canonical manifest receipt drifted")
-    scorer_receipt = scorer_implementation_receipt(Path(str(config["original_root"])))
+    projection_path, dataset_path, canonical_original_root = validate_custodian_canonical_inputs(
+        config, manifest=canonical_manifest
+    )
+    _work, freeze_paths = preflight_custodian_freeze_paths(
+        config, projection_path=projection_path, dataset_path=dataset_path,
+        canonical_original_root=canonical_original_root,
+    )
+    scorer_receipt = validate_scorer_contract(manifest=canonical_manifest, original_root=canonical_original_root)
     if scorer_receipt != config.get("scorer_implementation_receipt"): raise RuntimeError("scorer implementation receipt drift before scoring")
-    if sha256_file(projection_path) != config.get("expected_projection_sha256") or sha256_file(dataset_path) != config.get("expected_dataset_sha256"): raise RuntimeError("custodian input drift before scoring")
+    if sha256_file(projection_path) != config.get("expected_projection_sha256"):
+        raise RuntimeError("custodian projection drift before scoring")
     projection = json.loads(projection_path.read_text(encoding="utf-8"))
     projection_items, _projection_conversations = _validate_public_projection(projection)
-    if not isinstance(freeze_paths, Mapping) or set(freeze_paths) != set(ALL_ARMS): raise ValueError("custodian input contract is malformed")
     projection_content_sha256 = canonical_sha256(projection)
     if projection_content_sha256 != config.get("expected_projection_content_sha256"):
         raise RuntimeError("custodian projection content drift before scoring")
@@ -1467,22 +1974,46 @@ def custodian_score_run(config: Mapping[str, Any]) -> dict[str, Any]:
             raise RuntimeError("custodian frozen original index-build receipts differ from coordinator receipts")
         validate_repeat_identity(arm, repeats)
         freezes[arm] = repeats
-    # This is deliberately after complete-rerun validation.
-    _palace, _searcher, protocol, _state = v1.load_original_product(Path(str(config["original_root"])))
+    # These label-free lineage/checkpoint gates deliberately precede every
+    # original-protocol load, which is the first operation that can expose labels.
+    aerp4_lineage = validate_aerp4_lineage_receipt(
+        config.get("aerp4_lineage"), manifest=canonical_manifest,
+        expected_item_tokens=projection_tokens,
+    )
+    minilm_p5_checkpoint = validate_minilm_p5_checkpoint(
+        config.get("minilm_p5_checkpoint"),
+        expected_checkpoint_sha256=config.get("expected_minilm_p5_checkpoint_sha256"),
+        repeats=freezes[ARM_P5], expected_model_sha256=config["expected_model_sha256"],
+        expected_item_tokens=projection_tokens,
+    )
+    validate_aerp4_minilm_checkpoint_binding(aerp4_lineage, minilm_p5_checkpoint)
+    # This is deliberately after complete-rerun and label-free checkpoint validation.
+    if sha256_file(dataset_path) != config.get("expected_dataset_sha256"):
+        raise RuntimeError("custodian dataset drift before scoring")
+    input_receipts = {
+        "dataset_sha256": sha256_file(dataset_path),
+        "projection_sha256": sha256_file(projection_path),
+        "projection_content_sha256": projection_content_sha256,
+        "freeze_sha256": {arm: [sha256_file(path) for path in paths] for arm, paths in freeze_paths.items()},
+        "original_index_receipts_sha256": canonical_sha256(expected_index_receipts),
+        "aerp4_lineage_sha256": canonical_sha256(aerp4_lineage),
+        "minilm_p5_checkpoint_sha256": canonical_sha256(minilm_p5_checkpoint),
+        "scientific_gates_sha256": canonical_sha256(gates),
+        "manifest_sha256": config.get("manifest_sha256"),
+    }
+    _palace, _searcher, protocol, _state = v1.load_original_product(canonical_original_root)
     dataset = protocol.load_official_locomo10(dataset_path)
     _retrieval, scorer = protocol.prepare_hard_story_track(
         dataset, candidate_pool_size=TOP_K, require_official_counts=True
     )
-    item_to_token = {row["item_id"]: row["item_token"] for row in projection_items}
-    scorer_view = type("ScorerView", (), {"scorer_items": {item_to_token[key]: value for key, value in scorer.scorer_items.items() if key in item_to_token}})()
-    aggregate, rows = score_after_all_freezes(scorer=scorer_view, freezes=freezes)
-    if sum(row["unresolved"] for row in rows) != sum(scorer.scorer_items[key].official_exact.unresolved_evidence_item_count for key in item_to_token): raise RuntimeError("unresolved evidence disappeared from score ledger")
-    categories = {str(category): summarize_scored_rows([row for row in rows if row["category"] == category]) for category in sorted({row["category"] for row in rows})}
-    q = aggregate["paired_cluster_bootstrap"]["p5_vs_original_question"]; c = aggregate["paired_cluster_bootstrap"]["p5_vs_original_conversation"]
-    decision = {"rule": "both P5-vs-original overall paired CI lower bounds strictly exceed frozen zero", "question_ci_lower": q["lower_95"], "conversation_ci_lower": c["lower_95"], "go": q["lower_95"] > gates["p5_vs_original_question_ci_lower_strictly_gt"] and c["lower_95"] > gates["p5_vs_original_conversation_ci_lower_strictly_gt"]}
-    if scorer_implementation_receipt(Path(str(config["original_root"]))) != scorer_receipt: raise RuntimeError("scorer implementation receipt drift after scoring")
-    result = {"schema": SCHEMA + "-custodian-score", "scorer_implementation_receipt": scorer_receipt, "input_receipts": {"dataset_sha256": sha256_file(dataset_path), "projection_sha256": sha256_file(projection_path), "projection_content_sha256": projection_content_sha256, "freeze_sha256": {arm: [sha256_file(Path(path)) for path in paths] for arm, paths in freeze_paths.items()}, "original_index_receipts_sha256": canonical_sha256(expected_index_receipts), "scientific_gates_sha256": canonical_sha256(gates), "manifest_sha256": config.get("manifest_sha256")}, "coordinator_original_index_receipts": expected_index_receipts, "aggregate": aggregate, "overall": summarize_scored_rows(rows), "hard_cat1_2": summarize_scored_rows([row for row in rows if row["category"] in {1, 2}]), "cat5": summarize_scored_rows([row for row in rows if row["category"] == 5]), "per_category": categories, "original_replicate_variability": original_replicate_reports(rows), "scientific_decision": decision, "unresolved_evidence_item_count": sum(row["unresolved"] for row in rows), "freeze_digests": {arm: [sha256_file(Path(path)) for path in paths] for arm, paths in freeze_paths.items()}}
-    if sha256_file(projection_path) != config.get("expected_projection_sha256") or sha256_file(dataset_path) != config.get("expected_dataset_sha256") or any([sha256_file(Path(path)) for path in paths] != config["expected_freeze_sha256"][arm] for arm, paths in freeze_paths.items()): raise RuntimeError("custodian input drift after scoring")
+    result = assemble_custodian_scored_report(
+        scorer=scorer, projection_items=projection_items, freezes=freezes, gates=gates,
+        scorer_receipt=scorer_receipt, input_receipts=input_receipts,
+        aerp4_lineage=aerp4_lineage, minilm_p5_checkpoint=minilm_p5_checkpoint,
+        coordinator_original_index_receipts=expected_index_receipts,
+    )
+    if validate_scorer_contract(manifest=canonical_manifest, original_root=canonical_original_root) != scorer_receipt: raise RuntimeError("scorer implementation receipt drift after scoring")
+    if sha256_file(projection_path) != config.get("expected_projection_sha256") or sha256_file(dataset_path) != config.get("expected_dataset_sha256") or any([sha256_file(path) for path in paths] != config["expected_freeze_sha256"][arm] for arm, paths in freeze_paths.items()): raise RuntimeError("custodian input drift after scoring")
     _publish_nonreplace(Path(str(config["output"])), _canonical(result)); return result
 
 
@@ -1503,7 +2034,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker-config", type=Path)
     parser.add_argument("--score-config", type=Path)
-    parser.add_argument("--dataset", type=Path); parser.add_argument("--original-root", type=Path); parser.add_argument("--model-dir", type=Path); parser.add_argument("--study", type=Path); parser.add_argument("--custody", type=Path); parser.add_argument("--train-freeze", type=Path); parser.add_argument("--dev-freeze", type=Path); parser.add_argument("--work", type=Path)
+    parser.add_argument("--projection", type=Path); parser.add_argument("--dataset", type=Path); parser.add_argument("--original-root", type=Path); parser.add_argument("--model-dir", type=Path); parser.add_argument("--train-freeze", type=Path); parser.add_argument("--dev-freeze", type=Path); parser.add_argument("--work", type=Path)
     args = parser.parse_args(argv)
     if args.tau is not None or args.router is not None: raise ValueError("AERP5 v2 rejects tau/router inputs")
     load_manifest(args.manifest)
@@ -1511,9 +2042,10 @@ def main(argv: list[str] | None = None) -> int:
         worker_run(_json(args.worker_config)); return 0
     if args.score_config is not None:
         custodian_score_run(_json(args.score_config)); return 0
-    required = (args.dataset, args.original_root, args.model_dir, args.study, args.custody, args.train_freeze, args.dev_freeze, args.work, args.output)
-    if any(value is None for value in required): parser.error("coordinator requires dataset/original/model/AERP4 pins/work/output")
-    coordinator_run(dataset=args.dataset, original_root=args.original_root, model_dir=args.model_dir, study=PinnedJson.pin(args.study, load_manifest(args.manifest)["aerp4"]["study_sha256"]), custody=PinnedJson.pin(args.custody, load_manifest(args.manifest)["aerp4"]["custody_bundle_sha256"]), train=PinnedJson.pin(args.train_freeze, load_manifest(args.manifest)["aerp4"]["train_ranking_freeze_sha256"]), dev=PinnedJson.pin(args.dev_freeze, load_manifest(args.manifest)["aerp4"]["dev_ranking_freeze_sha256"]), work=args.work, output=args.output, manifest=load_manifest(args.manifest))
+    required = (args.projection, args.dataset, args.original_root, args.model_dir, args.train_freeze, args.dev_freeze, args.work, args.output)
+    if any(value is None for value in required): parser.error("coordinator requires pinned projection/dataset/original/model/ranking-freezes/work/output")
+    manifest = load_manifest(args.manifest)
+    coordinator_run(projection_path=args.projection, dataset=args.dataset, original_root=args.original_root, model_dir=args.model_dir, train=PinnedJson.pin(args.train_freeze, manifest["aerp4"]["train_ranking_freeze_sha256"]), dev=PinnedJson.pin(args.dev_freeze, manifest["aerp4"]["dev_ranking_freeze_sha256"]), work=args.work, output=args.output, manifest=manifest)
     return 0
 
 
