@@ -29,13 +29,12 @@ progress but not a paper-level result.
 ## Current status
 
 Track A is not complete.  The repository has engineering results on burned
-LoCoMo data, a frozen static-P5 primary arm, and an executable direct
-original-product comparison, but it does not yet contain a complete real-1,982
-paired-product result or untouched-dataset confirmation.  The original
-repository benchmark candidate's historical result is not
-interchangeable with the public-product result.  Track B has a protocol but no
-completed controlled story-generation experiment.  No current artifact is a
-paper-level result.
+LoCoMo data, a frozen static-P5 primary arm, and now a formal real-1,982
+public-product paired result, but it does not yet contain an untouched-dataset
+confirmation.  The original repository benchmark candidate's historical result
+is not interchangeable with the public-product result.  Track B has a protocol
+but no completed controlled story-generation experiment.  No current artifact
+is a paper-level result.
 
 The burned-data AERP-6 transition ledger is a read-only mechanism gate over the
 frozen staged LoCoMo artifact.  It records per-evidence six-view and cumulative
@@ -77,13 +76,30 @@ shell only performs label loading, postchecks, and publication.  Before any
 freeze bytes are hashed or parsed, the custodian also requires every dynamic
 freeze to be a unique non-symlink, non-hard-linked regular file named
 `{arm}-{repeat}.json` under the coordinator's external work namespace, with no
-filesystem alias to projection, dataset, manifest, or scorer inputs.  No AERP-5 v2 real-1982 product result exists yet;
-this code is an executable protocol rather than evidence of a completed
-experiment.  The runner therefore reports product-comparison completion
-separately and keeps `resource_gate_eligible=false` until mixed-visibility,
-blind-180, 30k-event, SQLite/drawer failure-injection, and frozen resource
-threshold receipts are explicitly bound.  Any result remains `public_nonblind`
-and can never supply a confirmation claim.
+filesystem alias to projection, dataset, manifest, or scorer inputs.  The
+2026-08-23 `retry7` is now the formal public-product result, bound to commit
+`c7d737ee217a71ff6a60f1c30313d8e6e1ea3c61` and tree
+`65af2cc3b97d6e790ce9e0563380bab3bbb3911b`.  Its formal artifact is
+`benchmark-artifacts/aerp5-v2-real-c7d737e-retry7.json` with SHA-256
+`afc596566a37b1cacf561bd0971c1cff44064faba1d23ed159960f1d2ebbb916`.
+The result covers 1,982 items, five original-product replicates, and two exact
+repeats for each of fixed P5 and secondary fixed six-view.  P5 versus the
+original public product has question-macro Recall@10 `0.59416156` versus
+`0.46623866`, delta `+0.12792290`, with paired 95% CI
+`[0.10722680, 0.14660648]`; the conversation-macro delta is `+0.12827231`
+with CI `[0.10771112, 0.14653054]`.  The frozen scientific decision is
+`GO=true`, with 9 unresolved evidence items.  P5's question-macro deltas by
+category are Cat. 1 `+0.06702051`, Cat. 2 `+0.12087227`, Cat. 3
+`+0.08960222`, Cat. 4 `+0.13174792`, and Cat. 5 `+0.17219731`.
+
+This remains a burned-LoCoMo, `public_nonblind` engineering result, not a
+confirmation claim.  The secondary fixed-six-view overall question-macro
+Recall@10 is `0.58868328`; it exceeds P5 in Categories 2 and 5, while Category
+1 is `0.04184089` below P5.  `resource_gate_eligible=false` remains in force:
+the blockers are mixed-visibility, blind-180, 30k-event, SQLite/drawer
+failure-injection, and frozen resource thresholds.  Track A therefore remains
+incomplete; the next untouched confirmation datasets are ConvoMem and
+MemBench.
 
 The first real execution of commit `9caacc6` failed the pre-registered 2 GiB
 RSS cap before any label scoring or formal report publication.  The observed
