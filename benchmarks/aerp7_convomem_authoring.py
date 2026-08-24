@@ -31,7 +31,7 @@ CENSUS_SOURCE_MANIFEST = {
     "inventory_sha256": "5af1c9fab4a267859342abfb03469fe8406e05b7ab04610a548791d3ea92a3ab",
 }
 CENSUS_SEMANTICS = {
-    "selection_algorithm": "aerp7-convomem-census-v1", "selection_seed": None,
+    "selection_algorithm": confirmation.CENSUS_SELECTION_ALGORITHM, "selection_seed": None,
     "persona_quota": "ALL", "per_persona_group_quota": "ALL",
     "context_rank_indices": "ALL_AVAILABLE_SORTED", "source_receipt": rank.PROTOCOL_SOURCE,
     "primary_current_arm": {"arm_id": "six_view_secondary", "config_sha256": formal._digest(rank._arm_method("six_view_secondary")), "ranker_code_sha256": formal._ranker_code_sha256()},

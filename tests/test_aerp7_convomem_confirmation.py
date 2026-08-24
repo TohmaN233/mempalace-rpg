@@ -99,6 +99,72 @@ def _rewrite_custody_ready(candidate: Path) -> None:
     ready_path.unlink(); custody._write(ready_path, ready)
 
 
+def _recompute_census_public_receipt(projection: dict[str, object]) -> None:
+    """Refresh only candidate-visible census seals for projection-only tampering tests."""
+    receipt = projection["selection_receipt"]
+    assert isinstance(receipt, dict)
+    items = projection["items"]
+    corpora = projection["corpora"]
+    assert isinstance(items, list) and isinstance(corpora, list)
+    corpora_by_id = {row["corpus_id"]: row for row in corpora}
+    contexts: dict[int, list[str]] = {}
+    for item in items:
+        contexts.setdefault(corpora_by_id[item["corpus_id"]]["declared_context_size"], []).append(item["item_id"])
+    denominator_rows = [
+        {"context_rank": rank, "declared_context_size": context, "item_count": len(sorted(ids)), "item_ids_sha256": custody.canonical_sha256(sorted(ids))}
+        for rank, (context, ids) in enumerate(sorted(contexts.items()))
+    ]
+    pairs = sorted(
+        [
+            {"selection_logical_item_id": item["selection_logical_item_id"], "selection_logical_binding_witness": item["selection_logical_binding_witness"], "selection_variant_id": item["selection_variant_id"], "item_id": item["item_id"], "corpus_id": item["corpus_id"]}
+            for item in items
+        ],
+        key=lambda row: (row["selection_logical_item_id"], row["selection_logical_binding_witness"], row["selection_variant_id"], row["item_id"], row["corpus_id"]),
+    )
+    corpus_ids = sorted(row["corpus_id"] for row in corpora)
+    query_context_corpora: dict[tuple[str, int], set[str]] = {}
+    contexts_by_logical_item: dict[str, set[int]] = {}
+    personas_by_corpus: dict[str, set[str]] = {}
+    for item in items:
+        context = corpora_by_id[item["corpus_id"]]["declared_context_size"]
+        logical_item_id = item["selection_logical_item_id"]
+        query_context_corpora.setdefault((logical_item_id, context), set()).add(item["corpus_id"])
+        contexts_by_logical_item.setdefault(logical_item_id, set()).add(context)
+        personas_by_corpus.setdefault(item["corpus_id"], set()).add(item["persona_id"])
+    receipt.update({
+        "selected_item_context_count": len(items),
+        "selected_item_ids_sha256": custody.canonical_sha256(sorted(item["item_id"] for item in items)),
+        "selected_persona_ids_sha256": custody.canonical_sha256(sorted({item["persona_id"] for item in items})),
+        "holdout_persona_set_sha256": custody.canonical_sha256(sorted({item["persona_id"] for item in items})),
+        "group_values_sha256": custody.canonical_sha256(sorted({item["selection_group_id"] for item in items})),
+        "tier_values_sha256": custody.canonical_sha256(sorted({item["selection_tier_id"] for item in items})),
+        "variant_selection_sha256": custody.canonical_sha256(sorted(item["selection_variant_id"] for item in items)),
+        "logical_variant_pairs_sha256": custody.canonical_sha256(pairs),
+        "corpus_ids_sha256": custody.canonical_sha256(corpus_ids),
+        "candidate_visible_query_count": len({item["selection_logical_item_id"] for item in items}),
+        "candidate_visible_persona_count": len({item["persona_id"] for item in items}),
+        "candidate_visible_context_count": len(denominator_rows),
+        "candidate_visible_corpus_count": len(corpus_ids),
+        "group_count": len({item["selection_group_id"] for item in items}),
+        "context_values_sha256": custody.canonical_sha256([row["declared_context_size"] for row in denominator_rows]),
+        "desired_context_values_sha256": custody.canonical_sha256([row["declared_context_size"] for row in denominator_rows]),
+        "per_context_denominators": denominator_rows,
+        "observed_crosswalk": {
+            "semantics": custody.CENSUS_CROSSWALK_SEMANTICS,
+            "multi_persona_corpus_count": sum(len(personas) > 1 for personas in personas_by_corpus.values()),
+            "sparse_query_context_count": sum(values != {row["declared_context_size"] for row in denominator_rows} for values in contexts_by_logical_item.values()),
+            "multi_case_query_context_count": sum(len(values) > 1 for values in query_context_corpora.values()),
+        },
+    })
+    receipt["denominators_sha256"] = custody.canonical_sha256({
+        "query_count": len(items), "candidate_visible_query_count": receipt["candidate_visible_query_count"],
+        "persona_count": receipt["candidate_visible_persona_count"], "context_count": receipt["candidate_visible_context_count"],
+        "corpus_count": receipt["candidate_visible_corpus_count"], "group_count": receipt["group_count"],
+        "logical_variant_pairs_sha256": receipt["logical_variant_pairs_sha256"], "corpus_ids_sha256": receipt["corpus_ids_sha256"],
+        "per_context_denominators": denominator_rows,
+    })
+
+
 def test_multicontext_projection_is_normalized_safe_and_group_selected(tmp_path: Path) -> None:
     output = _build(tmp_path, mixed=True)
     projection = custody.load_candidate_projection(output)
@@ -1277,6 +1343,118 @@ def test_census_v1_publishes_a_projection_that_validates_its_exact_denominators(
         custody.validate_candidate_projection(projection)
 
 
+def test_census_v2_receipt_binds_all_public_logical_variant_pairs_and_corpora(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path, mixed=True)
+    output = tmp_path / "census-v2-public-bindings"
+    _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    projection = custody.load_candidate_projection(output)
+    receipt = projection["selection_receipt"]
+    pair_rows = sorted(
+        [
+            {
+                "selection_logical_item_id": item["selection_logical_item_id"],
+                "selection_logical_binding_witness": item["selection_logical_binding_witness"],
+                "selection_variant_id": item["selection_variant_id"],
+            "item_id": item["item_id"],
+            "corpus_id": item["corpus_id"],
+            }
+            for item in projection["items"]
+        ],
+        key=lambda row: (row["selection_logical_item_id"], row["selection_logical_binding_witness"], row["selection_variant_id"], row["item_id"], row["corpus_id"]),
+    )
+    assert receipt["candidate_visible_corpus_count"] == len(projection["corpora"])
+    assert receipt["corpus_ids_sha256"] == custody.canonical_sha256(sorted(corpus["corpus_id"] for corpus in projection["corpora"]))
+    assert receipt["logical_variant_pairs_sha256"] == custody.canonical_sha256(pair_rows)
+
+
+def test_census_v2_projection_only_rejects_resealed_pair_logical_variant_and_corpus_drift(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path, mixed=True)
+    output = tmp_path / "census-v2-negative"
+    _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    original = custody.load_candidate_projection(output)
+
+    duplicate_pair = json.loads(json.dumps(original))
+    duplicate = dict(duplicate_pair["items"][0])
+    duplicate["item_id"] = "f" * 64
+    duplicate_pair["items"].append(duplicate)
+    _recompute_census_public_receipt(duplicate_pair)
+    with pytest.raises(custody.CustodyError, match="projection_census_logical_variant_duplicate"):
+        custody.validate_candidate_projection(duplicate_pair)
+
+    logical_split = json.loads(json.dumps(original))
+    logical_split["items"][0]["query_text"] = "independently-resealed-query"
+    _recompute_census_public_receipt(logical_split)
+    with pytest.raises(custody.CustodyError, match="projection_census_logical_item_binding_invalid"):
+        custody.validate_candidate_projection(logical_split)
+
+    logical_merge = json.loads(json.dumps(original))
+    logical_merge["items"][0]["selection_logical_item_id"] = logical_merge["items"][-1]["selection_logical_item_id"]
+    logical_merge["items"][0]["selection_logical_binding_witness"] = logical_merge["items"][-1]["selection_logical_binding_witness"]
+    _recompute_census_public_receipt(logical_merge)
+    with pytest.raises(custody.CustodyError, match="projection_census_logical_item_binding_invalid"):
+        custody.validate_candidate_projection(logical_merge)
+
+    equal_binding_merge = json.loads(json.dumps(original))
+    by_logical: dict[str, list[dict[str, object]]] = {}
+    for item in equal_binding_merge["items"]:
+        by_logical.setdefault(item["selection_logical_item_id"], []).append(item)
+    first_logical, first_rows = next(iter(by_logical.items()))
+    second_logical, second_rows = next(
+        (logical_item_id, rows) for logical_item_id, rows in by_logical.items()
+        if logical_item_id != first_logical
+        and {row["selection_variant_id"] for row in rows}.isdisjoint({row["selection_variant_id"] for row in first_rows})
+    )
+    assert first_rows[0]["selection_logical_binding_witness"] != second_rows[0]["selection_logical_binding_witness"]
+    public_binding = {key: first_rows[0][key] for key in ("persona_id", "query_text", "selection_group_id", "selection_tier_id")}
+    for row in second_rows:
+        row.update(public_binding)
+        row["selection_logical_item_id"] = first_logical
+    _recompute_census_public_receipt(equal_binding_merge)
+    with pytest.raises(custody.CustodyError, match="projection_census_logical_item_witness_binding_invalid"):
+        custody.validate_candidate_projection(equal_binding_merge)
+
+    logical_split = json.loads(json.dumps(original))
+    repeated_logical = next(item["selection_logical_item_id"] for item in logical_split["items"] if sum(other["selection_logical_item_id"] == item["selection_logical_item_id"] for other in logical_split["items"]) > 1)
+    split_item = next(item for item in logical_split["items"] if item["selection_logical_item_id"] == repeated_logical)
+    split_item["selection_logical_item_id"] = "d" * 64
+    _recompute_census_public_receipt(logical_split)
+    with pytest.raises(custody.CustodyError, match="projection_census_binding_logical_item_split"):
+        custody.validate_candidate_projection(logical_split)
+
+    variant_corpus_drift = json.loads(json.dumps(original))
+    by_variant: dict[str, list[dict[str, object]]] = {}
+    for item in variant_corpus_drift["items"]:
+        by_variant.setdefault(item["selection_variant_id"], []).append(item)
+    shared_variant = next(rows for rows in by_variant.values() if len(rows) > 1)
+    replacement_corpus = json.loads(json.dumps(variant_corpus_drift["corpora"][0]))
+    replacement_corpus["corpus_id"] = "b" * 64
+    variant_corpus_drift["corpora"].append(replacement_corpus)
+    shared_variant[0]["corpus_id"] = replacement_corpus["corpus_id"]
+    _recompute_census_public_receipt(variant_corpus_drift)
+    with pytest.raises(custody.CustodyError, match="projection_census_variant_corpus_binding_invalid"):
+        custody.validate_candidate_projection(variant_corpus_drift)
+
+    variant_split = json.loads(json.dumps(original))
+    shared_variant_items = next(
+        rows for rows in (
+            [item for item in variant_split["items"] if item["selection_variant_id"] == candidate["selection_variant_id"]]
+            for candidate in variant_split["items"]
+        ) if len(rows) > 1
+    )
+    shared_variant_items[0]["selection_variant_id"] = "c" * 64
+    _recompute_census_public_receipt(variant_split)
+    with pytest.raises(custody.CustodyError, match="projection_census_corpus_variant_binding_invalid"):
+        custody.validate_candidate_projection(variant_split)
+
+    orphan_corpus = json.loads(json.dumps(original))
+    orphan = json.loads(json.dumps(orphan_corpus["corpora"][0]))
+    orphan["corpus_id"] = "e" * 64
+    orphan_corpus["corpora"].append(orphan)
+    _recompute_census_public_receipt(orphan_corpus)
+    with pytest.raises(custody.CustodyError, match="projection_census_orphan_corpus"):
+        custody.validate_candidate_projection(orphan_corpus)
+
+
 def test_formal_source_outputs_must_be_new(tmp_path: Path) -> None:
     canonical, premix = _roots(tmp_path)
     candidate = tmp_path / "candidate"; custody_root = _custody_bundle(candidate)
@@ -1318,12 +1496,66 @@ def test_census_v1_recomputes_each_quarantine_reason_digest(tmp_path: Path) -> N
         custody.validate_candidate_projection(projection)
 
 
-def test_census_v1_rejects_any_multi_persona_quarantine_without_publication(tmp_path: Path) -> None:
-    canonical, premix = _roots(tmp_path, mixed=True)
-    output = tmp_path / "census"
+def test_census_v1_rejects_unresolved_canonical_key_and_receipt_structure_drift(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
+    cases = json.loads(cases_path.read_text(encoding="utf-8"))
+    cases = [case for case in cases if case["evidenceItems"][0]["personId"] != "p-a"]
+    _write(cases_path, cases)
     with pytest.raises(custody.CrosswalkError, match="census_quarantine_nonempty"):
-        _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
-    assert not output.exists()
+        _publish(canonical=canonical, premix=premix, output=tmp_path / "unresolved-output", staging=_staging(tmp_path / "unresolved-staging"), config=custody.SelectionConfig.census_v1())
+
+    canonical, premix = _roots(tmp_path / "receipt")
+    output = tmp_path / "receipt" / "census"
+    _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path / "receipt"), config=custody.SelectionConfig.census_v1())
+    projection = custody.load_candidate_projection(output)
+    projection["selection_receipt"]["observed_crosswalk"]["sparse_query_context_count"] = 1
+    with pytest.raises(custody.CustodyError, match="census_denominator_binding_invalid"):
+        custody.validate_candidate_projection(projection)
+
+
+def test_census_v1_includes_all_observed_embedded_item_case_pairs_deterministically(tmp_path: Path) -> None:
+    """Official multi-persona, sparse, and same-context case variants are data, not exclusions."""
+    canonical, premix = _roots(tmp_path, mixed=True)
+    cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
+    cases = json.loads(cases_path.read_text(encoding="utf-8"))
+    # A distinct official case may repeat an already observed item/context pair.
+    # It must remain an additional deterministic item/case observation.
+    cases.append(json.loads(json.dumps(cases[0])))
+    _write(cases_path, cases)
+
+    first = tmp_path / "census-first"
+    second = tmp_path / "census-second"
+    _publish(canonical=canonical, premix=premix, output=first, staging=_staging(tmp_path / "first"), config=custody.SelectionConfig.census_v1())
+    _publish(canonical=canonical, premix=premix, output=second, staging=_staging(tmp_path / "second"), config=custody.SelectionConfig.census_v1())
+    projection = custody.load_candidate_projection(first)
+    repeated = custody.load_candidate_projection(second)
+    receipt = projection["selection_receipt"]
+
+    assert len(projection["items"]) == 15
+    assert len(projection["corpora"]) == 14
+    logical_items: dict[str, list[dict[str, object]]] = {}
+    for item in projection["items"]:
+        logical_items.setdefault(item["selection_logical_item_id"], []).append(item)
+    assert len(logical_items) == 4
+    assert receipt["observed_crosswalk"] == {
+        "semantics": "all_embedded_evidence_key_to_case_pairs_v1",
+        "multi_persona_corpus_count": 1,
+        "sparse_query_context_count": 2,
+        "multi_case_query_context_count": 1,
+    }
+    assert {row["declared_context_size"]: row["item_count"] for row in receipt["per_context_denominators"]} == {1: 5, 3: 2, 8: 4, 13: 4}
+    assert receipt == repeated["selection_receipt"]
+    corpus_personas: dict[str, set[str]] = {}
+    for item in projection["items"]:
+        corpus_personas.setdefault(item["corpus_id"], set()).add(item["persona_id"])
+    assert sum(len(personas) > 1 for personas in corpus_personas.values()) == 1
+    shared_corpus = next(corpus_id for corpus_id, personas in corpus_personas.items() if len(personas) > 1)
+    shared_items = [item for item in projection["items"] if item["corpus_id"] == shared_corpus]
+    # The case token is stable whenever a pre-mix case is reused, while every
+    # logical-item × case item_id remains unique.
+    assert len(shared_items) == len({item["selection_logical_item_id"] for item in shared_items}) == len({item["item_id"] for item in shared_items}) == 2
+    assert len({item["selection_variant_id"] for item in shared_items}) == 1
 
 
 def test_census_v1_rejects_unmatched_premix_keys_without_publication(tmp_path: Path) -> None:

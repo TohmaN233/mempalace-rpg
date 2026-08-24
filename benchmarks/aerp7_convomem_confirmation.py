@@ -28,7 +28,8 @@ CUSTODY_SCHEMA = "aerp7-convomem-sealed-custody-v3"
 CANDIDATE_READY_SCHEMA = "aerp7-convomem-candidate-ready-v3"
 CUSTODY_READY_SCHEMA = "aerp7-convomem-custody-ready-v3"
 SELECTION_ALGORITHM = "hmac-sha256-revision-bound-persona-group-tier-context-v1"
-CENSUS_SELECTION_ALGORITHM = "aerp7-convomem-census-v1"
+CENSUS_SELECTION_ALGORITHM = "aerp7-convomem-census-observed-pairs-v2"
+CENSUS_CROSSWALK_SEMANTICS = "all_embedded_evidence_key_to_case_pairs_v1"
 BOUND_CUSTODY_ALGORITHM = "hmac-sha256-revision-bound-custody-binding-v1"
 PREMIX_EXACT_DUPLICATE_NORMALIZATION = {
     "schema": "aerp7-premix-exact-outer-conversation-normalization-v1",
@@ -554,6 +555,21 @@ def _audit(value: Any) -> None:
             _audit(child)
 
 
+def _census_logical_variant_pair_rows(items: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Canonical public witness for every observed logical-item × case pair."""
+    rows = [
+        {
+            "selection_logical_item_id": item["selection_logical_item_id"],
+            "selection_logical_binding_witness": item["selection_logical_binding_witness"],
+            "selection_variant_id": item["selection_variant_id"],
+            "item_id": item["item_id"],
+            "corpus_id": item["corpus_id"],
+        }
+        for item in items
+    ]
+    return sorted(rows, key=lambda row: (row["selection_logical_item_id"], row["selection_variant_id"], row["item_id"], row["corpus_id"]))
+
+
 def validate_candidate_projection(value: Any) -> dict[str, Any]:
     projection = _object(value, "projection_root_invalid")
     if set(projection) != {"schema", "dataset", "selection_receipt", "corpora", "items"} or projection.get("schema") != SCHEMA:
@@ -564,17 +580,20 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
     for digest in dataset.values(): _token(digest, "projection_digest_invalid")
     receipt = _object(projection.get("selection_receipt"), "projection_selection_receipt_invalid")
     if receipt.get("algorithm") == CENSUS_SELECTION_ALGORITHM:
-        required_census = {"algorithm", "seed", "persona_quota", "per_persona_group_quota", "context_rank_indices", "context_rank_semantics", "selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "selected_item_context_count", "candidate_visible_query_count", "candidate_visible_persona_count", "candidate_visible_context_count", "group_count", "selected_item_ids_sha256", "per_context_denominators", "denominators_sha256", "item_supplement_count", "exclusion_counts", "quarantine_reason_digests", "quarantine_ledger_sha256"}
-        if set(receipt) != required_census or (receipt.get("seed"), receipt.get("persona_quota"), receipt.get("per_persona_group_quota"), receipt.get("context_rank_indices"), receipt.get("context_rank_semantics")) != (None, "ALL", "ALL", "ALL_AVAILABLE_SORTED", "all_available_sorted_values"):
+        required_census = {"algorithm", "seed", "persona_quota", "per_persona_group_quota", "context_rank_indices", "context_rank_semantics", "selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "logical_variant_pairs_sha256", "corpus_ids_sha256", "selected_item_context_count", "candidate_visible_query_count", "candidate_visible_persona_count", "candidate_visible_context_count", "candidate_visible_corpus_count", "group_count", "selected_item_ids_sha256", "per_context_denominators", "denominators_sha256", "item_supplement_count", "observed_crosswalk", "exclusion_counts", "quarantine_reason_digests", "quarantine_ledger_sha256"}
+        if set(receipt) != required_census or (receipt.get("seed"), receipt.get("persona_quota"), receipt.get("per_persona_group_quota"), receipt.get("context_rank_indices"), receipt.get("context_rank_semantics")) != (None, "ALL", "ALL", "ALL_AVAILABLE_SORTED", "all_observed_item_context_pairs"):
             raise CustodyError("projection_census_selection_receipt_invalid")
-        digest_keys = {"selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "selected_item_ids_sha256", "denominators_sha256", "quarantine_ledger_sha256"}
+        digest_keys = {"selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "logical_variant_pairs_sha256", "corpus_ids_sha256", "selected_item_ids_sha256", "denominators_sha256", "quarantine_ledger_sha256"}
         if any(not isinstance(receipt.get(key), str) or len(receipt[key]) != 64 for key in digest_keys): raise CustodyError("projection_census_selection_receipt_invalid")
-        count_keys = {"selected_item_context_count", "candidate_visible_query_count", "candidate_visible_persona_count", "candidate_visible_context_count", "group_count", "item_supplement_count"}
+        count_keys = {"selected_item_context_count", "candidate_visible_query_count", "candidate_visible_persona_count", "candidate_visible_context_count", "candidate_visible_corpus_count", "group_count", "item_supplement_count"}
         if any(isinstance(receipt.get(key), bool) or not isinstance(receipt.get(key), int) or receipt[key] < 0 for key in count_keys) or receipt["item_supplement_count"] != 0:
             raise CustodyError("projection_census_selection_receipt_invalid")
         expected_exclusions = {"multi_persona_cases", "missing_crosswalk", "ambiguous_canonical_keys", "unmatched_premix_keys", "multiple_logical_matches_or_variants", "missing_requested_context_sizes"}
         if not isinstance(receipt.get("exclusion_counts"), Mapping) or set(receipt["exclusion_counts"]) != expected_exclusions or any(value != 0 for value in receipt["exclusion_counts"].values()): raise CustodyError("projection_census_quarantine_nonempty")
         if not isinstance(receipt.get("quarantine_reason_digests"), Mapping) or set(receipt["quarantine_reason_digests"]) != {"multi_persona_cases", "canonical_zero_logical_matches", "ambiguous_canonical_keys", "unmatched_premix_keys", "multiple_logical_matches_or_variants", "missing_requested_context_sizes"}: raise CustodyError("projection_census_selection_receipt_invalid")
+        observed_crosswalk = receipt.get("observed_crosswalk")
+        if not isinstance(observed_crosswalk, Mapping) or set(observed_crosswalk) != {"semantics", "multi_persona_corpus_count", "sparse_query_context_count", "multi_case_query_context_count"} or observed_crosswalk.get("semantics") != CENSUS_CROSSWALK_SEMANTICS or any(isinstance(observed_crosswalk.get(key), bool) or not isinstance(observed_crosswalk.get(key), int) or observed_crosswalk[key] < 0 for key in ("multi_persona_corpus_count", "sparse_query_context_count", "multi_case_query_context_count")):
+            raise CustodyError("projection_census_selection_receipt_invalid")
         contexts = receipt.get("per_context_denominators")
         if not isinstance(contexts, list) or not contexts or any(not isinstance(row, Mapping) or set(row) != {"context_rank", "declared_context_size", "item_count", "item_ids_sha256"} for row in contexts): raise CustodyError("projection_census_selection_receipt_invalid")
         if [row["context_rank"] for row in contexts] != list(range(len(contexts))) or any(isinstance(row["declared_context_size"], bool) or not isinstance(row["declared_context_size"], int) or row["declared_context_size"] <= 0 or isinstance(row["item_count"], bool) or not isinstance(row["item_count"], int) or row["item_count"] <= 0 or not isinstance(row["item_ids_sha256"], str) or len(row["item_ids_sha256"]) != 64 for row in contexts): raise CustodyError("projection_census_selection_receipt_invalid")
@@ -637,7 +656,7 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
     for item in _list(projection.get("items"), "projection_items_invalid"):
         row = _object(item, "projection_item_invalid")
         expected_item_keys = {"item_id", "persona_id", "query_text", "corpus_id"}
-        selection_tokens = {"selection_group_id", "selection_tier_id", "selection_variant_id"}
+        selection_tokens = {"selection_logical_item_id", "selection_logical_binding_witness", "selection_group_id", "selection_tier_id", "selection_variant_id"}
         present_selection_tokens = set(row) & selection_tokens
         if census_receipt is not None:
             # This opaque, revision-bound token is the only candidate-safe
@@ -657,13 +676,46 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
                 _token(row.get(key), "projection_selection_token_invalid")
     if len(seen) != receipt.get("selected_item_context_count"): raise CustodyError("projection_item_count_invalid")
     if census_receipt is not None:
+        referenced_corpus_ids = {item["corpus_id"] for item in projection["items"]}
+        if referenced_corpus_ids != corpus_ids:
+            raise CustodyError("projection_census_orphan_corpus")
+        logical_bindings: dict[str, tuple[str, str, str, str]] = {}
+        logical_witnesses: dict[str, str] = {}
+        witness_logical_items: dict[str, str] = {}
+        variant_corpora: dict[str, str] = {}
+        corpus_variants: dict[str, str] = {}
+        logical_variant_pairs: set[tuple[str, str]] = set()
+        for item in projection["items"]:
+            logical_item_id = item["selection_logical_item_id"]
+            binding = (item["persona_id"], item["query_text"], item["selection_group_id"], item["selection_tier_id"])
+            prior_binding = logical_bindings.setdefault(logical_item_id, binding)
+            if prior_binding != binding:
+                raise CustodyError("projection_census_logical_item_binding_invalid")
+            witness = item["selection_logical_binding_witness"]
+            prior_witness = logical_witnesses.setdefault(logical_item_id, witness)
+            if prior_witness != witness:
+                raise CustodyError("projection_census_logical_item_witness_binding_invalid")
+            prior_logical_item_id = witness_logical_items.setdefault(witness, logical_item_id)
+            if prior_logical_item_id != logical_item_id:
+                raise CustodyError("projection_census_binding_logical_item_split")
+            variant_id = item["selection_variant_id"]
+            prior_corpus = variant_corpora.setdefault(variant_id, item["corpus_id"])
+            if prior_corpus != item["corpus_id"]:
+                raise CustodyError("projection_census_variant_corpus_binding_invalid")
+            prior_variant = corpus_variants.setdefault(item["corpus_id"], variant_id)
+            if prior_variant != variant_id:
+                raise CustodyError("projection_census_corpus_variant_binding_invalid")
+            pair = (logical_item_id, variant_id)
+            if pair in logical_variant_pairs:
+                raise CustodyError("projection_census_logical_variant_duplicate")
+            logical_variant_pairs.add(pair)
         items_by_context: dict[int, list[str]] = {}
         corpora_by_id = {row["corpus_id"]: row for row in projection["corpora"]}
         persona_ids = sorted({item["persona_id"] for item in projection["items"]})
         selection_groups = {item["selection_group_id"] for item in projection["items"]}
         selection_tiers = {item["selection_tier_id"] for item in projection["items"]}
         selection_variants = sorted(item["selection_variant_id"] for item in projection["items"])
-        candidate_queries = {(item["persona_id"], item["query_text"]) for item in projection["items"]}
+        candidate_queries = {item["selection_logical_item_id"] for item in projection["items"]}
         for item in projection["items"]:
             items_by_context.setdefault(corpora_by_id[item["corpus_id"]]["declared_context_size"], []).append(item["item_id"])
         expected_contexts = [
@@ -676,12 +728,28 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
             for reason in ("ambiguous_canonical_keys", "unmatched_premix_keys", "canonical_zero_logical_matches", "multiple_logical_matches_or_variants", "missing_requested_context_sizes", "multi_persona_cases")
         }
         expected_quarantine_ledger = {
-            "schema": "aerp7-convomem-quarantine-ledger-v2",
+            "schema": "aerp7-convomem-quarantine-ledger-v3",
             "dataset_revision_sha256": projection["dataset"]["revision_sha256"],
             # SQL stores the frozen pre-mix selector values as floats, whereas
             # candidate corpora canonically expose integral declared sizes.
             "desired_context_values_sha256": canonical_sha256([float(row["declared_context_size"]) for row in expected_contexts]),
+            "matching_semantics": CENSUS_CROSSWALK_SEMANTICS,
             "reasons": expected_reasons,
+        }
+        query_context_corpora: dict[tuple[str, int], set[str]] = {}
+        personas_by_corpus: dict[str, set[str]] = {}
+        contexts_by_query: dict[str, set[int]] = {}
+        for item in projection["items"]:
+            context_size = corpora_by_id[item["corpus_id"]]["declared_context_size"]
+            logical_item_id = item["selection_logical_item_id"]
+            query_context_corpora.setdefault((logical_item_id, context_size), set()).add(item["corpus_id"])
+            contexts_by_query.setdefault(logical_item_id, set()).add(context_size)
+            personas_by_corpus.setdefault(item["corpus_id"], set()).add(item["persona_id"])
+        expected_observed_crosswalk = {
+            "semantics": CENSUS_CROSSWALK_SEMANTICS,
+            "multi_persona_corpus_count": sum(len(personas) > 1 for personas in personas_by_corpus.values()),
+            "sparse_query_context_count": sum(contexts != {row["declared_context_size"] for row in expected_contexts} for contexts in contexts_by_query.values()),
+            "multi_case_query_context_count": sum(len(corpora) > 1 for corpora in query_context_corpora.values()),
         }
         if (
             receipt["selected_item_ids_sha256"] != canonical_sha256(sorted(seen))
@@ -690,16 +758,20 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
             or receipt["candidate_visible_query_count"] != len(candidate_queries)
             or receipt["candidate_visible_persona_count"] != len(persona_ids)
             or receipt["candidate_visible_context_count"] != len(expected_contexts)
+            or receipt["candidate_visible_corpus_count"] != len(corpus_ids)
             or receipt["group_values_sha256"] != canonical_sha256(sorted(selection_groups))
             or receipt["tier_values_sha256"] != canonical_sha256(sorted(selection_tiers))
             or receipt["variant_selection_sha256"] != canonical_sha256(selection_variants)
+            or receipt["logical_variant_pairs_sha256"] != canonical_sha256(_census_logical_variant_pair_rows(projection["items"]))
+            or receipt["corpus_ids_sha256"] != canonical_sha256(sorted(corpus_ids))
             or receipt["context_values_sha256"] != canonical_sha256([row["declared_context_size"] for row in expected_contexts])
             or receipt["desired_context_values_sha256"] != canonical_sha256([row["declared_context_size"] for row in expected_contexts])
+            or receipt["observed_crosswalk"] != expected_observed_crosswalk
             or receipt["quarantine_reason_digests"] != {reason: empty_reason_digest for reason in expected_reasons}
             or receipt["quarantine_ledger_sha256"] != canonical_sha256(expected_quarantine_ledger)
             or receipt["per_context_denominators"] != expected_contexts
             or receipt["group_count"] != len(selection_groups)
-            or receipt["denominators_sha256"] != canonical_sha256({"query_count": len(seen), "candidate_visible_query_count": len(candidate_queries), "persona_count": len(persona_ids), "context_count": len(expected_contexts), "group_count": len(selection_groups), "per_context_denominators": expected_contexts})
+            or receipt["denominators_sha256"] != canonical_sha256({"query_count": len(seen), "candidate_visible_query_count": len(candidate_queries), "persona_count": len(persona_ids), "context_count": len(expected_contexts), "corpus_count": len(corpus_ids), "group_count": len(selection_groups), "logical_variant_pairs_sha256": canonical_sha256(_census_logical_variant_pair_rows(projection["items"])), "corpus_ids_sha256": canonical_sha256(sorted(corpus_ids)), "per_context_denominators": expected_contexts})
         ):
             raise CustodyError("projection_census_denominator_binding_invalid")
     _audit(projection)
@@ -1119,12 +1191,11 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
                                     if any(conversation_id not in outer_ids for conversation_id in conversations):
                                         raise CrosswalkError("premix_embedded_conversation_missing")
                                     keys.append(canonical_sha256([persona, question, answer, category, conversations]))
-                                # These cases cannot be safely assigned to one persona.
-                                # They are retained only as a revision-bound quarantine fact.
                                 personas = {_text(_object(raw, "premix_evidence_item_invalid").get("personId"), "premix_person_id_invalid") for raw in _list(case.get("evidenceItems"), "premix_evidence_items_invalid")}
+                                if not personas:
+                                    raise CustodyError("premix_case_has_no_embedded_evidence")
                                 if len(personas) != 1:
                                     connection.execute("INSERT INTO explicit_quarantine VALUES(?,?)", ("multi_persona_cases", case_sha))
-                                    continue
                                 connection.execute("INSERT INTO premix_cases VALUES(?,?,?,?)", (case_sha, _bytes(locator_case).decode(), float(context_size), _bytes(messages).decode()))
                                 for key in sorted(set(keys)):
                                     connection.execute("INSERT INTO premix_keys VALUES(?,?)", (key, case_sha))
@@ -1186,7 +1257,7 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
         raise
 
 
-def _quarantine_ledger(database: Path, revision: str, desired_contexts: Sequence[float] = ()) -> dict[str, Any]:
+def _quarantine_ledger(database: Path, revision: str, desired_contexts: Sequence[float] = (), *, census_observed_pairs: bool = False) -> dict[str, Any]:
     """Global SQL-only join audit; no selection-path encounter may hide a bad key."""
     connection = _index_connection(database)
     try:
@@ -1194,24 +1265,37 @@ def _quarantine_ledger(database: Path, revision: str, desired_contexts: Sequence
             "ambiguous_canonical_keys": "SELECT key_sha FROM canonical_items GROUP BY key_sha HAVING count(*) != 1",
             "unmatched_premix_keys": "SELECT DISTINCT p.key_sha FROM premix_keys p LEFT JOIN canonical_items c ON c.key_sha=p.key_sha WHERE c.key_sha IS NULL",
             "canonical_zero_logical_matches": "SELECT c.key_sha FROM canonical_items c LEFT JOIN premix_keys p ON p.key_sha=c.key_sha GROUP BY c.key_sha HAVING count(p.case_sha)=0",
-            # A key may occur at several requested context sizes, but must have
-            # exactly one logical corpus at each size.  Variants make the
-            # benchmark choice underdetermined and are quarantined globally.
-            "multiple_logical_matches_or_variants": "SELECT c.key_sha FROM canonical_items c JOIN premix_keys p ON p.key_sha=c.key_sha JOIN premix_cases pc ON pc.case_sha=p.case_sha GROUP BY c.key_sha, pc.context_size HAVING count(DISTINCT pc.case_sha)>1",
         }
         reasons = {}
         for reason, query in queries.items():
             keys = sorted({row[0] for row in connection.execute(query)})
             reasons[reason] = {"count": len(keys), "keys_sha256": canonical_sha256(keys)}
-        missing = []
-        for row in connection.execute("SELECT DISTINCT key_sha FROM canonical_items"):
-            key = row[0]
-            available = {candidate[0] for candidate in connection.execute("SELECT DISTINCT pc.context_size FROM premix_keys p JOIN premix_cases pc ON pc.case_sha=p.case_sha WHERE p.key_sha=?", (key,))}
-            if any(float(context) not in available for context in desired_contexts): missing.append(key)
-        reasons["missing_requested_context_sizes"] = {"count": len(missing), "keys_sha256": canonical_sha256(sorted(missing))}
-        multi = sorted(row[0] for row in connection.execute("SELECT key_sha FROM explicit_quarantine WHERE reason='multi_persona_cases'"))
-        reasons["multi_persona_cases"] = {"count": len(multi), "keys_sha256": canonical_sha256(multi)}
-        receipt = {"schema": "aerp7-convomem-quarantine-ledger-v2", "dataset_revision_sha256": revision, "desired_context_values_sha256": canonical_sha256(list(desired_contexts)), "reasons": reasons}
+        if census_observed_pairs:
+            # The formal estimand is every observed embedded-evidence key ×
+            # pre-mix case pair.  Official sparse context coverage, multiple
+            # cases at one context, and multi-persona cases are therefore
+            # disclosed selection structure, not unresolved crosswalk faults.
+            for reason in ("multiple_logical_matches_or_variants", "missing_requested_context_sizes", "multi_persona_cases"):
+                reasons[reason] = {"count": 0, "keys_sha256": canonical_sha256([])}
+            receipt = {
+                "schema": "aerp7-convomem-quarantine-ledger-v3",
+                "dataset_revision_sha256": revision,
+                "desired_context_values_sha256": canonical_sha256(list(desired_contexts)),
+                "matching_semantics": CENSUS_CROSSWALK_SEMANTICS,
+                "reasons": reasons,
+            }
+        else:
+            variant_keys = sorted({row[0] for row in connection.execute("SELECT c.key_sha FROM canonical_items c JOIN premix_keys p ON p.key_sha=c.key_sha JOIN premix_cases pc ON pc.case_sha=p.case_sha GROUP BY c.key_sha, pc.context_size HAVING count(DISTINCT pc.case_sha)>1")})
+            reasons["multiple_logical_matches_or_variants"] = {"count": len(variant_keys), "keys_sha256": canonical_sha256(variant_keys)}
+            missing = []
+            for row in connection.execute("SELECT DISTINCT key_sha FROM canonical_items"):
+                key = row[0]
+                available = {candidate[0] for candidate in connection.execute("SELECT DISTINCT pc.context_size FROM premix_keys p JOIN premix_cases pc ON pc.case_sha=p.case_sha WHERE p.key_sha=?", (key,))}
+                if any(float(context) not in available for context in desired_contexts): missing.append(key)
+            reasons["missing_requested_context_sizes"] = {"count": len(missing), "keys_sha256": canonical_sha256(sorted(missing))}
+            multi = sorted(row[0] for row in connection.execute("SELECT key_sha FROM explicit_quarantine WHERE reason='multi_persona_cases'"))
+            reasons["multi_persona_cases"] = {"count": len(multi), "keys_sha256": canonical_sha256(multi)}
+            receipt = {"schema": "aerp7-convomem-quarantine-ledger-v2", "dataset_revision_sha256": revision, "desired_context_values_sha256": canonical_sha256(list(desired_contexts)), "reasons": reasons}
         receipt["ledger_sha256"] = canonical_sha256(receipt)
         return receipt
     finally:
@@ -1220,7 +1304,14 @@ def _quarantine_ledger(database: Path, revision: str, desired_contexts: Sequence
 
 def _validate_quarantine_ledger(value: Any, revision: str) -> dict[str, Any]:
     ledger = _object(value, "quarantine_ledger_invalid")
-    if set(ledger) != {"schema", "dataset_revision_sha256", "desired_context_values_sha256", "reasons", "ledger_sha256"} or ledger.get("schema") != "aerp7-convomem-quarantine-ledger-v2" or ledger.get("dataset_revision_sha256") != revision:
+    v2 = {"schema", "dataset_revision_sha256", "desired_context_values_sha256", "reasons", "ledger_sha256"}
+    v3 = v2 | {"matching_semantics"}
+    if set(ledger) not in (v2, v3) or ledger.get("dataset_revision_sha256") != revision:
+        raise CustodyError("quarantine_ledger_invalid")
+    if ledger.get("schema") == "aerp7-convomem-quarantine-ledger-v3":
+        if set(ledger) != v3 or ledger.get("matching_semantics") != CENSUS_CROSSWALK_SEMANTICS:
+            raise CustodyError("quarantine_ledger_invalid")
+    elif ledger.get("schema") != "aerp7-convomem-quarantine-ledger-v2" or set(ledger) != v2:
         raise CustodyError("quarantine_ledger_invalid")
     reasons = _object(ledger.get("reasons"), "quarantine_ledger_invalid")
     if set(reasons) != {"ambiguous_canonical_keys", "unmatched_premix_keys", "canonical_zero_logical_matches", "multiple_logical_matches_or_variants", "missing_requested_context_sizes", "multi_persona_cases"}:
@@ -1231,7 +1322,8 @@ def _validate_quarantine_ledger(value: Any, revision: str) -> dict[str, Any]:
             raise CustodyError("quarantine_ledger_invalid")
         _token(data.get("keys_sha256"), "quarantine_ledger_invalid")
     _token(ledger.get("desired_context_values_sha256"), "quarantine_ledger_invalid")
-    if ledger.get("ledger_sha256") != canonical_sha256({key: ledger[key] for key in ("schema", "dataset_revision_sha256", "desired_context_values_sha256", "reasons")}):
+    bound_keys = ("schema", "dataset_revision_sha256", "desired_context_values_sha256", "matching_semantics", "reasons") if ledger.get("schema") == "aerp7-convomem-quarantine-ledger-v3" else ("schema", "dataset_revision_sha256", "desired_context_values_sha256", "reasons")
+    if ledger.get("ledger_sha256") != canonical_sha256({key: ledger[key] for key in bound_keys}):
         raise CustodyError("quarantine_ledger_invalid")
     return dict(ledger)
 
@@ -1287,23 +1379,27 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
         if not groups or any(group is None for group in groups):
             raise CustodyError("canonical_group_invalid")
         connection.execute("CREATE TEMP TABLE forbidden_keys(key_sha TEXT PRIMARY KEY)")
-        for query in (
+        forbidden_queries = [
             "INSERT OR IGNORE INTO forbidden_keys SELECT key_sha FROM canonical_items GROUP BY key_sha HAVING count(*) != 1",
             "INSERT OR IGNORE INTO forbidden_keys SELECT c.key_sha FROM canonical_items c LEFT JOIN premix_keys p ON p.key_sha=c.key_sha GROUP BY c.key_sha HAVING count(p.case_sha)=0",
-            "INSERT OR IGNORE INTO forbidden_keys SELECT c.key_sha FROM canonical_items c JOIN premix_keys p ON p.key_sha=c.key_sha JOIN premix_cases pc ON pc.case_sha=p.case_sha GROUP BY c.key_sha, pc.context_size HAVING count(DISTINCT pc.case_sha)>1",
-        ):
+        ]
+        if not config.is_census_v1:
+            forbidden_queries.append("INSERT OR IGNORE INTO forbidden_keys SELECT c.key_sha FROM canonical_items c JOIN premix_keys p ON p.key_sha=c.key_sha JOIN premix_cases pc ON pc.case_sha=p.case_sha GROUP BY c.key_sha, pc.context_size HAVING count(DISTINCT pc.case_sha)>1")
+        for query in forbidden_queries:
             connection.execute(query)
-        # Missing requested contexts is a fourth eligibility predicate.  Compute
-        # from SQL and bind it to the ledger's already validated digest.
-        missing: list[str] = []
-        for row in connection.execute("SELECT DISTINCT key_sha FROM canonical_items"):
-            available = {float(value[0]) for value in connection.execute("SELECT DISTINCT pc.context_size FROM premix_keys p JOIN premix_cases pc ON pc.case_sha=p.case_sha WHERE p.key_sha=?", (row[0],))}
-            if any(float(size) not in available for size in desired_contexts):
-                missing.append(row[0])
-        missing = sorted(missing)
-        if canonical_sha256(missing) != ledger["reasons"]["missing_requested_context_sizes"]["keys_sha256"]:
-            raise CustodyError("quarantine_ledger_drift")
-        connection.executemany("INSERT OR IGNORE INTO forbidden_keys VALUES(?)", ((key,) for key in missing))
+        if not config.is_census_v1:
+            # Sample selection retains its strict complete-context eligibility
+            # contract.  The formal census instead publishes all observed
+            # pairs and binds their non-rectangular structure in its receipt.
+            missing: list[str] = []
+            for row in connection.execute("SELECT DISTINCT key_sha FROM canonical_items"):
+                available = {float(value[0]) for value in connection.execute("SELECT DISTINCT pc.context_size FROM premix_keys p JOIN premix_cases pc ON pc.case_sha=p.case_sha WHERE p.key_sha=?", (row[0],))}
+                if any(float(size) not in available for size in desired_contexts):
+                    missing.append(row[0])
+            missing = sorted(missing)
+            if canonical_sha256(missing) != ledger["reasons"]["missing_requested_context_sizes"]["keys_sha256"]:
+                raise CustodyError("quarantine_ledger_drift")
+            connection.executemany("INSERT OR IGNORE INTO forbidden_keys VALUES(?)", ((key,) for key in missing))
         rows = connection.execute(
             "SELECT c.key_sha, c.locator, c.ordinal, c.persona, c.question, c.directory FROM canonical_items c WHERE NOT EXISTS (SELECT 1 FROM forbidden_keys f WHERE f.key_sha=c.key_sha)",
         ).fetchall()
@@ -1325,6 +1421,9 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
             selected_personas: list[str] = []
             variants: list[str] = []
             seen_personas: set[str] = set()
+            contexts_by_key: dict[str, set[float]] = {}
+            cases_by_key_context: dict[tuple[str, float], set[str]] = {}
+            personas_by_case: dict[str, set[str]] = {}
             for row in sorted(rows, key=lambda item: (item["persona"], json.loads(item["directory"])["group"], item["locator"], item["ordinal"])):
                 persona_id = _opaque(secret, revision, "persona", row["persona"])
                 if persona_id not in seen_personas:
@@ -1333,14 +1432,13 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
                     "SELECT pc.case_sha, pc.locator, pc.context_size FROM premix_keys p JOIN premix_cases pc ON pc.case_sha=p.case_sha WHERE p.key_sha=? ORDER BY pc.context_size, pc.case_sha",
                     (row["key_sha"],),
                 ).fetchall()
-                by_context: dict[float, list[sqlite3.Row]] = {}
                 for case in cases:
-                    by_context.setdefault(float(case["context_size"]), []).append(case)
-                if set(by_context) != {float(value) for value in desired_contexts} or any(len(values) != 1 for values in by_context.values()):
-                    raise CrosswalkError("census_context_crosswalk_invalid")
+                    context_size = float(case["context_size"])
+                    contexts_by_key.setdefault(row["key_sha"], set()).add(context_size)
+                    cases_by_key_context.setdefault((row["key_sha"], context_size), set()).add(case["case_sha"])
+                    personas_by_case.setdefault(case["case_sha"], set()).add(persona_id)
                 canonical = {"key_sha": row["key_sha"], "locator": row["locator"], "ordinal": row["ordinal"], "persona": row["persona"], "persona_id": persona_id, "question": row["question"], "directory": json.loads(row["directory"])}
-                for size in desired_contexts:
-                    case = by_context[float(size)][0]
+                for case in cases:
                     selected.append((canonical, {"case_sha": case["case_sha"], "locator": json.loads(case["locator"]), "context_size": float(case["context_size"])}))
                     variants.append(case["case_sha"])
             if not selected:
@@ -1352,7 +1450,7 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
                 "persona_quota": "ALL",
                 "per_persona_group_quota": "ALL",
                 "context_rank_indices": "ALL_AVAILABLE_SORTED",
-                "context_rank_semantics": "all_available_sorted_values",
+                "context_rank_semantics": "all_observed_item_context_pairs",
                 # The public validator recomputes this from opaque IDs; the
                 # selector's raw-persona traversal must not leak into or alter
                 # the census seal.
@@ -1369,6 +1467,12 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
                 "candidate_visible_context_count": len(desired_contexts),
                 "denominators_sha256": canonical_sha256({"query_count": len(selected), "candidate_visible_query_count": len(rows), "persona_count": len(selected_personas), "context_count": len(desired_contexts)}),
                 "item_supplement_count": 0,
+                "observed_crosswalk": {
+                    "semantics": CENSUS_CROSSWALK_SEMANTICS,
+                    "multi_persona_corpus_count": sum(len(personas) > 1 for personas in personas_by_case.values()),
+                    "sparse_query_context_count": sum(contexts != {float(value) for value in desired_contexts} for contexts in contexts_by_key.values()),
+                    "multi_case_query_context_count": sum(len(cases) > 1 for cases in cases_by_key_context.values()),
+                },
                 "exclusion_counts": {
                     "multi_persona_cases": ledger["reasons"]["multi_persona_cases"]["count"],
                     "missing_crosswalk": ledger["reasons"]["canonical_zero_logical_matches"]["count"],
@@ -1482,6 +1586,8 @@ def _selected_payloads_sql(database: Path, selected: Sequence[tuple[dict[str, An
             projection_items.append({
                 "item_id": context_id, "persona_id": item["persona_id"],
                 "query_text": item["question"], "corpus_id": corpus_id,
+                "selection_logical_item_id": _opaque(secret, revision, "selection-logical-item", locator),
+                "selection_logical_binding_witness": _opaque(secret, revision, "selection-logical-binding-witness", locator),
                 "selection_group_id": _opaque(secret, revision, "selection-group", item["directory"]["group"]),
                 "selection_tier_id": _opaque(secret, revision, "selection-tier", directory["tier"]),
                 "selection_variant_id": _opaque(secret, revision, "selection-variant", case["case_sha"]),
@@ -2012,7 +2118,10 @@ def build_prelabel_bundle(*, canonical_root: Path, premix_root: Path, candidate_
             if any(rank >= len(context_values) for rank in selection.context_rank_indices):
                 raise CustodyError("context_rank_unavailable")
             desired_contexts = [context_values[rank] for rank in selection.context_rank_indices]
-        ledger = _validate_quarantine_ledger(_quarantine_ledger(index.database, index.revision, desired_contexts), index.revision)
+        ledger = _validate_quarantine_ledger(
+            _quarantine_ledger(index.database, index.revision, desired_contexts, census_observed_pairs=selection.is_census_v1),
+            index.revision,
+        )
         chosen, receipt = _selection_rows_sql(index.database, secret, index.revision, selection, desired_contexts, ledger)
         corpora, projection_items, custody_items = _selected_payloads_sql(index.database, chosen, secret, index.revision)
         if selection.is_census_v1:
@@ -2032,7 +2141,11 @@ def build_prelabel_bundle(*, canonical_root: Path, premix_root: Path, candidate_
             receipt["desired_context_values_sha256"] = canonical_sha256([row["declared_context_size"] for row in rows])
             receipt["selected_item_ids_sha256"] = canonical_sha256(sorted(item["item_id"] for item in projection_items))
             receipt["per_context_denominators"] = rows
-            receipt["denominators_sha256"] = canonical_sha256({"query_count": len(projection_items), "candidate_visible_query_count": receipt["candidate_visible_query_count"], "persona_count": receipt["candidate_visible_persona_count"], "context_count": receipt["candidate_visible_context_count"], "group_count": receipt["group_count"], "per_context_denominators": rows})
+            corpus_ids = sorted(corpus["corpus_id"] for corpus in corpora)
+            receipt["candidate_visible_corpus_count"] = len(corpus_ids)
+            receipt["logical_variant_pairs_sha256"] = canonical_sha256(_census_logical_variant_pair_rows(projection_items))
+            receipt["corpus_ids_sha256"] = canonical_sha256(corpus_ids)
+            receipt["denominators_sha256"] = canonical_sha256({"query_count": len(projection_items), "candidate_visible_query_count": receipt["candidate_visible_query_count"], "persona_count": receipt["candidate_visible_persona_count"], "context_count": receipt["candidate_visible_context_count"], "corpus_count": receipt["candidate_visible_corpus_count"], "group_count": receipt["group_count"], "logical_variant_pairs_sha256": receipt["logical_variant_pairs_sha256"], "corpus_ids_sha256": receipt["corpus_ids_sha256"], "per_context_denominators": rows})
         _verify_index_bytes(index, "sqlite_index_postmaterialization_drift")
         dataset = {"canonical_sha256": index.canonical_digest, "premix_sha256": index.premix_digest, "revision_sha256": index.revision, "source_inventory_sha256": index.staging_receipt["source_inventory_sha256"]}
         projection = {"schema": SCHEMA, "dataset": dataset, "selection_receipt": receipt, "corpora": corpora, "items": projection_items}

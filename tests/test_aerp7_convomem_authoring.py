@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks import aerp7_convomem_authoring as authoring
+from benchmarks import aerp7_convomem_confirmation as confirmation
 from benchmarks import aerp_execution_checkpoint as checkpoint
 from benchmarks import aerp7_convomem_rank as rank
 from benchmarks.aerp7_convomem_confirmation import CustodyError
@@ -41,7 +42,9 @@ def test_signed_one_shot_plan_is_exact_and_rejects_path_or_hmac_drift(tmp_path: 
         "model_receipt": {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": hashlib.sha256(b"w").hexdigest(), "bytes": 1}]},
     }
     plan = authoring.sign_one_shot_plan(fields, operator_capability=secret)
-    assert authoring.validate_one_shot_plan(plan, operator_capability=secret)["plan_sha256"] == plan["plan_sha256"]
+    signed = authoring.validate_one_shot_plan(plan, operator_capability=secret)
+    assert signed["plan_sha256"] == plan["plan_sha256"]
+    assert signed["census_semantics"]["selection_algorithm"] == confirmation.CENSUS_SELECTION_ALGORITHM
     plan["output_dir"] = str((tmp_path / "other").resolve())
     with pytest.raises(CustodyError, match="plan_digest"):
         authoring.validate_one_shot_plan(plan, operator_capability=secret)
