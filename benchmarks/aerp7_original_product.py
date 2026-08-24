@@ -528,7 +528,13 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
     after_sqlite = v2._sqlite_semantic_snapshot(palace_path)
     after_config = v2._sqlite_hnsw_configuration(palace_path)
     if after_storage["immutable_snapshot"] != before_storage["immutable_snapshot"] or after_config != before_config:
-        raise OriginalProductError("direct original index audit mutated persisted index")
+        raise OriginalProductError(
+            "direct original index audit mutated persisted index: "
+            f"immutable_before={_canonical_bytes(before_storage['immutable_snapshot']).decode('utf-8')}; "
+            f"immutable_after={_canonical_bytes(after_storage['immutable_snapshot']).decode('utf-8')}; "
+            f"config_before={_canonical_bytes(before_config).decode('utf-8')}; "
+            f"config_after={_canonical_bytes(after_config).decode('utf-8')}"
+        )
     ids, embeddings = stored.get("ids"), stored.get("embeddings")
     if not isinstance(ids, list) or sorted(ids) != list(expected_ids):
         raise OriginalProductError("original Chroma physical IDs differ from dynamic namespace")

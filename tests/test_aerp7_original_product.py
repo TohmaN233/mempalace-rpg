@@ -1,7 +1,9 @@
 import copy
 import hashlib
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +53,47 @@ class Palace:
         self.calls.append(("get_collection", palace_path, collection_name, create, backend))
         assert collection_name == "mempalace_drawers" and create is True and backend == "chroma"
         return Collection(self)
+
+
+def test_direct_dynamic_audit_immutable_drift_reports_canonical_before_after_state(
+    monkeypatch, tmp_path
+):
+    before_immutable = {"header.bin": {"bytes": 10, "sha256": "a" * 64}}
+    after_immutable = {"header.bin": {"bytes": 11, "sha256": "b" * 64}}
+    before_config = {"batch_size": 100, "space": "cosine"}
+    after_config = {"batch_size": 101, "space": "cosine"}
+    storages = iter(
+        [
+            {"immutable_snapshot": before_immutable, "files": [], "immutable_sha256": "a" * 64},
+            {"immutable_snapshot": after_immutable, "files": [], "immutable_sha256": "b" * 64},
+        ]
+    )
+    configs = iter([before_config, after_config])
+    monkeypatch.setattr(original.v2, "_audit_storage_digest", lambda _path: next(storages))
+    monkeypatch.setattr(original.v2, "_sqlite_hnsw_configuration", lambda _path: next(configs))
+    monkeypatch.setattr(
+        original.v2,
+        "_sqlite_semantic_snapshot",
+        lambda _path: {"semantic_sha256": "c" * 64},
+    )
+
+    class Client:
+        def get_collection(self, _name):
+            return SimpleNamespace(get=lambda **_kwargs: {"ids": ["id"], "embeddings": [[0.0]]})
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "chromadb", SimpleNamespace(PersistentClient=lambda **_kwargs: Client()))
+    with pytest.raises(original.OriginalProductError) as excinfo:
+        original._direct_dynamic_audit(palace_path=tmp_path, expected_ids=["id"])
+    assert str(excinfo.value) == (
+        "direct original index audit mutated persisted index: "
+        f"immutable_before={original._canonical_bytes(before_immutable).decode('utf-8')}; "
+        f"immutable_after={original._canonical_bytes(after_immutable).decode('utf-8')}; "
+        f"config_before={original._canonical_bytes(before_config).decode('utf-8')}; "
+        f"config_after={original._canonical_bytes(after_config).decode('utf-8')}"
+    )
 
 
 class Searcher:
