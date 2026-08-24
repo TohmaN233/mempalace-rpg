@@ -75,7 +75,7 @@ def _logical_original_physical_receipt(value: Any) -> dict[str, Any]:
     if delta.get("status") == "none":
         if any(delta.get(key) is not None for key in ("path", "bytes", "before_sha256", "after_sha256")):
             raise CustodyError("original_physical_receipt_invalid")
-    elif delta.get("status") == "length_bin_same_size_once":
+    elif delta.get("status") == "length_bin_same_size_rewrite":
         path = delta.get("path")
         if (
             not isinstance(path, str)
@@ -104,7 +104,37 @@ def _logical_original_physical_receipt(value: Any) -> dict[str, Any]:
             raise CustodyError("original_physical_receipt_invalid")
     else:
         raise CustodyError("original_physical_receipt_invalid")
-    return {key: child for key, child in receipt.items() if key != "direct_read_normalization_delta"}
+    graph_files = receipt.get("graph_files")
+    if not isinstance(graph_files, list):
+        raise CustodyError("original_physical_receipt_invalid")
+    length_entries = [
+        entry for entry in graph_files
+        if isinstance(entry, Mapping) and entry.get("name") == "length.bin"
+    ]
+    if len(length_entries) != 1:
+        raise CustodyError("original_physical_receipt_invalid")
+    length_entry = length_entries[0]
+    if (
+        set(length_entry) != {"name", "path", "bytes", "sha256"}
+        or not isinstance(length_entry.get("path"), str)
+        or not length_entry["path"].endswith("/length.bin")
+        or _int(length_entry.get("bytes"), "original_physical_receipt_invalid", positive=True) <= 0
+    ):
+        raise CustodyError("original_physical_receipt_invalid")
+    _hex(length_entry["sha256"], "original_physical_receipt_invalid")
+    _hex(receipt.get("immutable_backend_sha256"), "original_physical_receipt_invalid")
+    _hex(receipt.get("immutable_non_length_backend_sha256"), "original_physical_receipt_invalid")
+    scientific = {
+        key: child for key, child in receipt.items()
+        if key not in {"direct_read_normalization_delta", "immutable_backend_sha256"}
+    }
+    scientific["graph_files"] = [
+        {key: child for key, child in entry.items() if key != "sha256"}
+        if isinstance(entry, Mapping) and entry.get("name") == "length.bin"
+        else entry
+        for entry in graph_files
+    ]
+    return scientific
 
 
 def _hex(value: Any, code: str) -> str:
@@ -301,7 +331,7 @@ def _original_replicate(projection: Mapping[str, Any], value: Any) -> dict[str, 
         if expected is not None and index[key] != expected: raise CustodyError("original_index_receipt_invalid")
     physical_ids = [f"{corpus['corpus_id']}::aerp7::{candidate['message_id']}" for corpus in projection["corpora"] for candidate in corpus["candidates"]]
     expected_physical = {"physical_count": len(physical_ids), "physical_ids_sha256": _digest(sorted(physical_ids))}
-    required_physical = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "sqlite_semantic_sha256", "operational_delta", "direct_read_normalization_delta"}
+    required_physical = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "immutable_non_length_backend_sha256", "sqlite_semantic_sha256", "operational_delta", "direct_read_normalization_delta"}
     worker_raw = _object(index["worker_physical_receipt"], "original_physical_receipt_invalid"); coordinator_raw = _object(index["coordinator_physical_receipt"], "original_physical_receipt_invalid")
     if set(worker_raw) != required_physical or set(coordinator_raw) != required_physical:
         raise CustodyError("original_physical_receipt_invalid")
@@ -310,17 +340,18 @@ def _original_replicate(projection: Mapping[str, Any], value: Any) -> dict[str, 
         raise CustodyError("original_physical_receipt_invalid")
     embedding = _object(worker["embedding"], "original_physical_receipt_invalid")
     if set(embedding) != {"count", "dimension", "dtype", "float32_sha256"} or embedding.get("count") != len(physical_ids) or embedding.get("dimension") != 384 or embedding.get("dtype") != "float32": raise CustodyError("original_physical_receipt_invalid")
-    _hex(embedding.get("float32_sha256"), "original_physical_receipt_invalid"); _hex(worker.get("immutable_backend_sha256"), "original_physical_receipt_invalid"); _hex(worker.get("sqlite_semantic_sha256"), "original_physical_receipt_invalid")
+    _hex(embedding.get("float32_sha256"), "original_physical_receipt_invalid"); _hex(worker_raw.get("immutable_backend_sha256"), "original_physical_receipt_invalid"); _hex(worker.get("immutable_non_length_backend_sha256"), "original_physical_receipt_invalid"); _hex(worker.get("sqlite_semantic_sha256"), "original_physical_receipt_invalid")
     graphs = worker.get("graph_files")
     if not isinstance(graphs, list) or [entry.get("name") for entry in graphs if isinstance(entry, Mapping)] != list(ORIGINAL_GRAPH_NAMES): raise CustodyError("original_physical_receipt_invalid")
     graph_parents = set()
     for graph in graphs:
         graph = _object(graph, "original_physical_receipt_invalid")
-        if set(graph) != {"name", "path", "bytes", "sha256"} or not isinstance(graph["name"], str) or not graph["name"] or not isinstance(graph["path"], str) or not graph["path"] or _int(graph["bytes"], "original_physical_receipt_invalid", positive=True) < 1: raise CustodyError("original_physical_receipt_invalid")
+        expected_keys = {"name", "path", "bytes"} if graph.get("name") == "length.bin" else {"name", "path", "bytes", "sha256"}
+        if set(graph) != expected_keys or not isinstance(graph["name"], str) or not graph["name"] or not isinstance(graph["path"], str) or not graph["path"] or _int(graph["bytes"], "original_physical_receipt_invalid", positive=True) < 1: raise CustodyError("original_physical_receipt_invalid")
         parent, separator, basename = graph["path"].rpartition("/")
         if basename != graph["name"]: raise CustodyError("original_physical_receipt_invalid")
         graph_parents.add(f"{parent}{separator}")
-        _hex(graph["sha256"], "original_physical_receipt_invalid")
+        if graph["name"] != "length.bin": _hex(graph["sha256"], "original_physical_receipt_invalid")
     if len(graph_parents) != 1: raise CustodyError("original_physical_receipt_invalid")
     if worker["operational_delta"] != ORIGINAL_OPERATIONAL_DELTA: raise CustodyError("original_physical_receipt_invalid")
     if index["index_identity_sha256"] != _digest({"collection_identity": index["collection_identity"], "physical": worker_raw}): raise CustodyError("original_index_receipt_invalid")

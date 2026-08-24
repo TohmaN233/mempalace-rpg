@@ -145,9 +145,12 @@ def test_direct_dynamic_audit_receipts_the_one_allowed_length_bin_normalization(
         for row in after["immutable_snapshot"]
     ]
     assert receipt["immutable_backend_sha256"] == after["immutable_sha256"]
+    assert receipt["immutable_non_length_backend_sha256"] == original.v2.canonical_sha256([
+        row for row in after["immutable_snapshot"] if row["path"] != "segment/length.bin"
+    ])
     assert receipt["direct_read_normalization_delta"] == {
         "schema": "aerp7-hnsw-direct-read-normalization-v1",
-        "status": "length_bin_same_size_once",
+        "status": "length_bin_same_size_rewrite",
         "path": "segment/length.bin",
         "bytes": 400,
         "before_sha256": "a" * 64,
@@ -227,7 +230,7 @@ def fake_auditor(*, palace_path, expected_namespace):
         "embedding": {"count": len(ids), "dimension": 384, "dtype": "float32", "float32_sha256": h("vectors")},
         "hnsw_config": rank.ORIGINAL_HNSW_CONFIG,
         "graph_files": [{"name": name, "path": f"segment/{name}", "bytes": 1, "sha256": h(name)} for name in rank.ORIGINAL_GRAPH_NAMES],
-        "immutable_backend_sha256": h("immutable"), "sqlite_semantic_sha256": h("sqlite"),
+        "immutable_backend_sha256": h("immutable"), "immutable_non_length_backend_sha256": h("non-length-immutable"), "sqlite_semantic_sha256": h("sqlite"),
         "operational_delta": rank.ORIGINAL_OPERATIONAL_DELTA,
         "direct_read_normalization_delta": {"schema": rank.DIRECT_READ_NORMALIZATION_SCHEMA, "status": "none", "path": None, "bytes": None, "before_sha256": None, "after_sha256": None},
     }
@@ -314,7 +317,7 @@ def test_coordinator_compares_logical_index_state_not_the_observed_length_normal
                 **base,
                 "direct_read_normalization_delta": {
                     "schema": "aerp7-hnsw-direct-read-normalization-v1",
-                    "status": "length_bin_same_size_once",
+                    "status": "length_bin_same_size_rewrite",
                     "path": final_length["path"],
                     "bytes": final_length["bytes"],
                     "before_sha256": "a" * 64,
@@ -356,8 +359,52 @@ def test_coordinator_compares_logical_index_state_not_the_observed_length_normal
         auditor=auditor,
     )
     index = completed["index_receipt"]
-    assert index["worker_physical_receipt"]["direct_read_normalization_delta"]["status"] == "length_bin_same_size_once"
+    assert index["worker_physical_receipt"]["direct_read_normalization_delta"]["status"] == "length_bin_same_size_rewrite"
     assert index["coordinator_physical_receipt"]["direct_read_normalization_delta"]["status"] == "none"
+
+
+def test_coordinator_compares_non_length_hnsw_state_when_canonical_length_rewrites_between_processes(tmp_path):
+    p, observer = projection(), Observer()
+    injected, _palace, _state = seams()
+    namespace = original.original_identity_namespace(p)
+    base = fake_auditor(palace_path=tmp_path / "palace", expected_namespace=namespace)
+
+    def receipt(*, length_sha256, backend_sha256):
+        value = copy.deepcopy(base)
+        value["immutable_backend_sha256"] = backend_sha256
+        value["immutable_non_length_backend_sha256"] = h("same-non-length-backend")
+        for graph in value["graph_files"]:
+            if graph["name"] == "length.bin":
+                graph["sha256"] = length_sha256
+        return value
+
+    observed = iter([
+        receipt(length_sha256=h("worker-length"), backend_sha256=h("worker-raw-backend")),
+        receipt(length_sha256=h("coordinator-length"), backend_sha256=h("coordinator-raw-backend")),
+    ])
+    auditor = lambda **_kwargs: next(observed)
+    custom = original.OriginalProductSeams(
+        palace=injected.palace,
+        searcher=injected.searcher,
+        reset_backends=injected.reset_backends,
+        auditor=auditor,
+    )
+    draft = original.run_original_public_replicate(
+        projection=p,
+        build_id="cross-process-length-rewrite-build",
+        collection_identity="cross-process-length-rewrite-collection",
+        palace_path=tmp_path / "palace",
+        observer=observer,
+        seams=custom,
+    )
+    completed = original.coordinator_reaudit_replicate(
+        draft=draft,
+        palace_path=tmp_path / "palace",
+        projection=p,
+        auditor=auditor,
+    )
+    assert completed["index_receipt"]["worker_physical_receipt"]["immutable_backend_sha256"] == h("worker-raw-backend")
+    assert completed["index_receipt"]["coordinator_physical_receipt"]["immutable_backend_sha256"] == h("coordinator-raw-backend")
 
 
 def test_five_dynamic_replicates_wrap_into_the_strict_frozen_original_artifact(tmp_path):

@@ -492,7 +492,7 @@ def dynamic_original_index_build_receipt(*, palace_path: Path, expected_namespac
         raw = dict(auditor(palace_path=palace_path, expected_namespace=expected_namespace))
     else:
         raw = _direct_dynamic_audit(palace_path=palace_path, expected_ids=expected_ids)
-    required = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "sqlite_semantic_sha256", "operational_delta", "direct_read_normalization_delta"}
+    required = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "immutable_non_length_backend_sha256", "sqlite_semantic_sha256", "operational_delta", "direct_read_normalization_delta"}
     if set(raw) != required:
         raise OriginalProductError("original index audit receipt schema mismatch")
     expected = {"physical_count": len(expected_ids), "physical_ids_sha256": _digest(expected_ids)}
@@ -561,7 +561,7 @@ def _hnsw_direct_read_normalization_delta(before: Any, after: Any) -> dict[str, 
         return None
     return {
         "schema": "aerp7-hnsw-direct-read-normalization-v1",
-        "status": "length_bin_same_size_once",
+        "status": "length_bin_same_size_rewrite",
         "path": path,
         "bytes": left["bytes"],
         "before_sha256": left["sha256"],
@@ -616,6 +616,13 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
         if not isinstance(entry, Mapping) or set(entry) != {"path", "bytes", "sha256"}:
             raise OriginalProductError("direct original index audit canonical HNSW graph mismatch")
         graph_files.append({"name": name, **entry})
+    length_path = f"{parent}{separator}length.bin"
+    non_length_snapshot = [
+        row for row in after_storage["immutable_snapshot"]
+        if row["path"] != length_path
+    ]
+    if len(non_length_snapshot) + 1 != len(after_storage["immutable_snapshot"]):
+        raise OriginalProductError("direct original index audit non-length HNSW snapshot mismatch")
     ids, embeddings = stored.get("ids"), stored.get("embeddings")
     if not isinstance(ids, list) or sorted(ids) != list(expected_ids):
         raise OriginalProductError("original Chroma physical IDs differ from dynamic namespace")
@@ -625,6 +632,7 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
         "embedding": {"count": count, "dimension": dimension, "dtype": "float32", "float32_sha256": vector_sha},
         "hnsw_config": after_config, "graph_files": graph_files,
         "immutable_backend_sha256": after_storage["immutable_sha256"],
+        "immutable_non_length_backend_sha256": v2.canonical_sha256(non_length_snapshot),
         "sqlite_semantic_sha256": before_sqlite["semantic_sha256"],
         "operational_delta": v2._validated_acquire_write_delta(before_sqlite, after_sqlite),
         "direct_read_normalization_delta": normalization_delta,
