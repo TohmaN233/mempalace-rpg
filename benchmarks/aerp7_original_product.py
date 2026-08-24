@@ -848,7 +848,11 @@ def coordinator_reaudit_replicate(*, draft: OriginalProductWorkerDraft, palace_p
     except CustodyError as exc:
         raise OriginalProductError("worker/coordinator physical index normalization receipt mismatch") from exc
     if worker_scientific != measured_scientific:
-        raise OriginalProductError("worker/coordinator physical index receipt mismatch")
+        raise OriginalProductError(
+            "worker/coordinator physical index receipt mismatch: "
+            f"worker_scientific={_canonical_bytes(worker_scientific).decode('utf-8')}; "
+            f"measured_scientific={_canonical_bytes(measured_scientific).decode('utf-8')}"
+        )
     raw = dict(draft.replicate_without_coordinator_audit)
     index = raw.get("index_receipt")
     if not isinstance(index, Mapping) or set(index) != {"build_id", "fresh_build", "collection_identity", "index_identity_sha256", "cold_reopen", "call_contract", "input_coverage_sha256", "query_coverage_sha256", "output_coverage_sha256", "worker_physical_receipt"}:

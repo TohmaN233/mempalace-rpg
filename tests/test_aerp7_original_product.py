@@ -292,8 +292,12 @@ def test_coordinator_audit_must_equal_worker_and_observer_is_required(tmp_path):
     completed = original.coordinator_reaudit_replicate(draft=draft, palace_path=tmp_path / "palace", projection=p, auditor=fake_auditor)
     assert completed["index_receipt"]["coordinator_physical_receipt"]["physical_count"] == 22
     changed = {**draft.worker_physical_receipt, "sqlite_semantic_sha256": h("forged")}
-    with pytest.raises(original.OriginalProductError, match="worker/coordinator"):
+    with pytest.raises(original.OriginalProductError, match="worker/coordinator") as captured:
         original.coordinator_reaudit_replicate(draft=draft, palace_path=tmp_path / "palace", projection=p, auditor=lambda **_kwargs: changed)
+    message = str(captured.value)
+    assert "worker_scientific=" in message and "measured_scientific=" in message
+    assert draft.worker_physical_receipt["sqlite_semantic_sha256"] in message
+    assert changed["sqlite_semantic_sha256"] in message
 
 
 def test_coordinator_compares_logical_index_state_not_the_observed_length_normalization(
