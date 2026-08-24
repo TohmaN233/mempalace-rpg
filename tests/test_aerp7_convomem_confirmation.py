@@ -600,6 +600,81 @@ def test_streaming_path_normalizes_exact_duplicate_outer_rows_and_rejects_conten
         _publish(canonical=canonical, premix=premix, output=tmp_path / "empty-out", staging=_staging(tmp_path / "empty"))
 
 
+def test_exact_empty_message_text_is_normalized_with_raw_locator_ledger_and_other_types_fail(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
+    cases = json.loads(cases_path.read_text(encoding="utf-8"))
+    conversation = json.loads(json.dumps(cases[0]["conversations"][0]))
+    conversation["id"] = "independent-empty-text-conversation"
+    conversation["messages"] = [
+        conversation["messages"][0],
+        {"speaker": "assistant", "text": ""},
+        {"speaker": "user", "text": "after-empty"},
+    ]
+    cases[0]["conversations"].append(conversation)
+    _write(cases_path, cases)
+
+    nonstream_cases, _excluded = custody._premix(
+        [{"locator": "cases.json", "raw": cases_path.read_bytes()}], SECRET, "b" * 64,
+    )
+    nonstream_messages = [row for row in nonstream_cases[0]["messages"] if row["source_locator"]["conversation_id"] == conversation["id"]]
+    assert [(row["message_order"], row["source_locator"]["message_ordinal"]) for row in nonstream_messages] == [(0, 0), (1, 2)]
+
+    index = custody._streaming_index(
+        custody._subroot(canonical, "evidence_questions"),
+        custody._subroot(premix, "pre_mixed_testcases"), _staging(tmp_path / "first"),
+    )
+    try:
+        connection = __import__("sqlite3").connect(index.database)
+        try:
+            locator = custody._bytes({"path": "cases.json", "case_ordinal": 0}).decode()
+            messages = json.loads(connection.execute("SELECT messages FROM premix_cases WHERE locator=?", (locator,)).fetchone()[0])
+            assert connection.execute("SELECT count(*) FROM premix_exact_empty_message_text_normalizations").fetchone()[0] == 1
+        finally:
+            connection.close()
+        normalization = index.staging_receipt["premix_exact_empty_message_text_normalization"]
+    finally:
+        index.close()
+    normalized_messages = [row for row in messages if row["conversation_id"] == conversation["id"]]
+    assert [(row["message_ordinal"], row["source_locator"]["message_ordinal"]) for row in normalized_messages] == [(0, 0), (1, 2)]
+    assert normalization["schema"] == custody.PREMIX_EXACT_EMPTY_MESSAGE_TEXT_NORMALIZATION["schema"]
+    assert normalization["normalized_extra_row_count"] == normalization["normalized_case_count"] == 1
+    second_index = custody._streaming_index(
+        custody._subroot(canonical, "evidence_questions"),
+        custody._subroot(premix, "pre_mixed_testcases"), _staging(tmp_path / "second"),
+    )
+    try:
+        assert second_index.staging_receipt["premix_exact_empty_message_text_normalization"] == normalization
+    finally:
+        second_index.close()
+
+    output = tmp_path / "published"
+    _publish(
+        canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path / "published-staging"),
+        config=custody.SelectionConfig.census_v1(),
+    )
+    projection = custody.load_candidate_projection(output)
+    sealed = custody.load_sealed_custody(output, _custody_bundle(output), binding_secret=SECRET)
+    selected = next(item for item in sealed["items"] if item["source_locator"]["case"] == {"path": "cases.json", "case_ordinal": 0})
+    corpus = next(row for row in projection["corpora"] if row["corpus_id"] == selected["corpus_id"])
+    normalized_candidates = [
+        (row, locator) for row, locator in zip(corpus["candidates"], selected["messages"])
+        if locator["source_locator"]["conversation_id"] == conversation["id"]
+    ]
+    assert [(row["message_order"], locator["source_locator"]["message_ordinal"]) for row, locator in normalized_candidates] == [(0, 0), (1, 2)]
+
+    cases[0]["conversations"][-1]["messages"][1]["text"] = None
+    _write(cases_path, cases)
+    with pytest.raises(custody.CustodyError, match="premix_message_text_invalid") as error:
+        _stream = custody._streaming_index(
+            custody._subroot(canonical, "evidence_questions"),
+            custody._subroot(premix, "pre_mixed_testcases"), _staging(tmp_path / "invalid"),
+        )
+    assert error.value.receipt["locator"] == "cases.json"
+    assert error.value.receipt["case_ordinal"] == 0
+    assert error.value.receipt["text_type"] == "NoneType"
+
+
 @pytest.mark.parametrize("field", ("labels", "persona_source_id", "source_locator", "directory", "messages"))
 def test_recomputed_ready_cannot_bypass_keyed_custody_binding(tmp_path: Path, field: str) -> None:
     output = _build(tmp_path)
