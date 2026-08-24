@@ -832,7 +832,7 @@ def validate_original_index_build_receipt(receipt: Any, *, expected_namespace: M
 
 
 def _sqlite_hnsw_configuration_expected() -> dict[str, Any]:
-    return {"space": "cosine", "ef_construction": 100, "ef_search": 100, "max_neighbors": 16, "num_threads": 1, "batch_size": 2, "sync_threshold": 2, "resize_factor": 1.2}
+    return {"space": "cosine", "ef_construction": 100, "ef_search": 100, "max_neighbors": 16, "num_threads": 1, "batch_size": 100, "sync_threshold": 1000, "resize_factor": 1.2}
 
 
 def coordinator_original_index_build_receipt(*, palace_path: Path, expected_namespace: Mapping[str, Any]) -> dict[str, Any]:

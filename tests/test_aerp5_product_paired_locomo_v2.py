@@ -515,6 +515,19 @@ def test_sqlite_hnsw_configuration_drift_reports_canonical_resolved_and_expected
     )
 
 
+def test_formal_original_v380_hnsw_configuration_expected_values_are_pinned() -> None:
+    assert runner._sqlite_hnsw_configuration_expected() == {
+        "batch_size": 100,
+        "ef_construction": 100,
+        "ef_search": 100,
+        "max_neighbors": 16,
+        "num_threads": 1,
+        "resize_factor": 1.2,
+        "space": "cosine",
+        "sync_threshold": 1000,
+    }
+
+
 def test_original_identity_namespace_requires_exact_fixed_dialog_count():
     with pytest.raises(RuntimeError, match="exactly 5882"):
         runner.original_identity_namespace({"conversation": {"sessions": [{"dialogs": [{"opaque_dialog_id": "dialog_000000", "speaker": "s", "date": "d", "caption": "c", "text": "x"}]}]}})
