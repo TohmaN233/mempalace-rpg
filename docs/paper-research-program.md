@@ -97,13 +97,17 @@ hostile same-user containment.
 
 ## Pins and smoke evidence
 
-The exact original pin is commit
-`72ccd2f3653ab902e419d15bb542c88045342b04`, tree
-`5e4ad9cf1d6387cebe16dd03b6da8355d899f70c`, and model-tree SHA-256
+The formal primary common-base pin is official MemPalace v3.8.0: commit
+`87e6f38377b4bee0666374b05df6e14ffd154245`, tree
+`639b2a849816fd4853072920405822824464e9c6`, and model-tree SHA-256
 `76217893f057779cee29c903aa24444154ad0da7645853f1041fd970cca275a0`.
+The former 3.6.0 pin, commit `72ccd2f3653ab902e419d15bb542c88045342b04`
+and tree `5e4ad9cf1d6387cebe16dd03b6da8355d899f70c`, is historical-secondary
+only and is not a formal primary comparator.
 The formal path also binds interpreter/source import paths, clean Git state,
 driver code receipts, and model receipts. Current-worker provenance binds the
-reviewed `.venv/Scripts/python.exe` and `.venv/pyvenv.cfg` paths plus byte hashes.
+platform-native virtualenv interpreter (`.venv/Scripts/python.exe` on Windows,
+`.venv/bin/python` on POSIX) and `.venv/pyvenv.cfg` paths plus byte hashes.
 The source tree deliberately leaves local `.venv` untracked: the final clean
 checkpoint therefore uses an external runtime/checkpoint receipt with exact paths,
 byte hashes, and live revalidation evidence, while the review closure carries both

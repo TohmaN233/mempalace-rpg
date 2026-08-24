@@ -58,6 +58,17 @@ def test_venv_python_uses_the_host_family_layout(tmp_path):
         m._venv_python(tmp_path, os_name="unsupported")
 
 
+def test_formal_primary_original_pin_is_official_mempalace_v380() -> None:
+    assert (m.ORIGINAL_COMMIT, m.ORIGINAL_TREE) == (
+        "87e6f38377b4bee0666374b05df6e14ffd154245",
+        "639b2a849816fd4853072920405822824464e9c6",
+    )
+    assert (m.ORIGINAL_COMMIT, m.ORIGINAL_TREE) != (
+        "72ccd2f3653ab902e419d15bb542c88045342b04",
+        "5e4ad9cf1d6387cebe16dd03b6da8355d899f70c",
+    )
+
+
 def original_execution_policy():
     root=Path('E:/MemPalaceWorkspace/repos/mempalace').resolve()
     return m.capture_original_execution_policy(
