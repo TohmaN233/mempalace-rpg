@@ -278,7 +278,7 @@ def _files(root: Path) -> list[Path]:
             continue
         if path.suffix != ".json" or ({"filler_conversations", "legacy_benchmarks"} & set(path.relative_to(root).parts)):
             continue
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or _is_reparse(metadata):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink < 1 or _is_reparse(metadata):
             raise CustodyError("official_json_symlink")
         # Every directory ancestor from the official subroot to this file must
         # be a real directory; rglob alone is not an authorization check.
@@ -671,6 +671,39 @@ def _snapshot(path: Path, code: str, *, retain: bool = True) -> tuple[bytes, tup
     return b"".join(chunks), identity, digest.hexdigest()
 
 
+def _source_snapshot(path: Path, code: str, *, retain: bool = True) -> tuple[bytes, tuple[int, int], str]:
+    """Read an official source file from a stable regular-file snapshot.
+
+    Official inputs may be ordinary hardlinks to a Git LFS object cache.  This
+    is intentionally separate from ``_snapshot``: all staging, index, output,
+    and publication artifacts remain private files with exactly one link.
+    """
+    try: before = os.lstat(path)
+    except OSError as exc: raise CustodyError(code) from exc
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink < 1 or _is_reparse(before): raise CustodyError(code)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try: descriptor = os.open(path, flags)
+    except OSError as exc: raise CustodyError(code) from exc
+    identity = (before.st_dev, before.st_ino)
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_nlink) != (before.st_dev, before.st_ino, before.st_size, before.st_nlink) or _is_reparse(opened)):
+            raise CustodyError(code)
+        chunks = []; digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk: break
+            if retain: chunks.append(chunk)
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    try: after = os.lstat(path)
+    except OSError as exc: raise CustodyError(code) from exc
+    if (not stat.S_ISREG(after.st_mode) or _is_reparse(after) or (after.st_dev, after.st_ino, after.st_size, after.st_nlink) != (before.st_dev, before.st_ino, before.st_size, before.st_nlink)):
+        raise CustodyError(code)
+    return b"".join(chunks), identity, digest.hexdigest()
+
+
 def _decode(raw: bytes, code: str) -> Any:
     try: return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc: raise CustodyError(code) from exc
@@ -687,13 +720,13 @@ def _ijson() -> Any:
 def _copy_source_once(path: Path, destination: Path, *, on_staged_created: Callable[[tuple[int, int]], None] | None = None) -> tuple[tuple[int, int], str]:
     """Stream one official descriptor into staging while hashing its exact byte snapshot."""
     before = os.lstat(path)
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or _is_reparse(before): raise CustodyError("official_source_file_invalid")
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink < 1 or _is_reparse(before): raise CustodyError("official_source_file_invalid")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags); digest = hashlib.sha256(); staged_identity: tuple[int, int] | None = None; identity = (before.st_dev, before.st_ino)
     try:
         try:
             opened = os.fstat(descriptor)
-            if (opened.st_dev, opened.st_ino) != identity or opened.st_nlink != 1 or opened.st_size != before.st_size: raise CustodyError("official_source_file_invalid")
+            if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != identity or opened.st_nlink != before.st_nlink or opened.st_size != before.st_size or _is_reparse(opened)): raise CustodyError("official_source_file_invalid")
             with destination.open("xb") as staged:
                 created = os.fstat(staged.fileno())
                 if not stat.S_ISREG(created.st_mode) or created.st_nlink != 1 or _is_reparse(created):
@@ -707,7 +740,7 @@ def _copy_source_once(path: Path, destination: Path, *, on_staged_created: Calla
                     digest.update(chunk); staged.write(chunk)
                 staged.flush(); os.fsync(staged.fileno())
             after = os.lstat(path)
-            if (after.st_dev, after.st_ino) != identity or after.st_nlink != 1 or after.st_size != before.st_size or _is_reparse(after): raise CustodyError("official_source_drift")
+            if (not stat.S_ISREG(after.st_mode) or (after.st_dev, after.st_ino) != identity or after.st_nlink != before.st_nlink or after.st_size != before.st_size or _is_reparse(after)): raise CustodyError("official_source_drift")
             return identity, digest.hexdigest()
         except Exception:
             if staged_identity is not None:
@@ -769,17 +802,17 @@ def _source_size_inventory(canonical_root: Path, premix_root: Path) -> dict[str,
     for role, root in (("canonical", canonical_root), ("premix", premix_root)):
         for path in _files(root):
             before = os.lstat(path)
-            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or _is_reparse(before):
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink < 1 or _is_reparse(before):
                 raise CustodyError("source_size_inventory_invalid")
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
             try:
                 opened = os.fstat(descriptor)
             finally:
                 os.close(descriptor)
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or opened.st_size != before.st_size or opened.st_nlink != 1:
+            if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or opened.st_size != before.st_size or opened.st_nlink != before.st_nlink or _is_reparse(opened)):
                 raise CustodyError("source_size_inventory_invalid")
             after = os.lstat(path)
-            if (after.st_dev, after.st_ino, after.st_size, after.st_nlink) != (before.st_dev, before.st_ino, before.st_size, before.st_nlink):
+            if (not stat.S_ISREG(after.st_mode) or _is_reparse(after) or (after.st_dev, after.st_ino, after.st_size, after.st_nlink) != (before.st_dev, before.st_ino, before.st_size, before.st_nlink)):
                 raise CustodyError("source_size_inventory_drift")
             total += before.st_size; maximum = max(maximum, before.st_size); count += 1
             rows.append({"role": role, "locator": path.relative_to(root).as_posix(), "identity": [before.st_dev, before.st_ino], "size": before.st_size})
@@ -1091,7 +1124,7 @@ def _verify_streaming_sources(canonical_root: Path, premix_root: Path, index: St
         if len(files) != len(expected) or [path.relative_to(root).as_posix() for path in files] != [row["locator"] for row in expected]:
             raise CustodyError(code)
         for path, row in zip(files, expected):
-            _raw, identity, digest = _snapshot(path, code, retain=False)
+            _raw, identity, digest = _source_snapshot(path, code, retain=False)
             if list(identity) != row["identity"] or path.stat().st_size != row["size"] or digest != row["sha256"]:
                 raise CustodyError(code)
 

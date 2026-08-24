@@ -291,6 +291,85 @@ def test_hardlink_staging_is_rejected_without_ready(tmp_path: Path, monkeypatch:
     assert custody.load_candidate_projection(output)["items"]
 
 
+def test_hardlinked_official_source_is_accepted_and_staged_as_a_private_copy(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    canonical_root = custody._subroot(canonical, "evidence_questions")
+    source = next(path for path in canonical_root.rglob("*.json") if "legacy_benchmarks" not in path.parts)
+    lfs_object = tmp_path / "lfs-object"
+    os.link(source, lfs_object)
+    assert os.lstat(source).st_nlink == 2
+
+    assert source in custody._files(canonical_root)
+    inventory = custody._source_size_inventory(canonical_root, custody._subroot(premix, "pre_mixed_testcases"))
+    assert inventory["source_file_count"] == 5
+
+    staged = tmp_path / "stage.json"
+    identity, _digest = custody._copy_source_once(source, staged)
+    assert identity == (os.lstat(source).st_dev, os.lstat(source).st_ino)
+    assert os.lstat(staged).st_nlink == 1
+
+    output = tmp_path / "bundle"
+    _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path))
+    assert custody.load_candidate_projection(output)["items"]
+
+
+def test_official_source_snapshot_rejects_symlink_and_reparse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source.json"
+    source.write_text("[]", encoding="utf-8")
+    alias = tmp_path / "source-alias.json"
+    try:
+        os.symlink(source, alias)
+    except OSError:
+        pass
+    else:
+        with pytest.raises(custody.CustodyError, match="official_source_invalid"):
+            custody._source_snapshot(alias, "official_source_invalid")
+    monkeypatch.setattr(custody, "_is_reparse", lambda _metadata: True)
+    with pytest.raises(custody.CustodyError, match="official_source_invalid"):
+        custody._source_snapshot(source, "official_source_invalid")
+
+
+@pytest.mark.parametrize("drift", ("identity", "size", "nlink"))
+def test_official_source_snapshot_rejects_identity_size_and_link_count_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str) -> None:
+    source = tmp_path / "source.json"
+    source.write_text("[]", encoding="utf-8")
+    lfs_object = tmp_path / "lfs-object"
+    os.link(source, lfs_object)
+    original_read = custody.os.read
+    mutated = False
+
+    if drift == "identity":
+        original_lstat = custody.os.lstat
+        calls = 0
+
+        def replace_identity(path: str | Path, *args: object, **kwargs: object) -> os.stat_result | SimpleNamespace:
+            nonlocal calls
+            metadata = original_lstat(path, *args, **kwargs)
+            if Path(path) == source:
+                calls += 1
+                if calls == 2:
+                    return SimpleNamespace(st_mode=metadata.st_mode, st_nlink=metadata.st_nlink, st_dev=metadata.st_dev, st_ino=metadata.st_ino + 1, st_size=metadata.st_size)
+            return metadata
+
+        monkeypatch.setattr(custody.os, "lstat", replace_identity)
+
+    def mutate(descriptor: int, size: int) -> bytes:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            if drift == "size":
+                with source.open("ab") as stream:
+                    stream.write(b"\n")
+            elif drift == "nlink":
+                lfs_object.unlink()
+        return original_read(descriptor, size)
+
+    if drift != "identity":
+        monkeypatch.setattr(custody.os, "read", mutate)
+    with pytest.raises(custody.CustodyError, match="official_source_drift"):
+        custody._source_snapshot(source, "official_source_drift")
+
+
 def test_pinned_source_drift_and_conflicting_repeated_conversation_fail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     canonical, premix = _roots(tmp_path)
     cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
