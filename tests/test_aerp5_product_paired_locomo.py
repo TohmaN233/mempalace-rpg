@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +18,48 @@ def _dialogs(count: int = 10):
 
 def test_original_product_pin_matches_the_formal_primary_comparator() -> None:
     assert runner.ORIGINAL_PIN == aerp8.ORIGINAL_COMMIT == "87e6f38377b4bee0666374b05df6e14ffd154245"
+
+
+def test_load_original_product_keeps_protocol_current_and_product_modules_original(
+    monkeypatch, tmp_path
+) -> None:
+    original_root = tmp_path / "official-v380"
+    package = original_root / "mempalace"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "palace.py").write_text("ORIGIN = 'official-v380'\n", encoding="utf-8")
+    (package / "searcher.py").write_text("ORIGIN = 'official-v380'\n", encoding="utf-8")
+    expected_state = {"git_head": runner.ORIGINAL_PIN, "git_dirty": False}
+    monkeypatch.setattr(runner, "require_clean_pinned_original", lambda root: expected_state)
+    module_names = [
+        name
+        for name in sys.modules
+        if name == "mempalace" or name.startswith("mempalace.")
+    ]
+    for name in module_names:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    try:
+        palace, searcher, protocol, state = runner.load_original_product(original_root)
+        assert Path(palace.__file__).resolve().is_relative_to(original_root.resolve())
+        assert Path(searcher.__file__).resolve().is_relative_to(original_root.resolve())
+        assert Path(protocol.__file__).resolve() == runner.FROZEN_PROTOCOL_PATH.resolve()
+        assert state == expected_state
+    finally:
+        for name in tuple(sys.modules):
+            if name == "mempalace" or name.startswith("mempalace."):
+                sys.modules.pop(name, None)
+        sys.modules.pop("_aerp5_frozen_locomo_protocol", None)
+
+
+def test_frozen_protocol_asset_matches_its_recorded_source_receipt() -> None:
+    assert runner.FROZEN_PROTOCOL_SOURCE == {
+        "repository": "local historical MemPalace evaluation protocol",
+        "commit": "429e11ced3529a3409509026a62fb3bb5ec43c77",
+        "sha256": "f0e5b3ec3045b83149d36347435b65c1ff7ee92e9597e74cdf4c0cd636394341",
+    }
+    assert hashlib.sha256(runner.FROZEN_PROTOCOL_PATH.read_bytes()).hexdigest() == (
+        runner.FROZEN_PROTOCOL_SOURCE["sha256"]
+    )
 
 
 class _Collection:

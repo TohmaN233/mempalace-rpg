@@ -32,6 +32,12 @@ from mempalace_rpg import RawAnchoredP5Policy, RpgMemoryKernel, SixViewRanker
 
 ROOT = Path(__file__).resolve().parents[1]
 ORIGINAL_PIN = "87e6f38377b4bee0666374b05df6e14ffd154245"
+FROZEN_PROTOCOL_PATH = ROOT / "benchmarks" / "locomo_story_protocol.py"
+FROZEN_PROTOCOL_SOURCE = {
+    "repository": "local historical MemPalace evaluation protocol",
+    "commit": "429e11ced3529a3409509026a62fb3bb5ec43c77",
+    "sha256": "f0e5b3ec3045b83149d36347435b65c1ff7ee92e9597e74cdf4c0cd636394341",
+}
 TOP_K = 10
 ORIGINAL_COLLECTION = "mempalace_drawers"
 REHEARSAL_SCOPE = "engineering_rehearsal_public_nonblind"
@@ -190,9 +196,7 @@ def load_original_product(original_root: Path) -> tuple[Any, Any, Any, dict[str,
         import mempalace.palace as palace  # type: ignore[import-not-found]
         import mempalace.searcher as searcher  # type: ignore[import-not-found]
 
-        protocol = _load_module(
-            "_aerp5_original_locomo_protocol", root / "benchmarks" / "locomo_story_protocol.py"
-        )
+        protocol = _load_module("_aerp5_frozen_locomo_protocol", FROZEN_PROTOCOL_PATH)
     finally:
         sys.path[:] = old_path
     return palace, searcher, protocol, state
