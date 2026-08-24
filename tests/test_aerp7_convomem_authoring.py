@@ -37,7 +37,7 @@ def test_signed_one_shot_plan_is_exact_and_rejects_path_or_hmac_drift(tmp_path: 
         "custodian_expires_at_unix": 2_000_000_000,
         "source_manifest": authoring.CENSUS_SOURCE_MANIFEST,
         "census_semantics": authoring.CENSUS_SEMANTICS,
-        "preparse_current_code_receipt": {"head": "a" * 64, "tree": "b" * 64, "diff_digest": "c" * 64, "dirty_policy": "clean_required"},
+        "preparse_current_code_receipt": {"head": "a" * 40, "tree": "b" * 40, "diff_digest": "c" * 64, "dirty_policy": "clean_required"},
         "model_receipt": {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": hashlib.sha256(b"w").hexdigest(), "bytes": 1}]},
     }
     plan = authoring.sign_one_shot_plan(fields, operator_capability=secret)
@@ -140,7 +140,7 @@ def test_aerp8_binding_keeps_immutable_driver_sources_live_while_sealing_new_orc
         def _validate_original_execution_policy(value): return dict(value)
     external["checkpoint_sha256"] = Aerp8.digest({key: value for key, value in external.items() if key != "checkpoint_sha256"})
     monkeypatch.setattr(checkpoint, "_aerp8", lambda: Aerp8)
-    code = {"head": "a" * 64, "tree": "b" * 64, "diff_digest": "c" * 64, "dirty_policy": "clean_required"}
+    code = {"head": "a" * 40, "tree": "b" * 40, "diff_digest": "c" * 64, "dirty_policy": "clean_required"}
     binding = checkpoint.capture_binding(expected_checkpoint_path=expected.resolve(), current_code_receipt=code)
     assert binding["aerp8_validation_scope"] == checkpoint.IMMUTABLE_SCOPE and binding["current_code_receipt"] == code
     source.write_bytes(b"drift")

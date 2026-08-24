@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from benchmarks import aerp7_convomem_rank as rank
 from benchmarks.aerp7_convomem_confirmation import CustodyError
 
 
@@ -37,8 +38,9 @@ def _clean_code_receipt(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != {"head", "tree", "diff_digest", "dirty_policy"} or value.get("dirty_policy") != "clean_required":
         raise CustodyError("aerp7_checkpoint_current_code_invalid")
     row = dict(value)
-    for key in ("head", "tree", "diff_digest"):
-        _hex(row.get(key), "aerp7_checkpoint_current_code_invalid")
+    for key in ("head", "tree"):
+        rank._git_object_id(row.get(key), "aerp7_checkpoint_current_code_invalid")
+    _hex(row.get("diff_digest"), "aerp7_checkpoint_current_code_invalid")
     return row
 
 

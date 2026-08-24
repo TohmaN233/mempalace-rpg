@@ -89,8 +89,9 @@ def _code_receipt(value: Any, code: str) -> dict[str, Any]:
     row = _obj(value, code)
     if set(row) != {"head", "tree", "diff_digest", "dirty_policy"} or row.get("dirty_policy") != "clean_required":
         raise CustodyError(code)
-    for key in ("head", "tree", "diff_digest"):
-        _hex(row.get(key), code)
+    for key in ("head", "tree"):
+        rank._git_object_id(row.get(key), code)
+    _hex(row.get("diff_digest"), code)
     return row
 
 

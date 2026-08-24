@@ -299,6 +299,18 @@ def test_receipts_require_real_model_files_and_clean_formal_code_policy():
     with pytest.raises(CustodyError): rank.rank_projection(projection=p, encoder=Encoder(), arm_id="strong_raw", model_receipt=model, code_receipt=code)
 
 
+def test_code_receipt_accepts_git_sha1_object_ids_but_keeps_diff_sha256():
+    p = projection(); model, code = receipts()
+    code["head"], code["tree"] = h("head")[:40], h("tree")[:40]
+    assert rank.rank_projection(projection=p, encoder=Encoder(), arm_id="strong_raw", model_receipt=model, code_receipt=code)["code_receipt"] == code
+    bad_object = copy.deepcopy(code); bad_object["head"] = "a" * 39
+    with pytest.raises(CustodyError, match="code_receipt_invalid"):
+        rank.rank_projection(projection=p, encoder=Encoder(), arm_id="strong_raw", model_receipt=model, code_receipt=bad_object)
+    bad_content = copy.deepcopy(code); bad_content["diff_digest"] = "c" * 40
+    with pytest.raises(CustodyError, match="code_receipt_invalid"):
+        rank.rank_projection(projection=p, encoder=Encoder(), arm_id="strong_raw", model_receipt=model, code_receipt=bad_content)
+
+
 def test_fcd1_semantics_and_independent_original_index_identities_are_not_just_hashes():
     p=projection(); model, code=receipts(); artifact=rank.rank_projection(projection=p,encoder=Encoder(),arm_id="static_p5",model_receipt=model,code_receipt=code)
     def reseal_current(value):

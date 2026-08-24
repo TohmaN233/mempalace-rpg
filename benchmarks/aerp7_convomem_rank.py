@@ -267,6 +267,13 @@ def _hex(value: Any, code: str) -> str:
     return value
 
 
+def _git_object_id(value: Any, code: str) -> str:
+    """Validate Git SHA-1/SHA-256 object IDs without weakening content hashes."""
+    if not isinstance(value, str) or len(value) not in (40, 64) or any(char not in "0123456789abcdef" for char in value):
+        raise CustodyError(code)
+    return value
+
+
 def _int(value: Any, code: str, *, positive: bool = False) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or (positive and value <= 0):
         raise CustodyError(code)
@@ -327,8 +334,9 @@ def _validate_code_receipt(value: Any) -> dict[str, Any]:
     row = _object(value, "code_receipt_invalid")
     if set(row) != {"head", "tree", "diff_digest", "dirty_policy"} or row.get("dirty_policy") != "clean_required":
         raise CustodyError("code_receipt_formal_clean_required")
-    for key in ("head", "tree", "diff_digest"):
-        _hex(row.get(key), "code_receipt_invalid")
+    for key in ("head", "tree"):
+        _git_object_id(row.get(key), "code_receipt_invalid")
+    _hex(row.get("diff_digest"), "code_receipt_invalid")
     return row
 
 

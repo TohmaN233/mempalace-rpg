@@ -62,7 +62,11 @@ def clean_code_receipt_shape(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping) or set(value) != {"head", "tree", "diff_digest", "dirty_policy"} or value.get("dirty_policy") != "clean_required":
         return None
     row = dict(value)
-    if any(not isinstance(row[key], str) or len(row[key]) != 64 or any(ch not in "0123456789abcdef" for ch in row[key]) for key in ("head", "tree", "diff_digest")):
+    try:
+        rank._git_object_id(row.get("head"), "aerp7_one_shot_plan_invalid")
+        rank._git_object_id(row.get("tree"), "aerp7_one_shot_plan_invalid")
+        rank._hex(row.get("diff_digest"), "aerp7_one_shot_plan_invalid")
+    except CustodyError:
         return None
     return row
 

@@ -27,7 +27,7 @@ class Encoder:
 
 
 def receipts():
-    return ({"encoder_identity": Encoder.identity, "encoder_semantics": "deterministic", "files": copy.deepcopy(_MODEL_FILES)}, {"head": h("head"), "tree": h("tree"), "diff_digest": h("diff"), "dirty_policy": "clean_required"})
+    return ({"encoder_identity": Encoder.identity, "encoder_semantics": "deterministic", "files": copy.deepcopy(_MODEL_FILES)}, {"head": h("head")[:40], "tree": h("tree")[:40], "diff_digest": h("diff"), "dirty_policy": "clean_required"})
 
 
 def projection():
