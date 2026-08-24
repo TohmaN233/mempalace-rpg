@@ -293,11 +293,9 @@ def _validate_worker_draft_components(*, projection: Any, namespace: Any, replic
         raise OriginalProductError("worker draft input/trace receipt mismatch")
     if index["build_id"] != raw["build_id"] or index["index_identity_sha256"] != _digest({"collection_identity": index["collection_identity"], "physical": worker_physical_receipt}):
         raise OriginalProductError("worker draft index identity mismatch")
-    # Reuse the frozen rank validator with a local proof-only coordinator copy.
-    # This is never returned or published; it solely validates all ranking rows.
-    proof_index = dict(index); proof_index["coordinator_physical_receipt"] = dict(worker_physical_receipt)
-    proof = dict(raw); proof["index_receipt"] = proof_index; proof["index_sha256"] = _digest(proof_index)
-    rank._original_replicate(frozen, proof)
+    # A worker receipt is complete evidence in its own right, but has no
+    # coordinator observation yet.  Validate it without inventing a handoff.
+    rank._worker_original_replicate(frozen, raw)
     return frozen, dict(namespace), raw, dict(worker_physical_receipt)
 
 
@@ -492,7 +490,7 @@ def dynamic_original_index_build_receipt(*, palace_path: Path, expected_namespac
         raw = dict(auditor(palace_path=palace_path, expected_namespace=expected_namespace))
     else:
         raw = _direct_dynamic_audit(palace_path=palace_path, expected_ids=expected_ids)
-    required = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "immutable_non_length_backend_sha256", "sqlite_semantic_sha256", "operational_delta", "direct_read_normalization_delta"}
+    required = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "immutable_non_length_backend_sha256", "immutable_residual_backend_sha256", "sqlite_semantic_sha256", "operational_delta", "direct_read_normalization_delta"}
     if set(raw) != required:
         raise OriginalProductError("original index audit receipt schema mismatch")
     expected = {"physical_count": len(expected_ids), "physical_ids_sha256": _digest(expected_ids)}
@@ -512,7 +510,14 @@ def dynamic_original_index_build_receipt(*, palace_path: Path, expected_namespac
 
 
 def _hnsw_direct_read_normalization_delta(before: Any, after: Any) -> dict[str, Any] | None:
-    """Classify the sole observed v3.8 direct-read byte normalization."""
+    """Classify the observed v3.8 direct-read byte normalizations.
+
+    A fresh Chroma direct-read client may rewrite the canonical HNSW
+    ``length.bin`` alone, or may rewrite the same-sized ``data_level0.bin`` and
+    ``length.bin`` pair.  Neither transition is accepted unless every other
+    persisted non-SQLite byte is unchanged; callers also recheck IDs, vectors,
+    HNSW configuration, and SQLite semantics after the read.
+    """
     if not isinstance(before, list) or not isinstance(after, list):
         return None
     required = {"path", "bytes", "sha256"}
@@ -546,26 +551,51 @@ def _hnsw_direct_read_normalization_delta(before: Any, after: Any) -> dict[str, 
         return None
     parent, separator, _name = data_level_paths[0].rpartition("/")
     canonical_length_path = f"{parent}{separator}length.bin"
-    if len(changed) != 1 or changed[0] != canonical_length_path:
-        return None
-    path = changed[0]
-    left, right = before_by_path[path], after_by_path[path]
-    if (
-        not isinstance(left["bytes"], int)
-        or isinstance(left["bytes"], bool)
-        or left["bytes"] <= 0
-        or left["bytes"] != right["bytes"]
-        or any(not isinstance(row["sha256"], str) or len(row["sha256"]) != 64 or any(char not in "0123456789abcdef" for char in row["sha256"]) for row in (left, right))
-        or left["sha256"] == right["sha256"]
+    def same_sized_rewrite(path: str) -> bool:
+        left, right = before_by_path[path], after_by_path[path]
+        return (
+            isinstance(left["bytes"], int)
+            and not isinstance(left["bytes"], bool)
+            and left["bytes"] > 0
+            and left["bytes"] == right["bytes"]
+            and all(
+                isinstance(row["sha256"], str)
+                and len(row["sha256"]) == 64
+                and not any(char not in "0123456789abcdef" for char in row["sha256"])
+                for row in (left, right)
+            )
+            and left["sha256"] != right["sha256"]
+        )
+    if changed == [canonical_length_path] and same_sized_rewrite(canonical_length_path):
+        path = canonical_length_path
+        left, right = before_by_path[path], after_by_path[path]
+        return {
+            "schema": "aerp7-hnsw-direct-read-normalization-v1",
+            "status": "length_bin_same_size_rewrite",
+            "path": path,
+            "bytes": left["bytes"],
+            "before_sha256": left["sha256"],
+            "after_sha256": right["sha256"],
+        }
+    canonical_data_path = data_level_paths[0]
+    if set(changed) != {canonical_data_path, canonical_length_path} or not all(
+        same_sized_rewrite(path) for path in (canonical_data_path, canonical_length_path)
     ):
         return None
+    # The v2 envelope retains both canonical transitions, binding each final
+    # graph-file byte digest while rejecting every other file/size transition.
+    path = canonical_data_path
+    left, right = before_by_path[path], after_by_path[path]
     return {
-        "schema": "aerp7-hnsw-direct-read-normalization-v1",
-        "status": "length_bin_same_size_rewrite",
-        "path": path,
-        "bytes": left["bytes"],
-        "before_sha256": left["sha256"],
-        "after_sha256": right["sha256"],
+        "schema": rank.PAIRED_DIRECT_READ_NORMALIZATION_SCHEMA,
+        "status": "data_level0_and_length_same_size_rewrite",
+        "transitions": [
+            {"path": path, "bytes": left["bytes"], "before_sha256": left["sha256"], "after_sha256": right["sha256"]}
+            for path, left, right in (
+                (canonical_data_path, before_by_path[canonical_data_path], after_by_path[canonical_data_path]),
+                (canonical_length_path, before_by_path[canonical_length_path], after_by_path[canonical_length_path]),
+            )
+        ],
     }
 
 
@@ -623,6 +653,12 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
     ]
     if len(non_length_snapshot) + 1 != len(after_storage["immutable_snapshot"]):
         raise OriginalProductError("direct original index audit non-length HNSW snapshot mismatch")
+    residual_snapshot = [
+        row for row in after_storage["immutable_snapshot"]
+        if row["path"] not in {data_level_paths[0], length_path}
+    ]
+    if len(residual_snapshot) + 2 != len(after_storage["immutable_snapshot"]):
+        raise OriginalProductError("direct original index audit residual HNSW snapshot mismatch")
     ids, embeddings = stored.get("ids"), stored.get("embeddings")
     if not isinstance(ids, list) or sorted(ids) != list(expected_ids):
         raise OriginalProductError("original Chroma physical IDs differ from dynamic namespace")
@@ -633,6 +669,7 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
         "hnsw_config": after_config, "graph_files": graph_files,
         "immutable_backend_sha256": after_storage["immutable_sha256"],
         "immutable_non_length_backend_sha256": v2.canonical_sha256(non_length_snapshot),
+        "immutable_residual_backend_sha256": v2.canonical_sha256(residual_snapshot),
         "sqlite_semantic_sha256": before_sqlite["semantic_sha256"],
         "operational_delta": v2._validated_acquire_write_delta(before_sqlite, after_sqlite),
         "direct_read_normalization_delta": normalization_delta,
@@ -851,10 +888,20 @@ def coordinator_reaudit_replicate(*, draft: OriginalProductWorkerDraft, palace_p
     measured = dynamic_original_index_build_receipt(palace_path=palace_path, expected_namespace=draft.namespace, auditor=auditor)
     worker = draft.worker_physical_receipt
     try:
-        worker_scientific = rank._logical_original_physical_receipt(worker)
-        measured_scientific = rank._logical_original_physical_receipt(measured)
+        worker_scientific, measured_scientific = rank._joint_original_physical_receipts(worker, measured)
     except CustodyError as exc:
-        raise OriginalProductError("worker/coordinator physical index normalization receipt mismatch") from exc
+        try:
+            worker_detail = _canonical_bytes(rank._logical_original_physical_receipt(worker)).decode("utf-8")
+        except CustodyError:
+            worker_detail = "<invalid>"
+        try:
+            measured_detail = _canonical_bytes(rank._logical_original_physical_receipt(measured)).decode("utf-8")
+        except CustodyError:
+            measured_detail = "<invalid>"
+        raise OriginalProductError(
+            "worker/coordinator physical index normalization receipt mismatch: "
+            f"worker_scientific={worker_detail}; measured_scientific={measured_detail}"
+        ) from exc
     if worker_scientific != measured_scientific:
         raise OriginalProductError(
             "worker/coordinator physical index receipt mismatch: "

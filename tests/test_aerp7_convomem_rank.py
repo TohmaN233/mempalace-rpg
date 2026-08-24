@@ -35,7 +35,7 @@ def original_replicates(p):
         rows = [{**{key: value for key, value in row.items() if key not in {"confidence", "confidence_receipt"}}, "candidate_input_sha256": rank._candidate_input(p["corpora"][0], rank.ORIGINAL_MEMPALACE_SERIALIZER), "confidence": None, "confidence_receipt": None} for row in current["rankings"]]
         trace = [{key: value for key, value in row.items() if key in {"item_id", "query_sha256", "ranked_count", "ranking_sha256"}} for row in current["trace_receipt"]]
         for row in trace: row["candidate_input_sha256"] = rank._candidate_input(p["corpora"][0], rank.ORIGINAL_MEMPALACE_SERIALIZER)
-        input_receipt = rank._input_receipt(p, rank.ORIGINAL_MEMPALACE_SERIALIZER); physical_ids=[f"{corpus['corpus_id']}::aerp7::{candidate['message_id']}" for corpus in p["corpora"] for candidate in corpus["candidates"]]; physical={"physical_count":len(physical_ids),"physical_ids_sha256":rank._digest(sorted(physical_ids)),"embedding":{"count":len(physical_ids),"dimension":384,"dtype":"float32","float32_sha256":h("embedding"+str(number))},"hnsw_config":rank.ORIGINAL_HNSW_CONFIG,"graph_files":[{"name":name,"path":f"segment/{name}","bytes":1,"sha256":h(f"graph-{number}-{name}")} for name in rank.ORIGINAL_GRAPH_NAMES],"immutable_backend_sha256":h("backend"+str(number)),"immutable_non_length_backend_sha256":h("non-length-backend"+str(number)),"sqlite_semantic_sha256":h("sqlite"+str(number)),"operational_delta":rank.ORIGINAL_OPERATIONAL_DELTA,"direct_read_normalization_delta":{"schema":rank.DIRECT_READ_NORMALIZATION_SCHEMA,"status":"none","path":None,"bytes":None,"before_sha256":None,"after_sha256":None}}
+        input_receipt = rank._input_receipt(p, rank.ORIGINAL_MEMPALACE_SERIALIZER); physical_ids=[f"{corpus['corpus_id']}::aerp7::{candidate['message_id']}" for corpus in p["corpora"] for candidate in corpus["candidates"]]; physical={"physical_count":len(physical_ids),"physical_ids_sha256":rank._digest(sorted(physical_ids)),"embedding":{"count":len(physical_ids),"dimension":384,"dtype":"float32","float32_sha256":h("embedding"+str(number))},"hnsw_config":rank.ORIGINAL_HNSW_CONFIG,"graph_files":[{"name":name,"path":f"segment/{name}","bytes":1,"sha256":h(f"graph-{number}-{name}")} for name in rank.ORIGINAL_GRAPH_NAMES],"immutable_backend_sha256":h("backend"+str(number)),"immutable_non_length_backend_sha256":h("non-length-backend"+str(number)),"immutable_residual_backend_sha256":h("residual-backend"+str(number)),"sqlite_semantic_sha256":h("sqlite"+str(number)),"operational_delta":rank.ORIGINAL_OPERATIONAL_DELTA,"direct_read_normalization_delta":{"schema":rank.DIRECT_READ_NORMALIZATION_SCHEMA,"status":"none","path":None,"bytes":None,"before_sha256":None,"after_sha256":None}}
         index_receipt = {"build_id": "build-" + str(number), "fresh_build": True, "collection_identity": "collection-" + str(number), "index_identity_sha256": "", "cold_reopen": True, "call_contract": rank.ORIGINAL_CALL_CONTRACT, "input_coverage_sha256": rank._digest(input_receipt["item_corpora"]), "query_coverage_sha256": rank._digest([{"item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"])} for item in sorted(p["items"], key=lambda item: item["item_id"])]), "output_coverage_sha256": rank._digest([{"item_id": item["item_id"], "ranking_sha256": rank._digest(rows[[row["item_id"] for row in rows].index(item["item_id"])]["ranked_message_ids"])} for item in sorted(p["items"], key=lambda item: item["item_id"])]),"worker_physical_receipt":physical,"coordinator_physical_receipt":copy.deepcopy(physical)}; index_receipt["index_identity_sha256"]=rank._digest({"collection_identity":index_receipt["collection_identity"],"physical":physical})
         result.append({"build_id": "build-" + str(number), "input_receipt": input_receipt, "input_sha256": rank._digest(input_receipt), "index_receipt": index_receipt, "index_sha256": rank._digest(index_receipt), "trace_receipt": trace, "trace_sha256": rank._digest(trace), "rankings": rows})
     return result
@@ -127,6 +127,152 @@ def test_original_replicate_rejects_normalization_delta_not_bound_to_final_lengt
     replicate["index_sha256"] = rank._digest(replicate["index_receipt"])
     with pytest.raises(CustodyError):
         rank._original_replicate(p, replicate)
+
+
+def test_original_physical_receipt_normalizes_the_paired_v380_direct_read_rewrite():
+    p = projection()
+    worker = original_replicates(p)[0]["index_receipt"]["worker_physical_receipt"]
+    coordinator = copy.deepcopy(worker)
+    for physical, before, after in ((worker, h("worker-before"), h("worker-after")), (coordinator, h("coordinator-before"), h("coordinator-after"))):
+        data = next(entry for entry in physical["graph_files"] if entry["name"] == "data_level0.bin")
+        length = next(entry for entry in physical["graph_files"] if entry["name"] == "length.bin")
+        data["sha256"] = after
+        length_after = h("length-" + after)
+        length["sha256"] = length_after
+        physical["immutable_backend_sha256"] = h("backend-" + after)
+        physical["immutable_non_length_backend_sha256"] = h("non-length-" + after)
+        physical["immutable_residual_backend_sha256"] = h("residual")
+        physical["direct_read_normalization_delta"] = {
+            "schema": rank.PAIRED_DIRECT_READ_NORMALIZATION_SCHEMA,
+            "status": "data_level0_and_length_same_size_rewrite",
+            "transitions": [
+                {"path": data["path"], "bytes": data["bytes"], "before_sha256": before, "after_sha256": after},
+                {"path": length["path"], "bytes": length["bytes"], "before_sha256": h("before-" + length_after), "after_sha256": length_after},
+            ],
+        }
+    assert rank._logical_original_physical_receipt(worker) == rank._logical_original_physical_receipt(coordinator)
+
+
+def test_original_physical_receipt_accepts_root_level_canonical_graph_paths():
+    physical = original_replicates(projection())[0]["index_receipt"]["worker_physical_receipt"]
+    for entry in physical["graph_files"]:
+        entry["path"] = entry["name"]
+    data, length = next(entry for entry in physical["graph_files"] if entry["name"] == "data_level0.bin"), next(entry for entry in physical["graph_files"] if entry["name"] == "length.bin")
+    data["sha256"], length["sha256"] = h("root-data-after"), h("root-length-after")
+    physical["immutable_residual_backend_sha256"] = h("root-residual")
+    physical["direct_read_normalization_delta"] = {
+        "schema": rank.PAIRED_DIRECT_READ_NORMALIZATION_SCHEMA,
+        "status": "data_level0_and_length_same_size_rewrite",
+        "transitions": [
+            {"path": "data_level0.bin", "bytes": data["bytes"], "before_sha256": h("root-data-before"), "after_sha256": data["sha256"]},
+            {"path": "length.bin", "bytes": length["bytes"], "before_sha256": h("root-length-before"), "after_sha256": length["sha256"]},
+        ],
+    }
+    assert rank._logical_original_physical_receipt(physical)["graph_files"][0]["path"] == "data_level0.bin"
+
+
+@pytest.mark.parametrize("mutation", ("tampered", "missing", "mispathed", "final_mismatched"))
+def test_original_physical_receipt_rejects_incomplete_or_forged_paired_length_transition(mutation):
+    physical = original_replicates(projection())[0]["index_receipt"]["worker_physical_receipt"]
+    data = next(entry for entry in physical["graph_files"] if entry["name"] == "data_level0.bin")
+    length = next(entry for entry in physical["graph_files"] if entry["name"] == "length.bin")
+    data["sha256"] = h("data-after"); length["sha256"] = h("length-after")
+    physical["immutable_residual_backend_sha256"] = h("residual")
+    physical["direct_read_normalization_delta"] = {
+        "schema": rank.PAIRED_DIRECT_READ_NORMALIZATION_SCHEMA,
+        "status": "data_level0_and_length_same_size_rewrite",
+        "transitions": [
+            {"path": data["path"], "bytes": data["bytes"], "before_sha256": h("data-before"), "after_sha256": data["sha256"]},
+            {"path": length["path"], "bytes": length["bytes"], "before_sha256": h("length-before"), "after_sha256": length["sha256"]},
+        ],
+    }
+    if mutation == "tampered":
+        physical["direct_read_normalization_delta"]["transitions"][1]["before_sha256"] = physical["direct_read_normalization_delta"]["transitions"][1]["after_sha256"]
+    elif mutation == "missing":
+        physical["direct_read_normalization_delta"]["transitions"].pop()
+    elif mutation == "mispathed":
+        physical["direct_read_normalization_delta"]["transitions"][1]["path"] = "other/length.bin"
+    else:
+        physical["direct_read_normalization_delta"]["transitions"][1]["after_sha256"] = h("forged-length-after")
+    with pytest.raises(CustodyError):
+        rank._logical_original_physical_receipt(physical)
+
+
+def _paired_transition(physical, *, data_before, data_after, length_before, length_after, residual):
+    data = next(entry for entry in physical["graph_files"] if entry["name"] == "data_level0.bin")
+    length = next(entry for entry in physical["graph_files"] if entry["name"] == "length.bin")
+    data["sha256"], length["sha256"] = data_after, length_after
+    physical["immutable_backend_sha256"] = h("raw-" + data_after + length_after)
+    physical["immutable_non_length_backend_sha256"] = h("non-length-" + data_after)
+    physical["immutable_residual_backend_sha256"] = residual
+    physical["direct_read_normalization_delta"] = {
+        "schema": rank.PAIRED_DIRECT_READ_NORMALIZATION_SCHEMA,
+        "status": "data_level0_and_length_same_size_rewrite",
+        "transitions": [
+            {"path": data["path"], "bytes": data["bytes"], "before_sha256": data_before, "after_sha256": data_after},
+            {"path": length["path"], "bytes": length["bytes"], "before_sha256": length_before, "after_sha256": length_after},
+        ],
+    }
+
+
+def test_original_replicate_publishes_paired_v2_worker_then_none_coordinator():
+    p = projection(); replicate = original_replicates(p)[0]
+    worker, coordinator = replicate["index_receipt"]["worker_physical_receipt"], replicate["index_receipt"]["coordinator_physical_receipt"]
+    residual, data_before, data_after, length_before, length_after = h("residual"), h("data-before"), h("data-after"), h("length-before"), h("length-after")
+    _paired_transition(worker, data_before=data_before, data_after=data_after, length_before=length_before, length_after=length_after, residual=residual)
+    for entry in coordinator["graph_files"]:
+        if entry["name"] == "data_level0.bin": entry["sha256"] = data_after
+        if entry["name"] == "length.bin": entry["sha256"] = length_after
+    coordinator["immutable_backend_sha256"] = h("coordinator-raw")
+    coordinator["immutable_non_length_backend_sha256"] = h("coordinator-non-length")
+    coordinator["immutable_residual_backend_sha256"] = residual
+    replicate["index_receipt"]["index_identity_sha256"] = rank._digest({"collection_identity": replicate["index_receipt"]["collection_identity"], "physical": worker})
+    replicate["index_sha256"] = rank._digest(replicate["index_receipt"])
+    assert rank._original_replicate(p, replicate)["build_id"] == replicate["build_id"]
+
+
+@pytest.mark.parametrize("worker_mode,coordinator_mode", (("paired", "none"), ("none", "paired"), ("paired", "paired")))
+def test_joint_physical_receipt_accepts_all_paired_v2_handoff_combinations(worker_mode, coordinator_mode):
+    worker = original_replicates(projection())[0]["index_receipt"]["worker_physical_receipt"]
+    coordinator = copy.deepcopy(worker); residual = h("residual")
+    initial_data, initial_length = h("initial-data"), h("initial-length")
+    for physical in (worker, coordinator):
+        for entry in physical["graph_files"]:
+            if entry["name"] == "data_level0.bin": entry["sha256"] = initial_data
+            if entry["name"] == "length.bin": entry["sha256"] = initial_length
+        physical["immutable_residual_backend_sha256"] = residual
+    worker_data, worker_length = (h("worker-data"), h("worker-length")) if worker_mode == "paired" else (initial_data, initial_length)
+    if worker_mode == "paired":
+        _paired_transition(worker, data_before=initial_data, data_after=worker_data, length_before=initial_length, length_after=worker_length, residual=residual)
+    else:
+        for entry in worker["graph_files"]:
+            if entry["name"] == "data_level0.bin": entry["sha256"] = worker_data
+            if entry["name"] == "length.bin": entry["sha256"] = worker_length
+    if coordinator_mode == "paired":
+        _paired_transition(coordinator, data_before=worker_data, data_after=h("coordinator-data"), length_before=worker_length, length_after=h("coordinator-length"), residual=residual)
+    else:
+        for entry in coordinator["graph_files"]:
+            if entry["name"] == "data_level0.bin": entry["sha256"] = worker_data
+            if entry["name"] == "length.bin": entry["sha256"] = worker_length
+    assert rank._joint_original_physical_receipts(worker, coordinator)
+
+
+def test_joint_physical_receipt_rejects_worker_final_not_equal_to_coordinator_start():
+    worker = original_replicates(projection())[0]["index_receipt"]["worker_physical_receipt"]
+    coordinator = copy.deepcopy(worker); residual = h("residual")
+    _paired_transition(worker, data_before=h("data-before"), data_after=h("worker-data"), length_before=h("length-before"), length_after=h("worker-length"), residual=residual)
+    _paired_transition(coordinator, data_before=h("different-data"), data_after=h("coordinator-data"), length_before=h("worker-length"), length_after=h("coordinator-length"), residual=residual)
+    with pytest.raises(CustodyError, match="transition_handoff"):
+        rank._joint_original_physical_receipts(worker, coordinator)
+
+
+def test_joint_physical_receipt_rejects_residual_drift_outside_the_pair():
+    worker = original_replicates(projection())[0]["index_receipt"]["worker_physical_receipt"]
+    coordinator = copy.deepcopy(worker)
+    worker["immutable_residual_backend_sha256"] = h("worker-residual")
+    coordinator["immutable_residual_backend_sha256"] = h("coordinator-residual")
+    with pytest.raises(CustodyError):
+        rank._joint_original_physical_receipts(worker, coordinator)
 
 
 @pytest.mark.parametrize("mutation", ("non_length_digest", "data_level0_sha256", "coordinator_raw_aggregate_none"))

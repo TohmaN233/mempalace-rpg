@@ -184,6 +184,29 @@ def test_direct_read_normalization_rejects_other_graph_non_sqlite_or_size_drift(
     assert original._hnsw_direct_read_normalization_delta(before, after) is None
 
 
+def test_direct_read_normalization_accepts_only_the_canonical_paired_v380_rewrite():
+    before = [
+        {"path": "segment/data_level0.bin", "bytes": 100, "sha256": "a" * 64},
+        {"path": "segment/header.bin", "bytes": 10, "sha256": "h" * 64},
+        {"path": "segment/length.bin", "bytes": 400, "sha256": "b" * 64},
+        {"path": "segment/link_lists.bin", "bytes": 10, "sha256": "l" * 64},
+    ]
+    after = [
+        {"path": "segment/data_level0.bin", "bytes": 100, "sha256": "c" * 64},
+        *before[1:2],
+        {"path": "segment/length.bin", "bytes": 400, "sha256": "d" * 64},
+        *before[3:],
+    ]
+    assert original._hnsw_direct_read_normalization_delta(before, after) == {
+        "schema": original.rank.PAIRED_DIRECT_READ_NORMALIZATION_SCHEMA,
+        "status": "data_level0_and_length_same_size_rewrite",
+        "transitions": [
+            {"path": "segment/data_level0.bin", "bytes": 100, "before_sha256": "a" * 64, "after_sha256": "c" * 64},
+            {"path": "segment/length.bin", "bytes": 400, "before_sha256": "b" * 64, "after_sha256": "d" * 64},
+        ],
+    }
+
+
 def test_direct_read_normalization_rejects_length_bin_outside_the_canonical_hnsw_segment():
     before = [
         {"path": "canonical/data_level0.bin", "bytes": 100, "sha256": "a" * 64},
@@ -230,10 +253,59 @@ def fake_auditor(*, palace_path, expected_namespace):
         "embedding": {"count": len(ids), "dimension": 384, "dtype": "float32", "float32_sha256": h("vectors")},
         "hnsw_config": rank.ORIGINAL_HNSW_CONFIG,
         "graph_files": [{"name": name, "path": f"segment/{name}", "bytes": 1, "sha256": h(name)} for name in rank.ORIGINAL_GRAPH_NAMES],
-        "immutable_backend_sha256": h("immutable"), "immutable_non_length_backend_sha256": h("non-length-immutable"), "sqlite_semantic_sha256": h("sqlite"),
+        "immutable_backend_sha256": h("immutable"), "immutable_non_length_backend_sha256": h("non-length-immutable"), "immutable_residual_backend_sha256": h("residual-immutable"), "sqlite_semantic_sha256": h("sqlite"),
         "operational_delta": rank.ORIGINAL_OPERATIONAL_DELTA,
         "direct_read_normalization_delta": {"schema": rank.DIRECT_READ_NORMALIZATION_SCHEMA, "status": "none", "path": None, "bytes": None, "before_sha256": None, "after_sha256": None},
     }
+
+
+def _graph(receipt, name):
+    return next(row for row in receipt["graph_files"] if row["name"] == name)
+
+
+def _paired_receipt(receipt, *, data_before, data_after, length_before, length_after, residual):
+    value = copy.deepcopy(receipt)
+    data, length = _graph(value, "data_level0.bin"), _graph(value, "length.bin")
+    data["sha256"], length["sha256"] = data_after, length_after
+    value["immutable_backend_sha256"] = h("raw-" + data_after + length_after)
+    value["immutable_non_length_backend_sha256"] = h("non-length-" + data_after)
+    value["immutable_residual_backend_sha256"] = residual
+    value["direct_read_normalization_delta"] = {
+        "schema": rank.PAIRED_DIRECT_READ_NORMALIZATION_SCHEMA,
+        "status": "data_level0_and_length_same_size_rewrite",
+        "transitions": [
+            {"path": data["path"], "bytes": data["bytes"], "before_sha256": data_before, "after_sha256": data_after},
+            {"path": length["path"], "bytes": length["bytes"], "before_sha256": length_before, "after_sha256": length_after},
+        ],
+    }
+    return value
+
+
+def _replace_worker_receipt(draft, worker):
+    replicate = copy.deepcopy(draft.replicate_without_coordinator_audit)
+    index = replicate["index_receipt"]
+    index["worker_physical_receipt"] = worker
+    index["index_identity_sha256"] = rank._digest({"collection_identity": index["collection_identity"], "physical": worker})
+    replicate["index_sha256"] = rank._digest(index)
+    return original.OriginalProductWorkerDraft(
+        projection=draft.projection, namespace=draft.namespace,
+        replicate_without_coordinator_audit=replicate,
+        worker_physical_receipt=worker, telemetry=draft.telemetry,
+    )
+
+
+def _none_receipt(receipt, *, data_sha256, length_sha256, residual):
+    value = copy.deepcopy(receipt)
+    _graph(value, "data_level0.bin")["sha256"] = data_sha256
+    _graph(value, "length.bin")["sha256"] = length_sha256
+    value["immutable_backend_sha256"] = h("none-raw-" + data_sha256 + length_sha256)
+    value["immutable_non_length_backend_sha256"] = h("none-non-length-" + data_sha256)
+    value["immutable_residual_backend_sha256"] = residual
+    value["direct_read_normalization_delta"] = {
+        "schema": rank.DIRECT_READ_NORMALIZATION_SCHEMA, "status": "none",
+        "path": None, "bytes": None, "before_sha256": None, "after_sha256": None,
+    }
+    return value
 
 
 def seams():
@@ -373,6 +445,7 @@ def test_coordinator_compares_non_length_hnsw_state_when_canonical_length_rewrit
         value = copy.deepcopy(base)
         value["immutable_backend_sha256"] = backend_sha256
         value["immutable_non_length_backend_sha256"] = h("same-non-length-backend")
+        value["immutable_residual_backend_sha256"] = h("same-residual-backend")
         for graph in value["graph_files"]:
             if graph["name"] == "length.bin":
                 graph["sha256"] = length_sha256
@@ -380,7 +453,7 @@ def test_coordinator_compares_non_length_hnsw_state_when_canonical_length_rewrit
 
     observed = iter([
         receipt(length_sha256=h("worker-length"), backend_sha256=h("worker-raw-backend")),
-        receipt(length_sha256=h("coordinator-length"), backend_sha256=h("coordinator-raw-backend")),
+        receipt(length_sha256=h("worker-length"), backend_sha256=h("coordinator-raw-backend")),
     ])
     auditor = lambda **_kwargs: next(observed)
     custom = original.OriginalProductSeams(
@@ -501,6 +574,51 @@ def test_worker_draft_canonical_wire_packet_reloads_for_independent_coordinator_
     assert rebound_resource["resource_sha256"] == executor.formal.resource_digest(rebound_resource)
     with pytest.raises(original.OriginalProductError, match="original-product worker draft"):
         original.coordinator_reaudit_replicate(draft=loaded.replicate_without_coordinator_audit, palace_path=tmp_path / "palace", projection=p, auditor=fake_auditor)
+
+
+@pytest.mark.parametrize("worker_mode,coordinator_mode", (("paired", "none"), ("none", "paired"), ("paired", "paired")))
+def test_worker_draft_wire_publishes_all_paired_v2_handoff_combinations(tmp_path, worker_mode, coordinator_mode):
+    p = projection()
+    model = {"encoder_identity": "synthetic", "encoder_semantics": "deterministic", "files": [{"path_role": "weights", "sha256": h("weights"), "bytes": 1}]}
+    code = {"head": h("head"), "tree": h("tree"), "diff_digest": h("diff"), "dirty_policy": "clean_required"}
+    completed = []
+    for number in range(5):
+        injected, _palace, _state = seams()
+        draft = original.run_original_public_replicate(projection=p, build_id=f"wire-paired-{worker_mode}-{coordinator_mode}-{number}", collection_identity=f"wire-collection-{number}", palace_path=tmp_path / f"worker-{number}", observer=Observer(), seams=injected)
+        base = copy.deepcopy(draft.worker_physical_receipt)
+        initial_data, initial_length = _graph(base, "data_level0.bin")["sha256"], _graph(base, "length.bin")["sha256"]
+        residual = h(f"paired-residual-{number}")
+        if worker_mode == "paired":
+            worker_data, worker_length = h(f"worker-data-{number}"), h(f"worker-length-{number}")
+            worker = _paired_receipt(base, data_before=initial_data, data_after=worker_data, length_before=initial_length, length_after=worker_length, residual=residual)
+        else:
+            worker_data, worker_length, worker = initial_data, initial_length, _none_receipt(base, data_sha256=initial_data, length_sha256=initial_length, residual=residual)
+        loaded = original.load_worker_draft(original.serialize_worker_draft(_replace_worker_receipt(draft, worker)))
+        coordinator = _none_receipt(base, data_sha256=worker_data, length_sha256=worker_length, residual=residual)
+        if coordinator_mode == "paired":
+            coordinator = _paired_receipt(coordinator, data_before=worker_data, data_after=h(f"coordinator-data-{number}"), length_before=worker_length, length_after=h(f"coordinator-length-{number}"), residual=residual)
+        completed.append(original.coordinator_reaudit_replicate(draft=loaded, palace_path=tmp_path / f"coordinator-{number}", projection=p, auditor=lambda **_kwargs: coordinator))
+    artifact = rank.wrap_original_public_rankings(projection=p, replicates=completed, model_receipt=model, code_receipt=code)
+    assert rank.validate_frozen_ranking(artifact, projection=p)["artifact_sha256"] == artifact["artifact_sha256"]
+
+
+def test_worker_draft_wire_publishes_v1_length_only_and_rejects_handoff_or_residual_drift(tmp_path):
+    p = projection(); injected, _palace, _state = seams()
+    draft = original.run_original_public_replicate(projection=p, build_id="wire-length", collection_identity="wire-length-collection", palace_path=tmp_path / "worker", observer=Observer(), seams=injected)
+    base = copy.deepcopy(draft.worker_physical_receipt)
+    data_sha256, length_sha256 = _graph(base, "data_level0.bin")["sha256"], _graph(base, "length.bin")["sha256"]
+    worker = _none_receipt(base, data_sha256=data_sha256, length_sha256=h("worker-length"), residual=h("length-residual"))
+    worker["direct_read_normalization_delta"] = {"schema": rank.DIRECT_READ_NORMALIZATION_SCHEMA, "status": "length_bin_same_size_rewrite", "path": _graph(worker, "length.bin")["path"], "bytes": _graph(worker, "length.bin")["bytes"], "before_sha256": length_sha256, "after_sha256": h("worker-length")}
+    loaded = original.load_worker_draft(original.serialize_worker_draft(_replace_worker_receipt(draft, worker)))
+    coordinator = _none_receipt(base, data_sha256=data_sha256, length_sha256=h("worker-length"), residual=h("length-residual"))
+    completed = original.coordinator_reaudit_replicate(draft=loaded, palace_path=tmp_path / "coordinator", projection=p, auditor=lambda **_kwargs: coordinator)
+    assert completed["index_receipt"]["worker_physical_receipt"]["direct_read_normalization_delta"]["status"] == "length_bin_same_size_rewrite"
+    bad_handoff = _paired_receipt(coordinator, data_before=h("wrong-data"), data_after=h("coordinator-data"), length_before=h("worker-length"), length_after=h("coordinator-length"), residual=h("length-residual"))
+    with pytest.raises(original.OriginalProductError, match="normalization receipt mismatch"):
+        original.coordinator_reaudit_replicate(draft=loaded, palace_path=tmp_path / "bad-handoff", projection=p, auditor=lambda **_kwargs: bad_handoff)
+    bad_residual = _none_receipt(base, data_sha256=data_sha256, length_sha256=h("worker-length"), residual=h("forged-residual"))
+    with pytest.raises(original.OriginalProductError, match="normalization receipt mismatch"):
+        original.coordinator_reaudit_replicate(draft=loaded, palace_path=tmp_path / "bad-residual", projection=p, auditor=lambda **_kwargs: bad_residual)
 
 
 def _repack(packet):
