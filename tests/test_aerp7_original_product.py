@@ -96,6 +96,104 @@ def test_direct_dynamic_audit_immutable_drift_reports_canonical_before_after_sta
     )
 
 
+def test_direct_dynamic_audit_receipts_the_one_allowed_length_bin_normalization(
+    monkeypatch, tmp_path
+):
+    def storage(*, length_sha256: str) -> dict:
+        immutable = [
+            {"path": "segment/data_level0.bin", "bytes": 100, "sha256": "d" * 64},
+            {"path": "segment/header.bin", "bytes": 10, "sha256": "h" * 64},
+            {"path": "segment/length.bin", "bytes": 400, "sha256": length_sha256},
+            {"path": "segment/link_lists.bin", "bytes": 10, "sha256": "l" * 64},
+        ]
+        return {
+            "immutable_snapshot": immutable,
+            "immutable_sha256": original._digest(immutable),
+            "files": [
+                {"name": row["path"].rsplit("/", 1)[1], "bytes": row["bytes"], "sha256": row["sha256"]}
+                for row in immutable
+            ],
+        }
+
+    before, after = storage(length_sha256="a" * 64), storage(length_sha256="b" * 64)
+    storages = iter([before, after])
+    config = {"batch_size": 100, "space": "cosine"}
+    monkeypatch.setattr(original.v2, "_audit_storage_digest", lambda _path: next(storages))
+    monkeypatch.setattr(original.v2, "_sqlite_hnsw_configuration", lambda _path: config)
+    monkeypatch.setattr(
+        original.v2,
+        "_sqlite_semantic_snapshot",
+        lambda _path: {"semantic_sha256": "s" * 64, "acquire_write_rows": []},
+    )
+    monkeypatch.setattr(
+        original.v2,
+        "_validated_acquire_write_delta",
+        lambda _before, _after: original.rank.ORIGINAL_OPERATIONAL_DELTA,
+    )
+
+    class Client:
+        def get_collection(self, _name):
+            return SimpleNamespace(get=lambda **_kwargs: {"ids": ["id"], "embeddings": [[0.0]]})
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "chromadb", SimpleNamespace(PersistentClient=lambda **_kwargs: Client()))
+    receipt = original._direct_dynamic_audit(palace_path=tmp_path, expected_ids=["id"])
+    assert receipt["graph_files"] == [
+        {"name": row["path"].rsplit("/", 1)[1], **row}
+        for row in after["immutable_snapshot"]
+    ]
+    assert receipt["immutable_backend_sha256"] == after["immutable_sha256"]
+    assert receipt["direct_read_normalization_delta"] == {
+        "schema": "aerp7-hnsw-direct-read-normalization-v1",
+        "status": "length_bin_same_size_once",
+        "path": "segment/length.bin",
+        "bytes": 400,
+        "before_sha256": "a" * 64,
+        "after_sha256": "b" * 64,
+    }
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        [
+            {"path": "segment/data_level0.bin", "bytes": 100, "sha256": "b" * 64},
+            {"path": "segment/length.bin", "bytes": 400, "sha256": "a" * 64},
+        ],
+        [
+            {"path": "segment/data_level0.bin", "bytes": 100, "sha256": "a" * 64},
+            {"path": "segment/length.bin", "bytes": 400, "sha256": "a" * 64},
+            {"path": "unrelated.bin", "bytes": 1, "sha256": "b" * 64},
+        ],
+        [
+            {"path": "segment/data_level0.bin", "bytes": 100, "sha256": "a" * 64},
+            {"path": "segment/length.bin", "bytes": 401, "sha256": "b" * 64},
+        ],
+    ],
+)
+def test_direct_read_normalization_rejects_other_graph_non_sqlite_or_size_drift(after):
+    before = [
+        {"path": "segment/data_level0.bin", "bytes": 100, "sha256": "a" * 64},
+        {"path": "segment/length.bin", "bytes": 400, "sha256": "a" * 64},
+    ]
+    assert original._hnsw_direct_read_normalization_delta(before, after) is None
+
+
+def test_direct_read_normalization_rejects_length_bin_outside_the_canonical_hnsw_segment():
+    before = [
+        {"path": "canonical/data_level0.bin", "bytes": 100, "sha256": "a" * 64},
+        {"path": "canonical/length.bin", "bytes": 400, "sha256": "a" * 64},
+        {"path": "other/length.bin", "bytes": 400, "sha256": "a" * 64},
+    ]
+    after = [
+        *before[:2],
+        {"path": "other/length.bin", "bytes": 400, "sha256": "b" * 64},
+    ]
+    assert original._hnsw_direct_read_normalization_delta(before, after) is None
+
+
 class Searcher:
     def __init__(self, palace, state): self.palace, self.state, self.calls = palace, state, []
 
@@ -128,9 +226,10 @@ def fake_auditor(*, palace_path, expected_namespace):
         "physical_count": len(ids), "physical_ids_sha256": rank._digest(ids),
         "embedding": {"count": len(ids), "dimension": 384, "dtype": "float32", "float32_sha256": h("vectors")},
         "hnsw_config": rank.ORIGINAL_HNSW_CONFIG,
-        "graph_files": [{"name": name, "bytes": 1, "sha256": h(name)} for name in rank.ORIGINAL_GRAPH_NAMES],
+        "graph_files": [{"name": name, "path": f"segment/{name}", "bytes": 1, "sha256": h(name)} for name in rank.ORIGINAL_GRAPH_NAMES],
         "immutable_backend_sha256": h("immutable"), "sqlite_semantic_sha256": h("sqlite"),
         "operational_delta": rank.ORIGINAL_OPERATIONAL_DELTA,
+        "direct_read_normalization_delta": {"schema": rank.DIRECT_READ_NORMALIZATION_SCHEMA, "status": "none", "path": None, "bytes": None, "before_sha256": None, "after_sha256": None},
     }
 
 
@@ -195,6 +294,66 @@ def test_coordinator_audit_must_equal_worker_and_observer_is_required(tmp_path):
     changed = {**draft.worker_physical_receipt, "sqlite_semantic_sha256": h("forged")}
     with pytest.raises(original.OriginalProductError, match="worker/coordinator"):
         original.coordinator_reaudit_replicate(draft=draft, palace_path=tmp_path / "palace", projection=p, auditor=lambda **_kwargs: changed)
+
+
+def test_coordinator_compares_logical_index_state_not_the_observed_length_normalization(
+    tmp_path,
+):
+    p, observer = projection(), Observer()
+    injected, _palace, _state = seams()
+    namespace = original.original_identity_namespace(p)
+    base = fake_auditor(palace_path=tmp_path / "palace", expected_namespace=namespace)
+    final_length = next(entry for entry in base["graph_files"] if entry["name"] == "length.bin")
+    observed = iter(
+        [
+            {
+                **base,
+                "direct_read_normalization_delta": {
+                    "schema": "aerp7-hnsw-direct-read-normalization-v1",
+                    "status": "length_bin_same_size_once",
+                    "path": final_length["path"],
+                    "bytes": final_length["bytes"],
+                    "before_sha256": "a" * 64,
+                    "after_sha256": final_length["sha256"],
+                },
+            },
+            {
+                **base,
+                "direct_read_normalization_delta": {
+                    "schema": "aerp7-hnsw-direct-read-normalization-v1",
+                    "status": "none",
+                    "path": None,
+                    "bytes": None,
+                    "before_sha256": None,
+                    "after_sha256": None,
+                },
+            },
+        ]
+    )
+    auditor = lambda **_kwargs: next(observed)
+    custom = original.OriginalProductSeams(
+        palace=injected.palace,
+        searcher=injected.searcher,
+        reset_backends=injected.reset_backends,
+        auditor=auditor,
+    )
+    draft = original.run_original_public_replicate(
+        projection=p,
+        build_id="normalization-build",
+        collection_identity="normalization-collection",
+        palace_path=tmp_path / "palace",
+        observer=observer,
+        seams=custom,
+    )
+    completed = original.coordinator_reaudit_replicate(
+        draft=draft,
+        palace_path=tmp_path / "palace",
+        projection=p,
+        auditor=auditor,
+    )
+    index = completed["index_receipt"]
+    assert index["worker_physical_receipt"]["direct_read_normalization_delta"]["status"] == "length_bin_same_size_once"
+    assert index["coordinator_physical_receipt"]["direct_read_normalization_delta"]["status"] == "none"
 
 
 def test_five_dynamic_replicates_wrap_into_the_strict_frozen_original_artifact(tmp_path):

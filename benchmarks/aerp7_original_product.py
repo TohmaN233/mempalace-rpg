@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from benchmarks import aerp5_product_paired_locomo as v1
 from benchmarks import aerp5_product_paired_locomo_v2 as v2
 from benchmarks import aerp7_convomem_rank as rank
+from benchmarks.aerp7_convomem_confirmation import CustodyError
 from benchmarks import aerp7_original_core as original_core
 
 
@@ -491,7 +492,7 @@ def dynamic_original_index_build_receipt(*, palace_path: Path, expected_namespac
         raw = dict(auditor(palace_path=palace_path, expected_namespace=expected_namespace))
     else:
         raw = _direct_dynamic_audit(palace_path=palace_path, expected_ids=expected_ids)
-    required = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "sqlite_semantic_sha256", "operational_delta"}
+    required = {"physical_count", "physical_ids_sha256", "embedding", "hnsw_config", "graph_files", "immutable_backend_sha256", "sqlite_semantic_sha256", "operational_delta", "direct_read_normalization_delta"}
     if set(raw) != required:
         raise OriginalProductError("original index audit receipt schema mismatch")
     expected = {"physical_count": len(expected_ids), "physical_ids_sha256": _digest(expected_ids)}
@@ -503,7 +504,69 @@ def dynamic_original_index_build_receipt(*, palace_path: Path, expected_namespac
     names = [entry.get("name") for entry in raw["graph_files"] if isinstance(entry, Mapping)] if isinstance(raw["graph_files"], list) else []
     if names != list(rank.ORIGINAL_GRAPH_NAMES):
         raise OriginalProductError("original HNSW graph audit mismatch")
+    try:
+        rank._logical_original_physical_receipt(raw)
+    except CustodyError as exc:
+        raise OriginalProductError("original index normalization receipt mismatch") from exc
     return raw
+
+
+def _hnsw_direct_read_normalization_delta(before: Any, after: Any) -> dict[str, Any] | None:
+    """Classify the sole observed v3.8 direct-read byte normalization."""
+    if not isinstance(before, list) or not isinstance(after, list):
+        return None
+    required = {"path", "bytes", "sha256"}
+    before_by_path = {
+        row.get("path"): row
+        for row in before
+        if isinstance(row, Mapping) and set(row) == required and isinstance(row.get("path"), str)
+    }
+    after_by_path = {
+        row.get("path"): row
+        for row in after
+        if isinstance(row, Mapping) and set(row) == required and isinstance(row.get("path"), str)
+    }
+    if len(before_by_path) != len(before) or len(after_by_path) != len(after) or set(before_by_path) != set(after_by_path):
+        return None
+    changed = [path for path in before_by_path if before_by_path[path] != after_by_path[path]]
+    if not changed:
+        return {
+            "schema": "aerp7-hnsw-direct-read-normalization-v1",
+            "status": "none",
+            "path": None,
+            "bytes": None,
+            "before_sha256": None,
+            "after_sha256": None,
+        }
+    data_level_paths = [
+        path for path in before_by_path
+        if path == "data_level0.bin" or path.endswith("/data_level0.bin")
+    ]
+    if len(data_level_paths) != 1:
+        return None
+    parent, separator, _name = data_level_paths[0].rpartition("/")
+    canonical_length_path = f"{parent}{separator}length.bin"
+    if len(changed) != 1 or changed[0] != canonical_length_path:
+        return None
+    path = changed[0]
+    left, right = before_by_path[path], after_by_path[path]
+    if (
+        not isinstance(left["bytes"], int)
+        or isinstance(left["bytes"], bool)
+        or left["bytes"] <= 0
+        or left["bytes"] != right["bytes"]
+        or any(not isinstance(row["sha256"], str) or len(row["sha256"]) != 64 or any(char not in "0123456789abcdef" for char in row["sha256"]) for row in (left, right))
+        or left["sha256"] == right["sha256"]
+    ):
+        return None
+    return {
+        "schema": "aerp7-hnsw-direct-read-normalization-v1",
+        "status": "length_bin_same_size_once",
+        "path": path,
+        "bytes": left["bytes"],
+        "before_sha256": left["sha256"],
+        "after_sha256": right["sha256"],
+    }
 
 
 def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> dict[str, Any]:
@@ -527,7 +590,10 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
     after_storage = v2._audit_storage_digest(palace_path)
     after_sqlite = v2._sqlite_semantic_snapshot(palace_path)
     after_config = v2._sqlite_hnsw_configuration(palace_path)
-    if after_storage["immutable_snapshot"] != before_storage["immutable_snapshot"] or after_config != before_config:
+    normalization_delta = _hnsw_direct_read_normalization_delta(
+        before_storage["immutable_snapshot"], after_storage["immutable_snapshot"]
+    )
+    if normalization_delta is None or after_config != before_config:
         raise OriginalProductError(
             "direct original index audit mutated persisted index: "
             f"immutable_before={_canonical_bytes(before_storage['immutable_snapshot']).decode('utf-8')}; "
@@ -535,6 +601,21 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
             f"config_before={_canonical_bytes(before_config).decode('utf-8')}; "
             f"config_after={_canonical_bytes(after_config).decode('utf-8')}"
         )
+    snapshot_by_path = {row["path"]: row for row in after_storage["immutable_snapshot"]}
+    data_level_paths = [
+        path for path in snapshot_by_path
+        if path == "data_level0.bin" or path.endswith("/data_level0.bin")
+    ]
+    if len(data_level_paths) != 1:
+        raise OriginalProductError("direct original index audit canonical HNSW segment mismatch")
+    parent, separator, _name = data_level_paths[0].rpartition("/")
+    graph_files = []
+    for name in rank.ORIGINAL_GRAPH_NAMES:
+        path = f"{parent}{separator}{name}"
+        entry = snapshot_by_path.get(path)
+        if not isinstance(entry, Mapping) or set(entry) != {"path", "bytes", "sha256"}:
+            raise OriginalProductError("direct original index audit canonical HNSW graph mismatch")
+        graph_files.append({"name": name, **entry})
     ids, embeddings = stored.get("ids"), stored.get("embeddings")
     if not isinstance(ids, list) or sorted(ids) != list(expected_ids):
         raise OriginalProductError("original Chroma physical IDs differ from dynamic namespace")
@@ -542,10 +623,11 @@ def _direct_dynamic_audit(*, palace_path: Path, expected_ids: Sequence[str]) -> 
     return {
         "physical_count": len(ids), "physical_ids_sha256": _digest(sorted(ids)),
         "embedding": {"count": count, "dimension": dimension, "dtype": "float32", "float32_sha256": vector_sha},
-        "hnsw_config": before_config, "graph_files": before_storage["files"],
-        "immutable_backend_sha256": before_storage["immutable_sha256"],
+        "hnsw_config": after_config, "graph_files": graph_files,
+        "immutable_backend_sha256": after_storage["immutable_sha256"],
         "sqlite_semantic_sha256": before_sqlite["semantic_sha256"],
         "operational_delta": v2._validated_acquire_write_delta(before_sqlite, after_sqlite),
+        "direct_read_normalization_delta": normalization_delta,
     }
 
 
@@ -760,7 +842,12 @@ def coordinator_reaudit_replicate(*, draft: OriginalProductWorkerDraft, palace_p
         raise OriginalProductError("coordinator projection/namespace drift")
     measured = dynamic_original_index_build_receipt(palace_path=palace_path, expected_namespace=draft.namespace, auditor=auditor)
     worker = draft.worker_physical_receipt
-    if worker != measured:
+    try:
+        worker_scientific = rank._logical_original_physical_receipt(worker)
+        measured_scientific = rank._logical_original_physical_receipt(measured)
+    except CustodyError as exc:
+        raise OriginalProductError("worker/coordinator physical index normalization receipt mismatch") from exc
+    if worker_scientific != measured_scientific:
         raise OriginalProductError("worker/coordinator physical index receipt mismatch")
     raw = dict(draft.replicate_without_coordinator_audit)
     index = raw.get("index_receipt")

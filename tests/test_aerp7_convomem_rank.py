@@ -35,7 +35,7 @@ def original_replicates(p):
         rows = [{**{key: value for key, value in row.items() if key not in {"confidence", "confidence_receipt"}}, "candidate_input_sha256": rank._candidate_input(p["corpora"][0], rank.ORIGINAL_MEMPALACE_SERIALIZER), "confidence": None, "confidence_receipt": None} for row in current["rankings"]]
         trace = [{key: value for key, value in row.items() if key in {"item_id", "query_sha256", "ranked_count", "ranking_sha256"}} for row in current["trace_receipt"]]
         for row in trace: row["candidate_input_sha256"] = rank._candidate_input(p["corpora"][0], rank.ORIGINAL_MEMPALACE_SERIALIZER)
-        input_receipt = rank._input_receipt(p, rank.ORIGINAL_MEMPALACE_SERIALIZER); physical_ids=[f"{corpus['corpus_id']}::aerp7::{candidate['message_id']}" for corpus in p["corpora"] for candidate in corpus["candidates"]]; physical={"physical_count":len(physical_ids),"physical_ids_sha256":rank._digest(sorted(physical_ids)),"embedding":{"count":len(physical_ids),"dimension":384,"dtype":"float32","float32_sha256":h("embedding"+str(number))},"hnsw_config":rank.ORIGINAL_HNSW_CONFIG,"graph_files":[{"name":name,"bytes":1,"sha256":h(f"graph-{number}-{name}")} for name in rank.ORIGINAL_GRAPH_NAMES],"immutable_backend_sha256":h("backend"+str(number)),"sqlite_semantic_sha256":h("sqlite"+str(number)),"operational_delta":rank.ORIGINAL_OPERATIONAL_DELTA}
+        input_receipt = rank._input_receipt(p, rank.ORIGINAL_MEMPALACE_SERIALIZER); physical_ids=[f"{corpus['corpus_id']}::aerp7::{candidate['message_id']}" for corpus in p["corpora"] for candidate in corpus["candidates"]]; physical={"physical_count":len(physical_ids),"physical_ids_sha256":rank._digest(sorted(physical_ids)),"embedding":{"count":len(physical_ids),"dimension":384,"dtype":"float32","float32_sha256":h("embedding"+str(number))},"hnsw_config":rank.ORIGINAL_HNSW_CONFIG,"graph_files":[{"name":name,"path":f"segment/{name}","bytes":1,"sha256":h(f"graph-{number}-{name}")} for name in rank.ORIGINAL_GRAPH_NAMES],"immutable_backend_sha256":h("backend"+str(number)),"sqlite_semantic_sha256":h("sqlite"+str(number)),"operational_delta":rank.ORIGINAL_OPERATIONAL_DELTA,"direct_read_normalization_delta":{"schema":rank.DIRECT_READ_NORMALIZATION_SCHEMA,"status":"none","path":None,"bytes":None,"before_sha256":None,"after_sha256":None}}
         index_receipt = {"build_id": "build-" + str(number), "fresh_build": True, "collection_identity": "collection-" + str(number), "index_identity_sha256": "", "cold_reopen": True, "call_contract": rank.ORIGINAL_CALL_CONTRACT, "input_coverage_sha256": rank._digest(input_receipt["item_corpora"]), "query_coverage_sha256": rank._digest([{"item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"])} for item in sorted(p["items"], key=lambda item: item["item_id"])]), "output_coverage_sha256": rank._digest([{"item_id": item["item_id"], "ranking_sha256": rank._digest(rows[[row["item_id"] for row in rows].index(item["item_id"])]["ranked_message_ids"])} for item in sorted(p["items"], key=lambda item: item["item_id"])]),"worker_physical_receipt":physical,"coordinator_physical_receipt":copy.deepcopy(physical)}; index_receipt["index_identity_sha256"]=rank._digest({"collection_identity":index_receipt["collection_identity"],"physical":physical})
         result.append({"build_id": "build-" + str(number), "input_receipt": input_receipt, "input_sha256": rank._digest(input_receipt), "index_receipt": index_receipt, "index_sha256": rank._digest(index_receipt), "trace_receipt": trace, "trace_sha256": rank._digest(trace), "rankings": rows})
     return result
@@ -98,6 +98,35 @@ def test_original_artifact_contains_five_complete_fresh_outputs_and_rejects_sing
     ):
         bad = copy.deepcopy(artifact); mutate(bad)
         with pytest.raises(CustodyError): rank.validate_frozen_ranking(bad, projection=p)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("bytes", 999), ("after_sha256", h("forged-length-bin"))),
+)
+def test_original_replicate_rejects_normalization_delta_not_bound_to_final_length_bin(field, value):
+    p = projection()
+    replicate = original_replicates(p)[0]
+    for physical in (
+        replicate["index_receipt"]["worker_physical_receipt"],
+        replicate["index_receipt"]["coordinator_physical_receipt"],
+    ):
+        physical["direct_read_normalization_delta"] = {
+            "schema": rank.DIRECT_READ_NORMALIZATION_SCHEMA,
+            "status": "length_bin_same_size_once",
+            "path": "segment/length.bin",
+            "bytes": 1,
+            "before_sha256": h("before-length-bin"),
+            "after_sha256": h("graph-0-length.bin"),
+        }
+        physical["direct_read_normalization_delta"][field] = value
+    replicate["index_receipt"]["index_identity_sha256"] = rank._digest({
+        "collection_identity": replicate["index_receipt"]["collection_identity"],
+        "physical": replicate["index_receipt"]["worker_physical_receipt"],
+    })
+    replicate["index_sha256"] = rank._digest(replicate["index_receipt"])
+    with pytest.raises(CustodyError):
+        rank._original_replicate(p, replicate)
 
 
 def test_receipts_require_real_model_files_and_clean_formal_code_policy():
