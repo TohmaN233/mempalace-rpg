@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks import aerp5_product_paired_locomo_v2 as runner
+from benchmarks import aerp7_convomem_rank as convomem_rank
 from mempalace_rpg.retrieval import AuthorizedRetrievalCandidate
 
 
@@ -526,6 +527,21 @@ def test_formal_original_v380_hnsw_configuration_expected_values_are_pinned() ->
         "space": "cosine",
         "sync_threshold": 1000,
     }
+
+
+def test_formal_v380_hnsw_contract_cannot_drift_between_aerp5_and_aerp7() -> None:
+    expected = {
+        "batch_size": 100,
+        "ef_construction": 100,
+        "ef_search": 100,
+        "max_neighbors": 16,
+        "num_threads": 1,
+        "resize_factor": 1.2,
+        "space": "cosine",
+        "sync_threshold": 1000,
+    }
+    assert convomem_rank.ORIGINAL_HNSW_CONFIG == expected
+    assert runner._sqlite_hnsw_configuration_expected() == expected
 
 
 def test_original_identity_namespace_requires_exact_fixed_dialog_count():

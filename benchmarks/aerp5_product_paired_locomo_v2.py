@@ -33,6 +33,7 @@ from benchmarks import aerp1_locomo_three_way as aerp1
 from benchmarks import aerp2_product_six_view_locomo as aerp2
 from benchmarks import aerp4_locomo_paired_receipts as a4paired
 from benchmarks import aerp5_product_paired_locomo as v1
+from benchmarks.aerp_mempalace_v380_runtime_contract import original_hnsw_configuration
 from mempalace_rpg import FixedP5Policy, FixedSixViewPolicy, RpgMemoryKernel, SixViewRanker
 from mempalace_rpg.retrieval import SIX_VIEW_WEIGHTS
 
@@ -832,7 +833,7 @@ def validate_original_index_build_receipt(receipt: Any, *, expected_namespace: M
 
 
 def _sqlite_hnsw_configuration_expected() -> dict[str, Any]:
-    return {"space": "cosine", "ef_construction": 100, "ef_search": 100, "max_neighbors": 16, "num_threads": 1, "batch_size": 100, "sync_threshold": 1000, "resize_factor": 1.2}
+    return original_hnsw_configuration()
 
 
 def coordinator_original_index_build_receipt(*, palace_path: Path, expected_namespace: Mapping[str, Any]) -> dict[str, Any]:

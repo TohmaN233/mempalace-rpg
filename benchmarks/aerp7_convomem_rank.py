@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from benchmarks.aerp_mempalace_v380_runtime_contract import original_hnsw_configuration
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256, validate_candidate_projection
 from mempalace_rpg.retrieval import (
     AuthorizedRetrievalCandidate, FixedP5Policy, FusionRoutingDecision,
@@ -51,7 +52,7 @@ ORIGINAL_CALL_CONTRACT = {
     "candidate_strategy": "vector", "top_k": 10, "room_scope": "corpus_id",
     "collection_name": "mempalace_drawers", "cold_reopen": True,
 }
-ORIGINAL_HNSW_CONFIG = {"space": "cosine", "ef_construction": 100, "ef_search": 100, "max_neighbors": 16, "num_threads": 1, "batch_size": 2, "sync_threshold": 2, "resize_factor": 1.2}
+ORIGINAL_HNSW_CONFIG = original_hnsw_configuration()
 ORIGINAL_OPERATIONAL_DELTA = {"schema": "aerp5-chroma-operational-delta-v1", "excluded_table": "acquire_write", "permitted_transition": "unchanged_or_append_next_integer_id_lock_status_1", "validation": "passed"}
 ORIGINAL_GRAPH_NAMES = ("data_level0.bin", "header.bin", "length.bin", "link_lists.bin")
 
