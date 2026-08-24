@@ -28,6 +28,7 @@ CUSTODY_SCHEMA = "aerp7-convomem-sealed-custody-v3"
 CANDIDATE_READY_SCHEMA = "aerp7-convomem-candidate-ready-v3"
 CUSTODY_READY_SCHEMA = "aerp7-convomem-custody-ready-v3"
 SELECTION_ALGORITHM = "hmac-sha256-revision-bound-persona-group-tier-context-v1"
+CENSUS_SELECTION_ALGORITHM = "aerp7-convomem-census-v1"
 BOUND_CUSTODY_ALGORITHM = "hmac-sha256-revision-bound-custody-binding-v1"
 SQLITE_INDEX_EXPANSION_FACTOR = 3
 STAGING_HEADROOM_BYTES = 8 * 1024 * 1024 * 1024
@@ -120,12 +121,32 @@ class StreamingIndex:
 class SelectionConfig:
     """Frozen selection; there are intentionally no defaults or inferred quotas."""
 
-    seed: int
-    persona_quota: int
-    per_persona_group_quota: int
-    context_rank_indices: tuple[int, ...]
+    seed: int | None
+    persona_quota: int | str
+    per_persona_group_quota: int | str
+    context_rank_indices: tuple[int, ...] | str
+
+    @classmethod
+    def census_v1(cls) -> "SelectionConfig":
+        """The sole formal selector: every valid candidate-visible unit, no RNG."""
+        return cls(None, "ALL", "ALL", "ALL_AVAILABLE_SORTED")
+
+    @property
+    def is_census_v1(self) -> bool:
+        return (
+            self.seed is None
+            and self.persona_quota == "ALL"
+            and self.per_persona_group_quota == "ALL"
+            and self.context_rank_indices == "ALL_AVAILABLE_SORTED"
+        )
 
     def validate(self) -> None:
+        if self.is_census_v1:
+            return
+        # Sentinel values are deliberately all-or-nothing: a partial census is
+        # a hidden sample, not a conservative formal selection.
+        if any(value in {None, "ALL", "ALL_AVAILABLE_SORTED"} for value in (self.seed, self.persona_quota, self.per_persona_group_quota, self.context_rank_indices)):
+            raise CustodyError("invalid_selection_config", field="census_sentinel_mixed")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise CustodyError("invalid_selection_seed")
         for name, value in (("persona_quota", self.persona_quota), ("per_persona_group_quota", self.per_persona_group_quota)):
@@ -460,19 +481,39 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
         raise CustodyError("projection_dataset_schema_invalid")
     for digest in dataset.values(): _token(digest, "projection_digest_invalid")
     receipt = _object(projection.get("selection_receipt"), "projection_selection_receipt_invalid")
+    if receipt.get("algorithm") == CENSUS_SELECTION_ALGORITHM:
+        required_census = {"algorithm", "seed", "persona_quota", "per_persona_group_quota", "context_rank_indices", "context_rank_semantics", "selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "selected_item_context_count", "candidate_visible_query_count", "candidate_visible_persona_count", "candidate_visible_context_count", "group_count", "selected_item_ids_sha256", "per_context_denominators", "denominators_sha256", "item_supplement_count", "exclusion_counts", "quarantine_reason_digests", "quarantine_ledger_sha256"}
+        if set(receipt) != required_census or (receipt.get("seed"), receipt.get("persona_quota"), receipt.get("per_persona_group_quota"), receipt.get("context_rank_indices"), receipt.get("context_rank_semantics")) != (None, "ALL", "ALL", "ALL_AVAILABLE_SORTED", "all_available_sorted_values"):
+            raise CustodyError("projection_census_selection_receipt_invalid")
+        digest_keys = {"selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "selected_item_ids_sha256", "denominators_sha256", "quarantine_ledger_sha256"}
+        if any(not isinstance(receipt.get(key), str) or len(receipt[key]) != 64 for key in digest_keys): raise CustodyError("projection_census_selection_receipt_invalid")
+        count_keys = {"selected_item_context_count", "candidate_visible_query_count", "candidate_visible_persona_count", "candidate_visible_context_count", "group_count", "item_supplement_count"}
+        if any(isinstance(receipt.get(key), bool) or not isinstance(receipt.get(key), int) or receipt[key] < 0 for key in count_keys) or receipt["item_supplement_count"] != 0:
+            raise CustodyError("projection_census_selection_receipt_invalid")
+        expected_exclusions = {"multi_persona_cases", "missing_crosswalk", "ambiguous_canonical_keys", "unmatched_premix_keys", "multiple_logical_matches_or_variants", "missing_requested_context_sizes"}
+        if not isinstance(receipt.get("exclusion_counts"), Mapping) or set(receipt["exclusion_counts"]) != expected_exclusions or any(value != 0 for value in receipt["exclusion_counts"].values()): raise CustodyError("projection_census_quarantine_nonempty")
+        if not isinstance(receipt.get("quarantine_reason_digests"), Mapping) or set(receipt["quarantine_reason_digests"]) != {"multi_persona_cases", "canonical_zero_logical_matches", "ambiguous_canonical_keys", "unmatched_premix_keys", "multiple_logical_matches_or_variants", "missing_requested_context_sizes"}: raise CustodyError("projection_census_selection_receipt_invalid")
+        contexts = receipt.get("per_context_denominators")
+        if not isinstance(contexts, list) or not contexts or any(not isinstance(row, Mapping) or set(row) != {"context_rank", "declared_context_size", "item_count", "item_ids_sha256"} for row in contexts): raise CustodyError("projection_census_selection_receipt_invalid")
+        if [row["context_rank"] for row in contexts] != list(range(len(contexts))) or any(isinstance(row["declared_context_size"], bool) or not isinstance(row["declared_context_size"], int) or row["declared_context_size"] <= 0 or isinstance(row["item_count"], bool) or not isinstance(row["item_count"], int) or row["item_count"] <= 0 or not isinstance(row["item_ids_sha256"], str) or len(row["item_ids_sha256"]) != 64 for row in contexts): raise CustodyError("projection_census_selection_receipt_invalid")
+        # Continue through the common corpus/item audit, then check receipts
+        # against the actual candidate-safe projection below.
+        census_receipt = receipt
+    else:
+        census_receipt = None
     required = {"algorithm", "seed", "persona_quota", "per_persona_group_quota", "context_rank_indices", "context_rank_semantics", "selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "selected_item_context_count", "item_supplement_count", "exclusion_counts", "quarantine_reason_digests", "quarantine_ledger_sha256"}
-    if set(receipt) != required or receipt.get("algorithm") != SELECTION_ALGORITHM:
+    if census_receipt is None and (set(receipt) != required or receipt.get("algorithm") != SELECTION_ALGORITHM):
         raise CustodyError("projection_selection_receipt_schema_invalid")
-    if isinstance(receipt.get("seed"), bool) or not isinstance(receipt.get("seed"), int) or any(isinstance(receipt.get(key), bool) or not isinstance(receipt.get(key), int) or receipt[key] <= 0 for key in ("persona_quota", "per_persona_group_quota")):
+    if census_receipt is None and (isinstance(receipt.get("seed"), bool) or not isinstance(receipt.get("seed"), int) or any(isinstance(receipt.get(key), bool) or not isinstance(receipt.get(key), int) or receipt[key] <= 0 for key in ("persona_quota", "per_persona_group_quota"))):
         raise CustodyError("projection_selection_receipt_value_invalid")
     indices = receipt.get("context_rank_indices")
-    if not isinstance(indices, list) or not indices or any(isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices) or len(set(indices)) != len(indices):
+    if census_receipt is None and (not isinstance(indices, list) or not indices or any(isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices) or len(set(indices)) != len(indices)):
         raise CustodyError("projection_selection_receipt_value_invalid")
-    if receipt.get("context_rank_semantics") != "zero_based_unique_sorted_values": raise CustodyError("projection_selection_receipt_value_invalid")
+    if census_receipt is None and receipt.get("context_rank_semantics") != "zero_based_unique_sorted_values": raise CustodyError("projection_selection_receipt_value_invalid")
     for key in ("selected_persona_ids_sha256", "holdout_persona_set_sha256", "group_values_sha256", "tier_values_sha256", "context_values_sha256", "desired_context_values_sha256", "variant_selection_sha256", "quarantine_ledger_sha256"):
         _token(receipt.get(key), "projection_selection_receipt_digest_invalid")
     expected_exclusions = {"multi_persona_cases", "missing_crosswalk", "ambiguous_canonical_keys", "unmatched_premix_keys", "multiple_logical_matches_or_variants", "missing_requested_context_sizes"}
-    if isinstance(receipt.get("selected_item_context_count"), bool) or not isinstance(receipt.get("selected_item_context_count"), int) or receipt["selected_item_context_count"] < 0 or isinstance(receipt.get("item_supplement_count"), bool) or not isinstance(receipt.get("item_supplement_count"), int) or receipt["item_supplement_count"] < 0 or not isinstance(receipt.get("exclusion_counts"), Mapping) or set(receipt["exclusion_counts"]) != expected_exclusions or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in receipt["exclusion_counts"].values()):
+    if census_receipt is None and (isinstance(receipt.get("selected_item_context_count"), bool) or not isinstance(receipt.get("selected_item_context_count"), int) or receipt["selected_item_context_count"] < 0 or isinstance(receipt.get("item_supplement_count"), bool) or not isinstance(receipt.get("item_supplement_count"), int) or receipt["item_supplement_count"] < 0 or not isinstance(receipt.get("exclusion_counts"), Mapping) or set(receipt["exclusion_counts"]) != expected_exclusions or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in receipt["exclusion_counts"].values())):
         raise CustodyError("projection_selection_receipt_value_invalid")
     quarantine_digests = receipt.get("quarantine_reason_digests")
     if not isinstance(quarantine_digests, Mapping) or set(quarantine_digests) != {"multi_persona_cases", "canonical_zero_logical_matches", "ambiguous_canonical_keys", "unmatched_premix_keys", "multiple_logical_matches_or_variants", "missing_requested_context_sizes"}:
@@ -513,13 +554,72 @@ def validate_candidate_projection(value: Any) -> dict[str, Any]:
     seen = set()
     for item in _list(projection.get("items"), "projection_items_invalid"):
         row = _object(item, "projection_item_invalid")
-        if set(row) != {"item_id", "persona_id", "query_text", "corpus_id"}: raise CustodyError("projection_item_schema_invalid")
+        expected_item_keys = {"item_id", "persona_id", "query_text", "corpus_id"}
+        selection_tokens = {"selection_group_id", "selection_tier_id", "selection_variant_id"}
+        present_selection_tokens = set(row) & selection_tokens
+        if census_receipt is not None:
+            # This opaque, revision-bound token is the only candidate-safe
+            # witness of selected group membership.  It permits recomputing
+            # the census group denominator without revealing a source group.
+            expected_item_keys |= selection_tokens
+        elif present_selection_tokens:
+            expected_item_keys |= selection_tokens
+        if set(row) != expected_item_keys: raise CustodyError("projection_item_schema_invalid")
         item_id = _token(row.get("item_id"), "projection_item_id_invalid")
         if item_id in seen: raise CustodyError("projection_item_duplicate")
         seen.add(item_id); _token(row.get("persona_id"), "projection_persona_id_invalid"); _text(row.get("query_text"), "projection_query_invalid")
         corpus_id = _token(row.get("corpus_id"), "projection_corpus_id_invalid")
         if corpus_id not in corpus_ids: raise CustodyError("projection_context_binding_invalid")
+        if census_receipt is not None or present_selection_tokens:
+            for key in selection_tokens:
+                _token(row.get(key), "projection_selection_token_invalid")
     if len(seen) != receipt.get("selected_item_context_count"): raise CustodyError("projection_item_count_invalid")
+    if census_receipt is not None:
+        items_by_context: dict[int, list[str]] = {}
+        corpora_by_id = {row["corpus_id"]: row for row in projection["corpora"]}
+        persona_ids = sorted({item["persona_id"] for item in projection["items"]})
+        selection_groups = {item["selection_group_id"] for item in projection["items"]}
+        selection_tiers = {item["selection_tier_id"] for item in projection["items"]}
+        selection_variants = sorted(item["selection_variant_id"] for item in projection["items"])
+        candidate_queries = {(item["persona_id"], item["query_text"]) for item in projection["items"]}
+        for item in projection["items"]:
+            items_by_context.setdefault(corpora_by_id[item["corpus_id"]]["declared_context_size"], []).append(item["item_id"])
+        expected_contexts = [
+            {"context_rank": rank, "declared_context_size": context, "item_count": len(sorted(ids)), "item_ids_sha256": canonical_sha256(sorted(ids))}
+            for rank, (context, ids) in enumerate(sorted(items_by_context.items()))
+        ]
+        empty_reason_digest = canonical_sha256([])
+        expected_reasons = {
+            reason: {"count": 0, "keys_sha256": empty_reason_digest}
+            for reason in ("ambiguous_canonical_keys", "unmatched_premix_keys", "canonical_zero_logical_matches", "multiple_logical_matches_or_variants", "missing_requested_context_sizes", "multi_persona_cases")
+        }
+        expected_quarantine_ledger = {
+            "schema": "aerp7-convomem-quarantine-ledger-v2",
+            "dataset_revision_sha256": projection["dataset"]["revision_sha256"],
+            # SQL stores the frozen pre-mix selector values as floats, whereas
+            # candidate corpora canonically expose integral declared sizes.
+            "desired_context_values_sha256": canonical_sha256([float(row["declared_context_size"]) for row in expected_contexts]),
+            "reasons": expected_reasons,
+        }
+        if (
+            receipt["selected_item_ids_sha256"] != canonical_sha256(sorted(seen))
+            or receipt["selected_persona_ids_sha256"] != canonical_sha256(persona_ids)
+            or receipt["holdout_persona_set_sha256"] != canonical_sha256(persona_ids)
+            or receipt["candidate_visible_query_count"] != len(candidate_queries)
+            or receipt["candidate_visible_persona_count"] != len(persona_ids)
+            or receipt["candidate_visible_context_count"] != len(expected_contexts)
+            or receipt["group_values_sha256"] != canonical_sha256(sorted(selection_groups))
+            or receipt["tier_values_sha256"] != canonical_sha256(sorted(selection_tiers))
+            or receipt["variant_selection_sha256"] != canonical_sha256(selection_variants)
+            or receipt["context_values_sha256"] != canonical_sha256([row["declared_context_size"] for row in expected_contexts])
+            or receipt["desired_context_values_sha256"] != canonical_sha256([row["declared_context_size"] for row in expected_contexts])
+            or receipt["quarantine_reason_digests"] != {reason: empty_reason_digest for reason in expected_reasons}
+            or receipt["quarantine_ledger_sha256"] != canonical_sha256(expected_quarantine_ledger)
+            or receipt["per_context_denominators"] != expected_contexts
+            or receipt["group_count"] != len(selection_groups)
+            or receipt["denominators_sha256"] != canonical_sha256({"query_count": len(seen), "candidate_visible_query_count": len(candidate_queries), "persona_count": len(persona_ids), "context_count": len(expected_contexts), "group_count": len(selection_groups), "per_context_denominators": expected_contexts})
+        ):
+            raise CustodyError("projection_census_denominator_binding_invalid")
     _audit(projection)
     return dict(projection)
 
@@ -1054,6 +1154,80 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
         rows = connection.execute(
             "SELECT c.key_sha, c.locator, c.ordinal, c.persona, c.question, c.directory FROM canonical_items c WHERE NOT EXISTS (SELECT 1 FROM forbidden_keys f WHERE f.key_sha=c.key_sha)",
         ).fetchall()
+        if config.is_census_v1:
+            nonzero = {reason: int(data["count"]) for reason, data in ledger["reasons"].items() if int(data["count"]) != 0}
+            if nonzero:
+                # A census cannot turn known malformed / unmatched official
+                # units into a zeroed "exclusion" statistic.  The committed
+                # ledger names every failed class by count and opaque digest.
+                raise CrosswalkError("census_quarantine_nonempty", counts=nonzero, ledger_sha256=ledger["ledger_sha256"])
+            forbidden_count = connection.execute("SELECT count(*) FROM forbidden_keys").fetchone()[0]
+            if forbidden_count:
+                raise CrosswalkError("census_candidate_custody_crosswalk_invalid", forbidden_key_count=forbidden_count)
+            # Every canonical query is a member of the estimand.  Do not turn
+            # incomplete personas, duplicate keys, or absent context variants
+            # into silent exclusions.  The SQL index remains the only source
+            # read after staged ingestion; labels never enter this branch.
+            selected: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            selected_personas: list[str] = []
+            variants: list[str] = []
+            seen_personas: set[str] = set()
+            for row in sorted(rows, key=lambda item: (item["persona"], json.loads(item["directory"])["group"], item["locator"], item["ordinal"])):
+                persona_id = _opaque(secret, revision, "persona", row["persona"])
+                if persona_id not in seen_personas:
+                    selected_personas.append(persona_id); seen_personas.add(persona_id)
+                cases = connection.execute(
+                    "SELECT pc.case_sha, pc.locator, pc.context_size FROM premix_keys p JOIN premix_cases pc ON pc.case_sha=p.case_sha WHERE p.key_sha=? ORDER BY pc.context_size, pc.case_sha",
+                    (row["key_sha"],),
+                ).fetchall()
+                by_context: dict[float, list[sqlite3.Row]] = {}
+                for case in cases:
+                    by_context.setdefault(float(case["context_size"]), []).append(case)
+                if set(by_context) != {float(value) for value in desired_contexts} or any(len(values) != 1 for values in by_context.values()):
+                    raise CrosswalkError("census_context_crosswalk_invalid")
+                canonical = {"key_sha": row["key_sha"], "locator": row["locator"], "ordinal": row["ordinal"], "persona": row["persona"], "persona_id": persona_id, "question": row["question"], "directory": json.loads(row["directory"])}
+                for size in desired_contexts:
+                    case = by_context[float(size)][0]
+                    selected.append((canonical, {"case_sha": case["case_sha"], "locator": json.loads(case["locator"]), "context_size": float(case["context_size"])}))
+                    variants.append(case["case_sha"])
+            if not selected:
+                raise CustodyError("census_selection_empty")
+            all_tiers = [row[0] for row in connection.execute("SELECT DISTINCT json_extract(directory, '$.tier') FROM canonical_items ORDER BY 1")]
+            receipt = {
+                "algorithm": CENSUS_SELECTION_ALGORITHM,
+                "seed": None,
+                "persona_quota": "ALL",
+                "per_persona_group_quota": "ALL",
+                "context_rank_indices": "ALL_AVAILABLE_SORTED",
+                "context_rank_semantics": "all_available_sorted_values",
+                # The public validator recomputes this from opaque IDs; the
+                # selector's raw-persona traversal must not leak into or alter
+                # the census seal.
+                "selected_persona_ids_sha256": canonical_sha256(sorted(selected_personas)),
+                "holdout_persona_set_sha256": canonical_sha256(sorted(selected_personas)),
+                "group_values_sha256": canonical_sha256(groups),
+                "tier_values_sha256": canonical_sha256(all_tiers),
+                "context_values_sha256": canonical_sha256(_indexed_context_values(database)),
+                "desired_context_values_sha256": canonical_sha256(list(desired_contexts)),
+                "variant_selection_sha256": canonical_sha256(variants),
+                "selected_item_context_count": len(selected),
+                "candidate_visible_query_count": len(rows),
+                "candidate_visible_persona_count": len(selected_personas),
+                "candidate_visible_context_count": len(desired_contexts),
+                "denominators_sha256": canonical_sha256({"query_count": len(selected), "candidate_visible_query_count": len(rows), "persona_count": len(selected_personas), "context_count": len(desired_contexts)}),
+                "item_supplement_count": 0,
+                "exclusion_counts": {
+                    "multi_persona_cases": ledger["reasons"]["multi_persona_cases"]["count"],
+                    "missing_crosswalk": ledger["reasons"]["canonical_zero_logical_matches"]["count"],
+                    "ambiguous_canonical_keys": ledger["reasons"]["ambiguous_canonical_keys"]["count"],
+                    "unmatched_premix_keys": ledger["reasons"]["unmatched_premix_keys"]["count"],
+                    "multiple_logical_matches_or_variants": ledger["reasons"]["multiple_logical_matches_or_variants"]["count"],
+                    "missing_requested_context_sizes": ledger["reasons"]["missing_requested_context_sizes"]["count"],
+                },
+                "quarantine_reason_digests": {reason: ledger["reasons"][reason]["keys_sha256"] for reason in ledger["reasons"]},
+                "quarantine_ledger_sha256": ledger["ledger_sha256"],
+            }
+            return selected, receipt
         by_persona: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
             by_persona.setdefault(row["persona"], []).append(row)
@@ -1151,14 +1325,21 @@ def _selected_payloads_sql(database: Path, selected: Sequence[tuple[dict[str, An
                 raise CustodyError("premix_context_size_invalid")
             corpora.setdefault(corpus_id, {"corpus_id": corpus_id, "declared_context_size": int(declared_context_size), "actual_conversation_count": len({message["conversation_id"] for message in messages}), "actual_message_count": len(messages), "candidates": candidates})
             context_id = _opaque(secret, revision, "item-context", {"canonical_item_id": canonical_id, "corpus_id": corpus_id})
-            projection_items.append({"item_id": context_id, "persona_id": item["persona_id"], "query_text": item["question"], "corpus_id": corpus_id})
+            directory = json.loads(canonical_row["directory"])
+            projection_items.append({
+                "item_id": context_id, "persona_id": item["persona_id"],
+                "query_text": item["question"], "corpus_id": corpus_id,
+                "selection_group_id": _opaque(secret, revision, "selection-group", item["directory"]["group"]),
+                "selection_tier_id": _opaque(secret, revision, "selection-tier", directory["tier"]),
+                "selection_variant_id": _opaque(secret, revision, "selection-variant", case["case_sha"]),
+            })
             if len(candidates) != len(messages):
                 raise CustodyError("selected_message_count_invalid")
             evidence_conversation_ids = [_opaque(secret, revision, "conversation", conversation_id) for conversation_id in json.loads(canonical_row["conversations"])]
             candidate_conversation_ids = {candidate["opaque_conversation_id"] for candidate in candidates}
             if not set(evidence_conversation_ids) <= candidate_conversation_ids:
                 raise CustodyError("evidence_conversation_not_in_corpus")
-            custody_items.append({"item_id": context_id, "canonical_item_id": canonical_id, "persona_id": item["persona_id"], "persona_source_id": item["persona"], "corpus_id": corpus_id, "source_locator": {"canonical": locator, "case": case["locator"]}, "directory": json.loads(canonical_row["directory"]), "labels": {"answer": canonical_row["answer"], "message_evidences": json.loads(canonical_row["labels"])}, "evidence_conversation_ids": evidence_conversation_ids, "messages": [{"message_id": candidate["message_id"], "source_locator": message["source_locator"]} for candidate, message in zip(candidates, messages)]})
+            custody_items.append({"item_id": context_id, "canonical_item_id": canonical_id, "persona_id": item["persona_id"], "persona_source_id": item["persona"], "corpus_id": corpus_id, "source_locator": {"canonical": locator, "case": case["locator"]}, "directory": directory, "labels": {"answer": canonical_row["answer"], "message_evidences": json.loads(canonical_row["labels"])}, "evidence_conversation_ids": evidence_conversation_ids, "messages": [{"message_id": candidate["message_id"], "source_locator": message["source_locator"]} for candidate, message in zip(candidates, messages)]})
         return [corpora[key] for key in sorted(corpora)], projection_items, custody_items
     finally:
         connection.close()
@@ -1537,7 +1718,20 @@ def _publish_single(output: Path, *, payload_name: str, payload: dict[str, Any],
     if _directory_identity(parent, "output_parent_identity_drift") != parent_identity:
         raise CustodyError("output_parent_identity_drift")
     try: os.mkdir(target)
-    except FileExistsError as exc: raise CustodyError("output_already_exists") from exc
+    except FileExistsError:
+        # A crash after custody publication but before candidate publication is
+        # recoverable only when every published byte exactly matches this rebuilt
+        # deterministic generation.  Never adopt a partial or foreign directory.
+        if target.is_symlink() or not target.is_dir() or {entry.name for entry in target.iterdir()} != {payload_name, "READY.json"}:
+            raise CustodyError("output_already_exists")
+        payload_path, ready_path = target / payload_name, target / "READY.json"
+        raw, _identity, raw_sha = _snapshot(payload_path, "publication_existing_invalid")
+        checked = validator(_decode(raw, "publication_existing_invalid"))
+        ready_raw, _ready_identity, _ready_sha = _snapshot(ready_path, "publication_existing_invalid")
+        existing_ready = _decode(ready_raw, "publication_existing_invalid")
+        if raw != _bytes(payload) or raw_sha != payload_binding["raw_sha256"] or canonical_sha256(checked) != payload_binding["canonical_sha256"] or existing_ready != ready:
+            raise CustodyError("publication_existing_conflict")
+        return dict(ready)
     except OSError as exc: raise CustodyError("output_claim_failed") from exc
     identity = _directory_identity(target, "publication_target_identity_drift")
     created: dict[Path, tuple[int, int]] = {}
@@ -1598,6 +1792,49 @@ def _publish_candidate(output: Path, projection: dict[str, Any], ready: dict[str
     return _publish_single(output, payload_name="projection.json", payload=projection, ready=ready, payload_binding=ready["projection"], validator=validate_candidate_projection)
 
 
+def resume_candidate_ready(*, output: Path, projection: dict[str, Any], ready: dict[str, Any]) -> dict[str, Any]:
+    """Finish only the candidate READY half of a custody-first publication.
+
+    The caller must already have authenticated custody's matching public
+    commitment.  This routine never reads custody data; it requires the sole
+    pre-existing candidate byte to equal the supplied safe projection and then
+    publishes READY with the same non-replace hard-link/fsync boundaries as the
+    regular publisher.
+    """
+    _candidate_ready(ready)
+    target = output.resolve(strict=True)
+    parent = target.parent
+    parent_identity = _directory_identity(parent, "output_parent_identity_drift")
+    if not output.is_absolute() or _directory_identity(parent, "output_parent_identity_drift") != parent_identity or target.is_symlink() or not target.is_dir() or {entry.name for entry in target.iterdir()} != {"projection.json"}:
+        raise CustodyError("candidate_ready_resume_invalid")
+    raw, _identity, raw_sha = _snapshot(target / "projection.json", "candidate_ready_resume_invalid")
+    checked = validate_candidate_projection(_decode(raw, "candidate_ready_resume_invalid"))
+    if raw != _bytes(projection) or raw_sha != ready["projection"]["raw_sha256"] or canonical_sha256(checked) != ready["projection"]["canonical_sha256"]:
+        raise CustodyError("candidate_ready_resume_binding_invalid")
+    temporary, final = target / ".READY.json.tmp", target / "READY.json"
+    try:
+        _write(temporary, ready)
+        temp_identity = _snapshot(temporary, "candidate_ready_resume_invalid")[1]
+        os.link(temporary, final)
+        _fsync_directory(target, code="candidate_ready_resume_directory_fsync_failed")
+        linked = os.lstat(final)
+        if (linked.st_dev, linked.st_ino) != temp_identity or not stat.S_ISREG(linked.st_mode):
+            raise CustodyError("candidate_ready_resume_alias_invalid")
+        os.unlink(temporary)
+        _fsync_directory(target, code="candidate_ready_resume_cleanup_fsync_failed")
+        _candidate_ready(_decode(_snapshot(final, "candidate_ready_resume_invalid")[0], "candidate_ready_resume_invalid"))
+    except FileExistsError as exc:
+        raise CustodyError("candidate_ready_resume_collision") from exc
+    except Exception:
+        # A remaining temporary is non-loadable and must not be adopted on a
+        # subsequent retry; exact-byte retry begins from the trusted custody
+        # generation, not a half-written candidate marker.
+        if temporary.exists():
+            temporary.unlink()
+        raise
+    return dict(ready)
+
+
 def _publish_custody(output: Path, custody: dict[str, Any], projection: dict[str, Any], candidate_ready: Mapping[str, Any], *, binding_secret: bytes) -> dict[str, Any]:
     ready = {"schema": CUSTODY_READY_SCHEMA, "generation_id": candidate_ready["generation_id"], "candidate_projection": dict(candidate_ready["projection"]), "custody": {"raw_sha256": hashlib.sha256(_bytes(custody)).hexdigest(), "canonical_sha256": canonical_sha256(custody)}, "durability": _durability_receipt()}
     return _publish_single(output, payload_name="sealed-custody.json", payload=custody, ready=ready, payload_binding=ready["custody"], validator=lambda value: _validate_custody(value, projection, binding_secret=binding_secret))
@@ -1616,12 +1853,33 @@ def build_prelabel_bundle(*, canonical_root: Path, premix_root: Path, candidate_
     try:
         _verify_index_bytes(index, "sqlite_index_preselection_drift")
         context_values = _indexed_context_values(index.database)
-        if any(rank >= len(context_values) for rank in selection.context_rank_indices):
-            raise CustodyError("context_rank_unavailable")
-        desired_contexts = [context_values[rank] for rank in selection.context_rank_indices]
+        if selection.is_census_v1:
+            desired_contexts = context_values
+        else:
+            if any(rank >= len(context_values) for rank in selection.context_rank_indices):
+                raise CustodyError("context_rank_unavailable")
+            desired_contexts = [context_values[rank] for rank in selection.context_rank_indices]
         ledger = _validate_quarantine_ledger(_quarantine_ledger(index.database, index.revision, desired_contexts), index.revision)
         chosen, receipt = _selection_rows_sql(index.database, secret, index.revision, selection, desired_contexts, ledger)
         corpora, projection_items, custody_items = _selected_payloads_sql(index.database, chosen, secret, index.revision)
+        if selection.is_census_v1:
+            corpora_by_id = {row["corpus_id"]: row for row in corpora}
+            per_context: dict[int, list[str]] = {}
+            for item in projection_items:
+                per_context.setdefault(corpora_by_id[item["corpus_id"]]["declared_context_size"], []).append(item["item_id"])
+            rows = [
+                {"context_rank": rank, "declared_context_size": context, "item_count": len(sorted(ids)), "item_ids_sha256": canonical_sha256(sorted(ids))}
+                for rank, (context, ids) in enumerate(sorted(per_context.items()))
+            ]
+            receipt["group_count"] = len({item["selection_group_id"] for item in projection_items})
+            receipt["group_values_sha256"] = canonical_sha256(sorted({item["selection_group_id"] for item in projection_items}))
+            receipt["tier_values_sha256"] = canonical_sha256(sorted({item["selection_tier_id"] for item in projection_items}))
+            receipt["variant_selection_sha256"] = canonical_sha256(sorted(item["selection_variant_id"] for item in projection_items))
+            receipt["context_values_sha256"] = canonical_sha256([row["declared_context_size"] for row in rows])
+            receipt["desired_context_values_sha256"] = canonical_sha256([row["declared_context_size"] for row in rows])
+            receipt["selected_item_ids_sha256"] = canonical_sha256(sorted(item["item_id"] for item in projection_items))
+            receipt["per_context_denominators"] = rows
+            receipt["denominators_sha256"] = canonical_sha256({"query_count": len(projection_items), "candidate_visible_query_count": receipt["candidate_visible_query_count"], "persona_count": receipt["candidate_visible_persona_count"], "context_count": receipt["candidate_visible_context_count"], "group_count": receipt["group_count"], "per_context_denominators": rows})
         _verify_index_bytes(index, "sqlite_index_postmaterialization_drift")
         dataset = {"canonical_sha256": index.canonical_digest, "premix_sha256": index.premix_digest, "revision_sha256": index.revision, "source_inventory_sha256": index.staging_receipt["source_inventory_sha256"]}
         projection = {"schema": SCHEMA, "dataset": dataset, "selection_receipt": receipt, "corpora": corpora, "items": projection_items}
@@ -1642,7 +1900,9 @@ def build_prelabel_bundle(*, canonical_root: Path, premix_root: Path, candidate_
             index_live = False
             raise
         index_live = False
-        generation_id = secrets.token_hex(32)
+        # Deterministic across a crash/retry: it is derived from the already
+        # frozen source revision and full selection receipt, never a result.
+        generation_id = _opaque(secret, index.revision, "published-generation", receipt)
         candidate_ready = _candidate_ready_value(projection, generation_id)
         # Custody is published first.  A subsequent candidate-publication failure
         # leaves a non-clobbering, unusable custody generation rather than a
@@ -1665,13 +1925,22 @@ def build_prelabel_bundle(*, canonical_root: Path, premix_root: Path, candidate_
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Publish AERP-7 candidate-safe ConvoMem prelabels.")
     for flag in ("canonical-root", "premix-root", "candidate-output-dir", "custody-output-dir", "staging-root", "secret-key-file"): parser.add_argument("--" + flag, required=True, type=Path)
-    parser.add_argument("--seed", required=True, type=int); parser.add_argument("--persona-quota", required=True, type=int); parser.add_argument("--per-persona-group-quota", required=True, type=int); parser.add_argument("--context-rank-index", required=True, type=int, action="append")
+    parser.add_argument("--census-v1", action="store_true", help="formal selector: all candidate-visible units; forbids RNG")
+    parser.add_argument("--seed", type=int); parser.add_argument("--persona-quota", type=int); parser.add_argument("--per-persona-group-quota", type=int); parser.add_argument("--context-rank-index", type=int, action="append")
     args = parser.parse_args(argv)
     try:
         _safe_existing_ancestors(args.secret_key_file, "secret_key_path_invalid")
         if args.secret_key_file.is_symlink() or not args.secret_key_file.is_file(): raise CustodyError("secret_key_path_invalid")
         secret_raw, _secret_identity, _secret_digest = _snapshot(args.secret_key_file, "secret_key_snapshot_invalid")
-        result = build_prelabel_bundle(canonical_root=args.canonical_root, premix_root=args.premix_root, candidate_output_dir=args.candidate_output_dir, custody_output_dir=args.custody_output_dir, staging_root=args.staging_root, secret=secret_raw, selection=SelectionConfig(args.seed, args.persona_quota, args.per_persona_group_quota, tuple(args.context_rank_index)))
+        if args.census_v1:
+            if any(value is not None for value in (args.seed, args.persona_quota, args.per_persona_group_quota, args.context_rank_index)):
+                raise CustodyError("invalid_selection_config", field="census_cli_mixed")
+            selection = SelectionConfig.census_v1()
+        else:
+            if args.seed is None or args.persona_quota is None or args.per_persona_group_quota is None or not args.context_rank_index:
+                raise CustodyError("invalid_selection_config", field="sample_cli_incomplete")
+            selection = SelectionConfig(args.seed, args.persona_quota, args.per_persona_group_quota, tuple(args.context_rank_index))
+        result = build_prelabel_bundle(canonical_root=args.canonical_root, premix_root=args.premix_root, candidate_output_dir=args.candidate_output_dir, custody_output_dir=args.custody_output_dir, staging_root=args.staging_root, secret=secret_raw, selection=selection)
     except CustodyError as exc:
         print(json.dumps({"status": "failed", "receipt": exc.receipt}, sort_keys=True, separators=(",", ":"))); return 2
     print(json.dumps({"status": "published", **result}, sort_keys=True, separators=(",", ":"))); return 0

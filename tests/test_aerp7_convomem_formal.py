@@ -1,6 +1,8 @@
 import copy
 import hashlib
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -38,8 +40,10 @@ def projection():
 
 def protocol(p, candidate=None):
     model, code = receipts()
-    candidate = candidate or {"generation_id": h("generation"), "ready_sha256": h("ready"), "projection_raw_sha256": h("raw"), "projection_canonical_sha256": canonical_sha256(p)}
-    row = {"schema": formal.FORMAL_PROTOCOL_SCHEMA, "synthetic_test_mode": False, "candidate": candidate, "current_code_receipt": code, "original_code_receipt": code, "source_receipt": rank.PROTOCOL_SOURCE, "model_receipt": model, "arms": list(rank_score_arms()), "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}, "top_k": 10, "tie_break": "stable_ranking_key_ascending", "original_build_count": 5, "p5_repeat_required": True, "bootstrap": {"seed": 20260822, "resamples": 5000, "percentile_lower": .025, "percentile_upper": .975, "percentile_rule": "linear", "original_replicate_rule": "per_query_arithmetic_mean"}, "gates": {"overall_delta_min": .01, "overall_ci_lower_gt_zero": 0.0, "hard_delta_min": 0.0, "hard_ci_lower_min": -.01, "abstention_ci_lower_min": -.01, "guardrails_required": True}, "resource_thresholds": {"resource_comparability": "strict", "peak_rss_bytes_max": 2_000_000_000, "storage_bytes_max": 2_000_000_000, "ingest_seconds_max": 100.0, "index_seconds_max": 100.0, "query_p95_ns_max": 1_000_000_000}}
+    candidate = candidate or {"generation_id": h("generation"), "ready_sha256": h("ready"), "projection_raw_sha256": h("raw"), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}
+    checkpoint = {"schema": "aerp7-execution-checkpoint-binding-v1", "expected_checkpoint_path": str((Path.cwd() / "synthetic-aerp8-checkpoint.json").resolve()), "checkpoint_sha256": h("checkpoint"), "driver_code_receipt": {"synthetic": True}, "original_execution_policy": {"synthetic": True}, "original_execution_policy_sha256": h("policy"), "current_code_receipt": code, "aerp8_validation_scope": "immutable_driver_sources_and_live_original_policy"}
+    checkpoint["binding_sha256"] = formal._digest(checkpoint)
+    row = {"schema": formal.FORMAL_PROTOCOL_SCHEMA, "synthetic_test_mode": False, "candidate": candidate, "current_code_receipt": code, "original_code_receipt": code, "execution_checkpoint": checkpoint, "source_receipt": rank.PROTOCOL_SOURCE, "model_receipt": model, "arms": list(rank_score_arms()), "primary_current_arm": {"arm_id": "six_view_secondary", "config_sha256": formal._digest(rank._arm_method("six_view_secondary")), "ranker_code_sha256": formal._ranker_code_sha256()}, "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}, "top_k": 10, "tie_break": "stable_ranking_key_ascending", "original_build_count": 5, "p5_repeat_required": True, "bootstrap": score.FORMAL_BOOTSTRAP, "gates": {"primary_delta_min": .01, "primary_ci_lower_gt_zero": 0.0}, "resource_thresholds": {"resource_comparability": "unavailable", "peak_rss_bytes_max": None, "storage_bytes_max": None, "ingest_seconds_max": None, "index_seconds_max": None, "query_p95_ns_max": None}}
     row["protocol_sha256"] = formal.protocol_digest(row)
     return row
 
@@ -86,7 +90,7 @@ def resource(arm, artifact_sha, build_id=None, index_sha=None, p=None, execution
     original = arm == "original_public_product"
     passage = {"calls": 1, "texts": c, "measurement_kind": "public_upsert_request_proxy" if original else "encoder_adapter_api_calls", "native_embedding_observable": not original, "limitation": "synthetic public proxy" if original else None}
     query = {"calls": q, "texts": q, "measurement_kind": "public_search_request_proxy" if original else "encoder_adapter_api_calls", "native_embedding_observable": not original, "limitation": "synthetic public proxy" if original else None}
-    row = {"schema": formal.RESOURCE_SCHEMA, "arm_id": arm, "execution_role": execution_role, "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm == "strong_raw" else "native_public_product" if original else "all_six_views_computed_then_fixed_fusion", "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization", "measurement_mode": "live_original_public_product" if original else "live_native_adapter", "resource_comparability": "strict", "p5_repeat_accounting": accounting, "ingest_seconds": 1.0, "index_seconds": 1.0, "query_measurements": measurements, "query_latency_ns": {"wall": formal._latency_percentiles([row["wall_ns"] for row in measurements]), "cpu": formal._latency_percentiles([row["cpu_ns"] for row in measurements])}, "passage_embedding": passage, "query_embedding": query, "storage_scope": "palace_directory_after_cold_reopen" if original else "no_persistent_index", "storage_bytes": 100 if original else 0, "peak_rss_bytes": 100, "artifact_sha256": artifact_sha, "build_id": build_id, "index_sha256": index_sha, "input_denominators": {"query_count": q, "candidate_text_count": c}, "hardware_runtime": {"python": "synthetic-python", "platform": "synthetic-platform", "processor": "synthetic-cpu"}}
+    row = {"schema": formal.RESOURCE_SCHEMA, "arm_id": arm, "execution_role": execution_role, "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm == "strong_raw" else "native_public_product" if original else "all_six_views_computed_then_fixed_fusion", "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization", "measurement_mode": "live_original_public_product" if original else "live_native_adapter", "resource_comparability": "unavailable", "p5_repeat_accounting": accounting, "ingest_seconds": 1.0, "index_seconds": 1.0, "query_measurements": measurements, "query_latency_ns": {"wall": formal._latency_percentiles([row["wall_ns"] for row in measurements]), "cpu": formal._latency_percentiles([row["cpu_ns"] for row in measurements])}, "passage_embedding": passage, "query_embedding": query, "storage_scope": "palace_directory_after_cold_reopen" if original else "no_persistent_index", "storage_bytes": 100 if original else 0, "peak_rss_bytes": 100, "artifact_sha256": artifact_sha, "build_id": build_id, "index_sha256": index_sha, "input_denominators": {"query_count": q, "candidate_text_count": c}, "hardware_runtime": {"python": "synthetic-python", "platform": "synthetic-platform", "processor": "synthetic-cpu"}}
     row["resource_sha256"] = formal.resource_digest(row)
     return row
 
@@ -360,7 +364,7 @@ def test_post_score_attestation_is_independent_of_release_and_rejects_resealed_r
         formal.validate_post_score_attestation(attestation, release=release, report=report, protocol=protocol_row, endpoint_manifest=endpoint, scorer_attestation_secret=secret)
 
 
-def _published_confirmation_bundle(tmp_path, monkeypatch, name):
+def _published_confirmation_bundle(tmp_path, name):
     canonical, premix, candidate, custody = tmp_path / (name + "-labels"), tmp_path / (name + "-premix"), tmp_path / name, tmp_path / (name + "-custody")
     cases = []
     for persona in ("p-a", "p-b"):
@@ -370,15 +374,23 @@ def _published_confirmation_bundle(tmp_path, monkeypatch, name):
             path = canonical / "core_benchmark" / "evidence_questions" / group / "tier-1" / f"{persona}.json"; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps({"evidence_items": [evidence]}))
             for size in (1, 8, 13): cases.append({"contextSize": size, "evidenceItems": [{key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}], "conversations": [{"id": conversation, "messages": [{"speaker": "speaker", "text": "candidate-a"}, {"speaker": "speaker", "text": "candidate-b"}]}]})
     path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(cases))
-    monkeypatch.setattr(confirmation, "_verify_sqlite_temp_environment", lambda staging: {"os_rule": "synthetic", "resolved_temp_path": str(staging)})
     staging = tmp_path / (name + "-staging"); staging.mkdir()
     secret = b"aerp7-synthetic-secret-key-must-be-long"
-    confirmation.build_prelabel_bundle(canonical_root=canonical, premix_root=premix, candidate_output_dir=candidate, custody_output_dir=custody, staging_root=staging, secret=secret, selection=confirmation.SelectionConfig(seed=7, persona_quota=1, per_persona_group_quota=1, context_rank_indices=(0, 2)))
+    # Exercise the actual builder path, including its platform temp-location
+    # contract; this is deliberately not a mocked parser/publication path.
+    prior = {key: os.environ.get(key) for key in ("TEMP", "TMP", "SQLITE_TMPDIR")}
+    os.environ["TEMP"] = str(staging); os.environ["TMP"] = str(staging); os.environ["SQLITE_TMPDIR"] = str(staging)
+    try:
+        confirmation.build_prelabel_bundle(canonical_root=canonical, premix_root=premix, candidate_output_dir=candidate, custody_output_dir=custody, staging_root=staging, secret=secret, selection=confirmation.SelectionConfig(seed=7, persona_quota=1, per_persona_group_quota=1, context_rank_indices=(0, 2)))
+    finally:
+        for key, value in prior.items():
+            if value is None: os.environ.pop(key, None)
+            else: os.environ[key] = value
     return candidate, custody, secret
 
 
 def test_open_custody_after_release_uses_actual_confirmation_bundles(tmp_path, monkeypatch):
-    candidate, custody, binding_secret = _published_confirmation_bundle(tmp_path, monkeypatch, "A"); p = confirmation.load_candidate_projection(candidate)
+    candidate, custody, binding_secret = _published_confirmation_bundle(tmp_path, "A"); p = confirmation.load_candidate_projection(candidate)
     ready_raw = (candidate / "READY.json").read_bytes(); projection_raw = (candidate / "projection.json").read_bytes(); ready = json.loads(ready_raw)
     candidate_receipt = {"generation_id": ready["generation_id"], "ready_sha256": hashlib.sha256(ready_raw).hexdigest(), "projection_raw_sha256": hashlib.sha256(projection_raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}
     (tmp_path / "staging").mkdir(); proto = protocol(p, candidate_receipt); config = worker_config(p, proto); current, current_receipt = formal.freeze_current_worker(encoder=Encoder(), protocol=proto, worker_config=config, candidate_bundle_root=candidate, staging_parent=tmp_path)
@@ -414,9 +426,24 @@ def test_open_custody_after_release_uses_actual_confirmation_bundles(tmp_path, m
     monkeypatch.setattr(confirmation, "load_custody_for_scoring", original_loader)
     # Keep the original candidate (whose READY was restored byte-for-byte) so
     # the final custody tamper reaches the custody binding check.
-    candidate_b, custody_b, _ = _published_confirmation_bundle(tmp_path, monkeypatch, "B")
+    candidate_b, custody_b, _ = _published_confirmation_bundle(tmp_path, "B")
     with pytest.raises(CustodyError, match="candidate_release_ready_binding_invalid"):
         formal.open_custody_after_release(release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_raw, custody_capability_secret=b"c" * 32, candidate_bundle_root=candidate_b, custody_bundle_root=custody_b, binding_secret=binding_secret)
     (custody / "sealed-custody.json").write_bytes(b"{}")
     with pytest.raises(CustodyError, match="custody_release_bundle_binding_invalid"):
         formal.open_custody_after_release(release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_raw, custody_capability_secret=b"c" * 32, candidate_bundle_root=candidate, custody_bundle_root=custody, binding_secret=binding_secret)
+
+
+def test_formal_protocol_freezes_six_view_as_the_unique_primary_arm():
+    row = protocol(projection())
+    row["primary_current_arm"] = {
+        "arm_id": "six_view_secondary",
+        "config_sha256": formal._digest(rank._arm_method("six_view_secondary")),
+        "ranker_code_sha256": formal._ranker_code_sha256(),
+    }
+    row["protocol_sha256"] = formal.protocol_digest(row)
+    assert formal.validate_formal_protocol(row)["primary_current_arm"]["arm_id"] == "six_view_secondary"
+    row["primary_current_arm"]["arm_id"] = "static_p5"
+    row["protocol_sha256"] = formal.protocol_digest(row)
+    with pytest.raises(CustodyError, match="formal_primary_current_arm_invalid"):
+        formal.validate_formal_protocol(row)

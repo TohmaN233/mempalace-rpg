@@ -881,9 +881,17 @@ def _scrubbed_original_env(*, original_python:Path, rpg_root:Path, git_executabl
         if value: env[key]=value
     return env
 
+def _venv_python(root:Path,*,os_name:str|None=None)->Path:
+    """Return the conventional virtualenv interpreter for the host family."""
+    name=os.name if os_name is None else os_name
+    if name=="nt": return root/".venv"/"Scripts"/"python.exe"
+    if name=="posix": return root/".venv"/"bin"/"python"
+    raise MemBenchError("membench_driver_worker_python_invalid")
+
+
 def _driver_code_receipt()->dict[str,Any]:
     root=Path(__file__).resolve().parents[1]
-    worker_python=root/".venv"/"Scripts"/"python.exe"
+    worker_python=_venv_python(root)
     venv_config=root/".venv"/"pyvenv.cfg"
     if not worker_python.is_file() or worker_python.is_symlink() or not venv_config.is_file() or venv_config.is_symlink(): raise MemBenchError("membench_driver_worker_python_invalid")
     module_names=("benchmarks.aerp8_membench","benchmarks.aerp7_convomem_rank","mempalace_rpg.retrieval","benchmarks.aerp7_original_core","benchmarks.aerp7_original_product")

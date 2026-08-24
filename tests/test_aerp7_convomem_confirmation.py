@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks import aerp7_convomem_confirmation as custody
+from benchmarks import aerp7_convomem_one_shot as one_shot
 
 
 SECRET = b"aerp7-synthetic-secret-key-must-be-long"
@@ -1000,3 +1001,91 @@ def test_linux_without_renameat2_rejects_before_streaming_official_reads(tmp_pat
     monkeypatch.setattr(custody, "_source_size_inventory", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("official input was read")))
     with pytest.raises(custody.CustodyError, match="builder_platform_unsupported"):
         custody._streaming_index(custody._subroot(canonical, "evidence_questions"), custody._subroot(premix, "pre_mixed_testcases"), _staging(tmp_path))
+
+
+def test_census_v1_selection_is_explicitly_rng_free() -> None:
+    selection = custody.SelectionConfig.census_v1()
+    selection.validate()
+    assert selection.seed is None
+    assert selection.persona_quota == "ALL"
+    assert selection.per_persona_group_quota == "ALL"
+    assert selection.context_rank_indices == "ALL_AVAILABLE_SORTED"
+
+
+def test_census_v1_publishes_a_projection_that_validates_its_exact_denominators(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    output = tmp_path / "census"
+    _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    projection = custody.load_candidate_projection(output)
+    receipt = projection["selection_receipt"]
+    assert receipt["algorithm"] == custody.CENSUS_SELECTION_ALGORITHM
+    assert receipt["selected_item_ids_sha256"] == custody.canonical_sha256(sorted(item["item_id"] for item in projection["items"]))
+    assert receipt["selected_persona_ids_sha256"] == custody.canonical_sha256(sorted({item["persona_id"] for item in projection["items"]}))
+    assert sum(row["item_count"] for row in receipt["per_context_denominators"]) == len(projection["items"])
+    assert receipt["group_count"] == len({item["selection_group_id"] for item in projection["items"]})
+    first = projection["items"][0]["selection_group_id"]
+    for item in projection["items"]:
+        item["selection_group_id"] = first
+    with pytest.raises(custody.CustodyError, match="census_denominator_binding_invalid"):
+        custody.validate_candidate_projection(projection)
+
+
+def test_formal_source_outputs_must_be_new(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    candidate = tmp_path / "candidate"; custody_root = _custody_bundle(candidate)
+    _publish(canonical=canonical, premix=premix, output=candidate, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    staging = tmp_path / "fresh-staging"; staging.mkdir()
+    plan = {
+        "candidate_output_dir": str(candidate), "custody_output_dir": str(custody_root),
+        "output_dir": str(tmp_path / "public"), "staging_root": str(staging),
+        **{key: str(tmp_path / (key + ".json")) for key in (
+            "protocol_path", "authorization_path", "custodian_public_config_path", "final_output_path",
+            "one_shot_receipt_path", "infrastructure_failure_receipt_path", "progress_receipt_path",
+        )},
+    }
+    with pytest.raises(custody.CustodyError, match="formal_output_not_new"):
+        one_shot._require_new_formal_targets(plan=plan)
+
+
+@pytest.mark.parametrize("seal", (
+    "group_values_sha256", "tier_values_sha256", "variant_selection_sha256",
+    "context_values_sha256", "desired_context_values_sha256", "quarantine_ledger_sha256",
+))
+def test_census_v1_recomputes_each_public_selection_seal(tmp_path: Path, seal: str) -> None:
+    canonical, premix = _roots(tmp_path)
+    output = tmp_path / "census-seals"
+    _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    projection = custody.load_candidate_projection(output)
+    projection["selection_receipt"][seal] = "0" * 64
+    with pytest.raises(custody.CustodyError, match="census_denominator_binding_invalid"):
+        custody.validate_candidate_projection(projection)
+
+
+def test_census_v1_recomputes_each_quarantine_reason_digest(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    output = tmp_path / "census-quarantine"
+    _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    projection = custody.load_candidate_projection(output)
+    projection["selection_receipt"]["quarantine_reason_digests"]["unmatched_premix_keys"] = "0" * 64
+    with pytest.raises(custody.CustodyError, match="census_denominator_binding_invalid"):
+        custody.validate_candidate_projection(projection)
+
+
+def test_census_v1_rejects_any_multi_persona_quarantine_without_publication(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path, mixed=True)
+    output = tmp_path / "census"
+    with pytest.raises(custody.CrosswalkError, match="census_quarantine_nonempty"):
+        _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    assert not output.exists()
+
+
+def test_census_v1_rejects_unmatched_premix_keys_without_publication(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
+    cases = json.loads(cases_path.read_text(encoding="utf-8"))
+    cases.append({"contextSize": 1, "evidenceItems": [{"personId": "p-missing", "question": "q-missing", "answer": "SECRET-missing", "category": "category-missing", "conversations": [{"id": "missing-conversation"}]}], "conversations": [{"id": "missing-conversation", "messages": [{"speaker": "speaker", "text": "candidate"}]}]})
+    _write(cases_path, cases)
+    output = tmp_path / "census"
+    with pytest.raises(custody.CrosswalkError, match="census_quarantine_nonempty"):
+        _publish(canonical=canonical, premix=premix, output=output, staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+    assert not output.exists()

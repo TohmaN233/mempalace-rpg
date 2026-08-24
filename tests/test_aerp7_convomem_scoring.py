@@ -77,6 +77,16 @@ def test_full_synthetic_scoring_is_leak_free_and_bootstrap_is_deterministic():
     assert score.validate_report(first)["report_sha256"]==first["report_sha256"]
 
 
+def test_evidence_micro_recall_at_10_is_an_explicit_secondary_denominator():
+    rows = [
+        {"metrics": {"evidence_item_count": 2, "resolved_evidence_item_count": 2, "unresolved_evidence_item_count": 0, "retrieved_evidence_count_at_10": 1, "recall_at_10": .5, "hit_at_10": 1., "all_at_10": 0., "ndcg_at_10": .5, "mrr_at_10": 1.}},
+        {"metrics": {"evidence_item_count": 1, "resolved_evidence_item_count": 1, "unresolved_evidence_item_count": 0, "retrieved_evidence_count_at_10": 1, "recall_at_10": 1., "hit_at_10": 1., "all_at_10": 1., "ndcg_at_10": 1., "mrr_at_10": 1.}},
+    ]
+    summary = score._metric_summary(rows)
+    assert summary["evidence_micro_recall_at_10"] == pytest.approx(2 / 3)
+    assert summary["recall_at_10"] == pytest.approx(.75)
+
+
 def test_public_failures_precede_custody_and_mapping_is_exact_speaker_text_with_cardinality_gates():
     p, arts, m, c=run(); bad=copy.deepcopy(arts); bad[1]["trace_receipt"][0]["ranking_sha256"]=h("tamper")
     with pytest.raises(CustodyError): score.score_frozen(projection=p,endpoint_manifest=m,ranking_artifacts=bad,custody_loader=lambda:(_ for _ in ()).throw(AssertionError("must not open custody")),evidence_token_secret=b"x"*32)
@@ -88,8 +98,9 @@ def test_public_failures_precede_custody_and_mapping_is_exact_speaker_text_with_
     c=custody(p); c["items"][5]["evidence_conversation_ids"]=[p["corpora"][0]["candidates"][0]["opaque_conversation_id"]]
     with pytest.raises(CustodyError,match="abstention_evidence_must_be_empty"): score.score_frozen(projection=p,endpoint_manifest=m,ranking_artifacts=arts,custody_loader=lambda:c,evidence_token_secret=b"x"*32)
     ambiguous=copy.deepcopy(p); candidate=copy.deepcopy(ambiguous["corpora"][0]["candidates"][0]); candidate["message_id"]=h("ambiguous-message"); candidate["message_order"]=11; candidate["corpus_order"]=11; ambiguous["corpora"][0]["candidates"].append(candidate); ambiguous["corpora"][0]["actual_message_count"]+=1
-    ambiguous_arts=artifacts(ambiguous); ambiguous_report=score.score_frozen(projection=ambiguous,endpoint_manifest=manifest(ambiguous,ambiguous_arts),ranking_artifacts=ambiguous_arts,custody_loader=lambda:custody(ambiguous),evidence_token_secret=b"x"*32)
-    assert "ambiguous" in {entry["status"] for entry in ambiguous_report["mapping_ledger"]}
+    ambiguous_arts=artifacts(ambiguous)
+    with pytest.raises(CustodyError, match="exact_evidence_mapping_incomplete"):
+        score.score_frozen(projection=ambiguous,endpoint_manifest=manifest(ambiguous,ambiguous_arts),ranking_artifacts=ambiguous_arts,custody_loader=lambda:custody(ambiguous),evidence_token_secret=b"x"*32, formal_live=True)
 
 
 def test_ap_ties_missing_stratum_secret_and_report_leak_are_fail_closed():
@@ -102,11 +113,11 @@ def test_ap_ties_missing_stratum_secret_and_report_leak_are_fail_closed():
 
 
 def test_formal_freeze_report_completeness_and_duplicate_span_ndcg_are_fail_closed():
-    p,arts,m,c=run(); formal=copy.deepcopy(m); formal["synthetic_test_mode"]=False; formal["bootstrap"]={**score.FORMAL_BOOTSTRAP}; formal["reference_arm"]="strong_raw"; formal["manifest_sha256"]=score.endpoint_manifest_digest(formal)
-    assert score.validate_endpoint_manifest(formal,projection_sha256=canonical_sha256(p))["reference_arm"]=="strong_raw"
+    p,arts,m,c=run(); formal=copy.deepcopy(m); formal["synthetic_test_mode"]=False; formal["bootstrap"]=score.formal_bootstrap(h("sealed-protocol")); formal["reference_arm"]="six_view_secondary"; formal["manifest_sha256"]=score.endpoint_manifest_digest(formal)
+    assert score.validate_endpoint_manifest(formal,projection_sha256=canonical_sha256(p))["reference_arm"]=="six_view_secondary"
     for mutate in (
         lambda value: value["arms"].pop(),
-        lambda value: value["bootstrap"].__setitem__("seed",1),
+        lambda value: value["bootstrap"].__setitem__("seed_derivation","manual"),
         lambda value: value.__setitem__("reference_arm","static_p5"),
     ):
         bad=copy.deepcopy(formal); mutate(bad); bad["manifest_sha256"]=score.endpoint_manifest_digest(bad)

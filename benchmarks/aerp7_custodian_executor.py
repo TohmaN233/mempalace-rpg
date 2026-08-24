@@ -30,6 +30,7 @@ from benchmarks import aerp7_convomem_formal as formal
 from benchmarks import aerp7_convomem_rank as rank
 from benchmarks import aerp7_convomem_scoring as score
 from benchmarks import aerp7_convomem_confirmation as confirmation
+from benchmarks import aerp_execution_checkpoint as execution_checkpoint
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256
 
 
@@ -150,7 +151,7 @@ def sign_private_payload(value: Mapping[str, Any], *, custody_capability_secret:
     return row
 
 
-def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: Path, formal_live: bool) -> dict[str, Any]:
+def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: Path, formal_live: bool, require_unexpired: bool = True) -> dict[str, Any]:
     expected_schema = FORMAL_PRIVATE_SCHEMA if formal_live else PRIVATE_SCHEMA
     if not isinstance(value, Mapping) or set(value) != PRIVATE_KEYS or value.get("schema") != expected_schema:
         raise CustodyError("custodian_private_capability_invalid")
@@ -160,7 +161,9 @@ def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: P
     )}
     if row.get("public_packet_sha256") != packet_sha256 or row.get("freeze_packet_file_sha256") != file_sha256 or row.get("output_path") != str(output_path.resolve()):
         raise CustodyError("custodian_private_public_binding_invalid")
-    if not isinstance(row.get("nonce"), str) or len(row["nonce"].encode("utf-8")) < 32 or isinstance(row.get("expires_at_unix"), bool) or not isinstance(row.get("expires_at_unix"), int) or row["expires_at_unix"] <= int(time.time()):
+    if not isinstance(row.get("nonce"), str) or len(row["nonce"].encode("utf-8")) < 32 or isinstance(row.get("expires_at_unix"), bool) or not isinstance(row.get("expires_at_unix"), int):
+        raise CustodyError("custodian_private_capability_expired")
+    if require_unexpired and row["expires_at_unix"] <= int(time.time()):
         raise CustodyError("custodian_private_capability_expired")
     unsigned = _private_unsigned(row)
     if row.get("authorization_sha256") != _digest(unsigned):
@@ -169,6 +172,7 @@ def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: P
     if not isinstance(row["authorization_hmac"], str) or not hmac.compare_digest(row["authorization_hmac"], expected):
         raise CustodyError("custodian_private_capability_hmac_invalid")
     result["authorization_id"] = _authorization_id(row)
+    result["expires_at_unix"] = row["expires_at_unix"]
     return result
 
 
@@ -264,6 +268,11 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
     _hex(packet["packet_sha256"], "custodian_freeze_packet_digest_invalid")
     _hex(packet["authorization_sha256"], "custodian_freeze_packet_invalid")
     protocol = formal.validate_formal_protocol(packet["protocol"])
+    if synthetic is False:
+        execution_checkpoint.require_live_binding(
+            protocol["execution_checkpoint"],
+            current_code_receipt=executor._clean_protocol_code_observation(expected=protocol["current_code_receipt"]),
+        )
     candidate_root = Path(cfg["candidate_bundle"])
     staging_parent = Path(tempfile.mkdtemp(prefix="aerp7-custodian-public-"))
     (staging_parent / "staging").mkdir()
@@ -348,30 +357,19 @@ def scientific_gate_decision(report: Mapping[str, Any], protocol: Mapping[str, A
     checked, frozen = score.validate_report(report), formal.validate_formal_protocol(protocol)
     gates = frozen["gates"]
     bootstrap = checked["paired_bootstrap"]
-    overall = bootstrap["overall_positive"]["paired_deltas"]["static_p5"]["vs_original_public_product"]
-    hard = bootstrap["derived_hard_changing_and_implicit"]["paired_deltas"]["static_p5"]["vs_original_public_product"]
-    abstention = bootstrap["static_p5_vs_strong_raw_abstention_confidence"]["metrics"]
+    primary = protocol["primary_current_arm"]["arm_id"]
+    overall = bootstrap["overall_positive"]["paired_deltas"][primary]["vs_original_public_product"]
     checks = {
-        "overall_delta_min": float(overall["estimate"]) >= float(gates["overall_delta_min"]),
-        "overall_ci_lower_gt_zero": float(overall["ci_lower"]) > float(gates["overall_ci_lower_gt_zero"]),
-        "hard_delta_min": float(hard["estimate"]) >= float(gates["hard_delta_min"]),
-        "hard_ci_lower_min": float(hard["ci_lower"]) >= float(gates["hard_ci_lower_min"]),
-        "abstention_auroc_ci_lower_min": float(abstention["auroc"]["ci_lower"]) >= float(gates["abstention_ci_lower_min"]),
-        "abstention_average_precision_ci_lower_min": float(abstention["average_precision"]["ci_lower"]) >= float(gates["abstention_ci_lower_min"]),
+        "primary_delta_min": float(overall["estimate"]) >= float(gates["primary_delta_min"]),
+        "primary_ci_lower_gt_zero": float(overall["ci_lower"]) > float(gates["primary_ci_lower_gt_zero"]),
     }
-    # Guardrails are strict public report invariants plus complete resolution of
-    # positive evidence.  Abstention rows legitimately carry zero evidence.
-    positive = [arm["positive"]["overall"]["question_macro"] for arm in checked["arms"].values()]
-    guardrails_ok = all(item["unresolved_evidence_item_count"] == 0 for item in positive)
-    if gates["guardrails_required"]:
-        checks["guardrails"] = guardrails_ok
     decision = {
         "schema": GATE_SCHEMA,
         "report_sha256": checked["report_sha256"],
         "protocol_sha256": frozen["protocol_sha256"],
         "reference_arm": "original_public_product",
-        "candidate_arm": "static_p5",
-        "measurements": {"overall": overall, "derived_hard": hard, "abstention_confidence": abstention},
+        "candidate_arm": primary,
+        "measurements": {"primary_persona_macro_recall_at_10": overall},
         "checks": checks,
         "outcome": "PASS" if all(checks.values()) else "FAIL",
     }
@@ -418,7 +416,8 @@ def _authorization_paths(output: Path, authorization_id: str) -> tuple[Path, Pat
     )
 
 
-def _validated_existing_result(*, output: Path, authorization_id: str, packet_sha256: str, file_sha256: str, formal_live: bool) -> dict[str, Any] | None:
+def _validated_existing_result(*, output: Path, authorization_id: str, packet_sha256: str, file_sha256: str, formal_live: bool,
+                               public_config: Mapping[str, Any], private_payload: Mapping[str, Any]) -> dict[str, Any] | None:
     """Authenticate an existing successful publication without opening custody."""
     if not output.exists():
         return None
@@ -428,7 +427,12 @@ def _validated_existing_result(*, output: Path, authorization_id: str, packet_sh
     expected_schema = FORMAL_PACKET_SCHEMA if formal_live else PACKET_SCHEMA
     if outer.get("schema") != expected_schema or outer.get("synthetic_test_mode") is formal_live or outer.get("formal_eligible") is not formal_live or outer.get("packet_sha256") != _digest({key: item for key, item in outer.items() if key != "packet_sha256"}) or outer.get("custodian_authorization_id") != authorization_id or outer.get("public_freeze_packet_sha256") != packet_sha256 or outer.get("public_freeze_file_sha256") != file_sha256:
         raise CustodyError("custodian_existing_output_conflict")
-    return {"published": False, "retry_idempotent": True, "sha256": _file_sha256(output), "packet_sha256": outer["packet_sha256"], "gate_outcome": outer["gate_decision"]["outcome"]}
+    # A byte self-hash is not an authorization.  Reuse the complete, live
+    # verification path before treating a crash-surviving final packet as a
+    # retry success: freeze/checkpoint, release HMAC, envelope, post-score
+    # attestation and scientific gate all bind again here.
+    validated = validate_completed_packet(config=public_config, outer=outer, private_payload=private_payload)
+    return {"published": False, "retry_idempotent": True, "sha256": _file_sha256(output), **validated}
 
 
 def _acquire_authorization_lock(*, output: Path, authorization_id: str) -> tuple[Path, Path, bytes, tuple[int, int]]:
@@ -461,27 +465,81 @@ def _remove_owned_lock(lock: Path, payload: bytes, identity: tuple[int, int]) ->
         raise CustodyError("custodian_authorization_lock_cleanup_failed") from exc
 
 
-def _consume_authorization(*, consumed: Path, authorization_id: str, packet_sha256: str, file_sha256: str) -> None:
-    payload = _bytes({
-        "schema": "aerp7-convomem-custodian-consumed-v1", "authorization_id": authorization_id,
-        "packet_sha256": packet_sha256, "output_file_sha256": file_sha256,
-    })
+def _consumed_marker_context(*, public: Mapping[str, Any], private: Mapping[str, Any], output: Path) -> dict[str, str]:
+    """Public identities authenticated with a completed child publication."""
+    cfg, packet, protocol = public["config"], public["packet"], public["protocol"]
+    checkpoint = protocol.get("execution_checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        raise CustodyError("custodian_authorization_consumed_context_invalid")
+    values = {
+        "authorization_id": private["authorization_id"],
+        "public_packet_sha256": packet.get("packet_sha256"),
+        "freeze_packet_file_sha256": cfg.get("freeze_packet_file_sha256"),
+        "protocol_sha256": protocol.get("protocol_sha256"),
+        "checkpoint_sha256": checkpoint.get("checkpoint_sha256"),
+        "output_path": str(output.resolve()),
+    }
+    if not all(isinstance(value, str) and len(value) == 64 for name, value in values.items() if name != "output_path") or not values["output_path"]:
+        raise CustodyError("custodian_authorization_consumed_context_invalid")
+    return values
+
+
+def _consumed_unsigned(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key not in {"marker_sha256", "marker_hmac"}}
+
+
+def _consumed_hmac(value: Mapping[str, Any], *, secret: bytes) -> str:
+    unsigned = _consumed_unsigned(value)
+    return hmac.new(
+        secret,
+        _bytes({
+            "domain": "aerp7-convomem-custodian-consumed-marker-auth-v1",
+            "marker_sha256": _digest(unsigned),
+            "marker": unsigned,
+        }),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _consume_authorization(*, consumed: Path, context: Mapping[str, str], packet_sha256: str, file_sha256: str, custody_capability_secret: bytes) -> None:
+    row = {
+        "schema": "aerp7-convomem-custodian-consumed-v2",
+        **dict(context),
+        "packet_sha256": packet_sha256,
+        "output_file_sha256": file_sha256,
+    }
+    row["marker_sha256"] = _digest(_consumed_unsigned(row))
+    row["marker_hmac"] = _consumed_hmac(row, secret=custody_capability_secret)
+    payload = _bytes(row)
     result = formal.publish_nonreplace(consumed, payload, fsync_parent=executor._sync_parent)
     if result["retry_idempotent"] and consumed.read_bytes() != payload:
         raise CustodyError("custodian_authorization_consumed_conflict")
 
 
-def _validated_consumed_marker(*, consumed: Path, authorization_id: str) -> dict[str, Any] | None:
+def _validated_consumed_marker(*, consumed: Path, context: Mapping[str, str], custody_capability_secret: bytes) -> dict[str, Any] | None:
     if not consumed.exists():
         return None
     if not consumed.is_file() or consumed.is_symlink():
         raise CustodyError("custodian_authorization_consumed_invalid")
-    row = _load_public(consumed, code="custodian_authorization_consumed_invalid")
-    required = {"schema", "authorization_id", "packet_sha256", "output_file_sha256"}
-    if set(row) != required or row.get("schema") != "aerp7-convomem-custodian-consumed-v1" or row.get("authorization_id") != authorization_id:
+    # Consume exactly one inode-stable marker snapshot.  The marker is the
+    # parent-visible authentication bridge from the child publication to the
+    # one-shot receipt; never parse one generation and compare another.
+    raw, _identity, _sha256 = confirmation._snapshot(consumed, "custodian_authorization_consumed_invalid")
+    row = confirmation._decode(raw, "custodian_authorization_consumed_invalid")
+    required = {
+        "schema", "authorization_id", "public_packet_sha256", "freeze_packet_file_sha256",
+        "protocol_sha256", "checkpoint_sha256", "output_path", "packet_sha256",
+        "output_file_sha256", "marker_sha256", "marker_hmac",
+    }
+    if set(row) != required or row.get("schema") != "aerp7-convomem-custodian-consumed-v2" or any(row.get(key) != value for key, value in context.items()):
         raise CustodyError("custodian_authorization_consumed_invalid")
-    _hex(row.get("packet_sha256"), "custodian_authorization_consumed_invalid")
-    _hex(row.get("output_file_sha256"), "custodian_authorization_consumed_invalid")
+    for name in ("authorization_id", "public_packet_sha256", "freeze_packet_file_sha256", "protocol_sha256", "checkpoint_sha256", "packet_sha256", "output_file_sha256", "marker_sha256"):
+        _hex(row.get(name), "custodian_authorization_consumed_invalid")
+    if row.get("marker_sha256") != _digest(_consumed_unsigned(row)):
+        raise CustodyError("custodian_authorization_consumed_invalid")
+    expected_hmac = _consumed_hmac(row, secret=custody_capability_secret)
+    if not isinstance(row.get("marker_hmac"), str) or not hmac.compare_digest(row["marker_hmac"], expected_hmac):
+        raise CustodyError("custodian_authorization_consumed_invalid")
     return row
 
 
@@ -539,7 +597,7 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     report = score.score_frozen(
         projection=public["projection"], endpoint_manifest=public["endpoint_manifest"],
         ranking_artifacts=public["ranking_artifacts"], custody_loader=custody_loader,
-        evidence_token_secret=private["evidence_token_secret"],
+        evidence_token_secret=private["evidence_token_secret"], formal_live=formal_live,
     )
     if not used:
         raise CustodyError("custodian_score_did_not_open_custody")
@@ -582,20 +640,64 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     return {**result, "packet_sha256": outer["packet_sha256"], "gate_outcome": decision["outcome"]}
 
 
+def validate_completed_packet(*, config: Mapping[str, Any], outer: Mapping[str, Any], private_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Reauthenticate a completed formal result without reopening custody."""
+    public = validate_public_freeze(config)
+    cfg, packet = public["config"], public["packet"]
+    output = Path(cfg["output_path"]); formal_live = cfg["synthetic_test_mode"] is False
+    # Completed-packet verification checks a historical, signed capability; it
+    # must remain independently auditable after its execution lease expires.
+    private = _private(private_payload, packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"], output_path=output, formal_live=formal_live, require_unexpired=False)
+    row = dict(outer)
+    required = {"schema", "synthetic_test_mode", "formal_eligible", "public_freeze_packet_sha256", "public_freeze_file_sha256", "envelope", "gate_decision", "scorer_code_before", "scorer_code_after", "custodian_authorization_id", "custodian_post_score_attestation", "packet_sha256"}
+    if set(row) != required or row.get("schema") != (FORMAL_PACKET_SCHEMA if formal_live else PACKET_SCHEMA) or row.get("synthetic_test_mode") is formal_live or row.get("formal_eligible") is not formal_live or row.get("packet_sha256") != _digest({key: item for key, item in row.items() if key != "packet_sha256"}):
+        raise CustodyError("custodian_completed_packet_invalid")
+    if row.get("public_freeze_packet_sha256") != packet["packet_sha256"] or row.get("public_freeze_file_sha256") != cfg["freeze_packet_file_sha256"] or row.get("custodian_authorization_id") != private["authorization_id"]:
+        raise CustodyError("custodian_completed_packet_binding_invalid")
+    decision = scientific_gate_decision(row["envelope"]["report"], public["protocol"])
+    if row.get("gate_decision") != decision:
+        raise CustodyError("custodian_completed_packet_gate_invalid")
+    envelope_builder = formal.audit_envelope if formal_live else formal.rehearsal_audit_envelope
+    try:
+        expected_envelope = envelope_builder(
+            report=row["envelope"]["report"], post_score_attestation=row["envelope"].get("post_score_attestation"), scorer_attestation_secret=private["scorer_attestation_secret"],
+            release_authorization=row["envelope"].get("release_authorization"), projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
+            current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"], endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
+            custody_ready_sha256=cfg["custody_ready_sha256"], custody_bundle_sha256=cfg["custody_bundle_sha256"], custody_capability_secret=private["custody_capability_secret"],
+        )
+    except CustodyError as exc:
+        raise CustodyError("custodian_completed_packet_envelope_invalid") from exc
+    if row.get("envelope") != expected_envelope:
+        raise CustodyError("custodian_completed_packet_envelope_invalid")
+    expected_attestation = _outer_attestation(envelope=expected_envelope, decision=decision, scorer_before=row["scorer_code_before"], scorer_after=row["scorer_code_after"], public_packet_sha256=packet["packet_sha256"], secret=private["scorer_attestation_secret"])
+    if row.get("custodian_post_score_attestation") != expected_attestation:
+        raise CustodyError("custodian_completed_packet_attestation_invalid")
+    _scan_public(row, private_values=[private[name] for name in ("binding_secret", "custody_capability_secret", "evidence_token_secret", "scorer_attestation_secret")])
+    return {"packet_sha256": row["packet_sha256"], "gate_outcome": decision["outcome"]}
+
+
 def execute_custodian(config: Mapping[str, Any], private_payload: Mapping[str, Any]) -> dict[str, Any]:
     """Run one exact-once rehearsal or live custodian authorization."""
     public = validate_public_freeze(config)
     cfg, packet = public["config"], public["packet"]
     output = Path(cfg["output_path"])
     formal_live = cfg["synthetic_test_mode"] is False
+    if formal_live and os.name != "posix":
+        raise CustodyError("custodian_formal_durability_host_unsupported")
     private = _private(
         private_payload, packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"], output_path=output,
-        formal_live=formal_live,
+        formal_live=formal_live, require_unexpired=False,
     )
+    consumed_context = _consumed_marker_context(public=public, private=private, output=output)
     _lock_path, consumed_path = _authorization_paths(output, private["authorization_id"])
-    consumed_marker = _validated_consumed_marker(consumed=consumed_path, authorization_id=private["authorization_id"])
+    consumed_marker = _validated_consumed_marker(
+        consumed=consumed_path,
+        context=consumed_context,
+        custody_capability_secret=private["custody_capability_secret"],
+    )
     existing = _validated_existing_result(
         output=output, authorization_id=private["authorization_id"], packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"], formal_live=formal_live,
+        public_config=config, private_payload=private_payload,
     )
     if consumed_marker is not None:
         if existing is None:
@@ -607,17 +709,25 @@ def execute_custodian(config: Mapping[str, Any], private_payload: Mapping[str, A
         # Heal the crash window where publication completed but the consumed
         # marker was not yet durably written.  No custody access is needed.
         _consume_authorization(
-            consumed=consumed_path, authorization_id=private["authorization_id"],
+            consumed=consumed_path, context=consumed_context,
             packet_sha256=existing["packet_sha256"], file_sha256=existing["sha256"],
+            custody_capability_secret=private["custody_capability_secret"],
         )
         return existing
+    if private["expires_at_unix"] <= int(time.time()):
+        raise CustodyError("custodian_private_capability_expired")
     lock, consumed, lock_payload, lock_identity = _acquire_authorization_lock(output=output, authorization_id=private["authorization_id"])
     try:
-        consumed_marker = _validated_consumed_marker(consumed=consumed, authorization_id=private["authorization_id"])
+        consumed_marker = _validated_consumed_marker(
+            consumed=consumed,
+            context=consumed_context,
+            custody_capability_secret=private["custody_capability_secret"],
+        )
         # A concurrent first execution may have published between the initial
         # output check and lock acquisition.  Authenticate it, never rescore.
         existing = _validated_existing_result(
             output=output, authorization_id=private["authorization_id"], packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"], formal_live=formal_live,
+            public_config=config, private_payload=private_payload,
         )
         if consumed_marker is not None:
             if existing is None:
@@ -627,13 +737,18 @@ def execute_custodian(config: Mapping[str, Any], private_payload: Mapping[str, A
             return existing
         if existing is not None:
             _consume_authorization(
-                consumed=consumed, authorization_id=private["authorization_id"],
+                consumed=consumed, context=consumed_context,
                 packet_sha256=existing["packet_sha256"], file_sha256=existing["sha256"],
+                custody_capability_secret=private["custody_capability_secret"],
             )
             return existing
+        if private["expires_at_unix"] <= int(time.time()):
+            raise CustodyError("custodian_private_capability_expired")
         result = _execute_authorized(public=public, private=private)
         _consume_authorization(
-            consumed=consumed, authorization_id=private["authorization_id"], packet_sha256=result["packet_sha256"], file_sha256=result["sha256"],
+            consumed=consumed, context=consumed_context,
+            packet_sha256=result["packet_sha256"], file_sha256=result["sha256"],
+            custody_capability_secret=private["custody_capability_secret"],
         )
         return result
     finally:
@@ -653,10 +768,10 @@ def _sanitized_env() -> dict[str, str]:
     return retained
 
 
-def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, Any], timeout_seconds: float = 120.0, python_executable: str | None = None) -> dict[str, Any]:
+def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, Any], timeout_seconds: float | None = None, python_executable: str | None = None) -> dict[str, Any]:
     """Test harness launcher: private JSON is stdin only; child env is public."""
     executable = python_executable or sys.executable
-    if Path(executable).resolve() != Path(sys.executable).resolve() or timeout_seconds <= 0:
+    if Path(executable).resolve() != Path(sys.executable).resolve() or (timeout_seconds is not None and timeout_seconds <= 0):
         raise CustodyError("custodian_launcher_invalid")
     public_config = _public_config(_load_public(public_config_path, code="custodian_public_config_invalid"))
     command = [executable, "-m", "benchmarks.aerp7_custodian_executor", "--custodian", str(public_config_path.resolve())]
@@ -676,7 +791,7 @@ def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, 
             except BaseException:
                 pass
             process.kill(); stdout, stderr = process.communicate()
-            raise TimeoutError("custodian_subprocess_timeout")
+            raise CustodyError("custodian_infrastructure_failure", reason="wall_timeout", timeout_seconds=timeout_seconds)
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
     secret_values = [str(value).encode("utf-8") for key, value in private_payload.items() if key.endswith("secret")]

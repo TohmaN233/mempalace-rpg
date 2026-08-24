@@ -227,7 +227,12 @@ def test_worker_draft_canonical_wire_packet_reloads_for_independent_coordinator_
     packet = {
         "schema": executor.FORMAL_ORIGINAL_PACKET_SCHEMA, "execution_mode": "exact_public_product_worker_draft",
         "draft_file_sha256": hashlib.sha256(payload).hexdigest(), "palace_path": str((tmp_path / "palace").resolve()),
-        "resource_receipt": resource, "process_id": 123, "packet_sha256": "",
+        "resource_receipt": resource,
+        "worker_execution_identity": {
+            "original_python": str((tmp_path / "original-python.exe").resolve()),
+            "original_execution_policy_sha256": "c" * 64,
+        },
+        "process_id": 123, "packet_sha256": "",
     }
     packet["packet_sha256"] = executor._digest({key: value for key, value in packet.items() if key != "packet_sha256"})
     real_reaudit = original.coordinator_reaudit_replicate

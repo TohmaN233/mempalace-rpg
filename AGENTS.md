@@ -121,6 +121,13 @@ fixed `data2test` role paths per profile. Those payloads are external to the
 pinned Git tree: an authorized acquisition receipt must bind archive/file byte
 digests before JSON parsing. The implementation never discovers, samples,
 shuffles, or drops profiles/files.
+ConvoMem's signed `census-v1` pre-parse manifest is likewise frozen as the
+official upstream commit/tree plus exactly 2,168 files, 27,458,421,811 bytes,
+and its inventory digest; those source bytes remain unopened until the approved
+formal run.  The current Windows workspace cannot produce that formal receipt:
+the one-shot path fails closed without Linux directory-fsync semantics, and a
+future Linux run requires a freshly compatible AERP-8 external checkpoint rather
+than reusing this Windows development receipt.
 Before any original worker starts, the external AERP-8 checkpoint is now schema
 `aerp8-membench-current-checkpoint-v2` and binds an
 `aerp8-membench-original-execution-policy-v1` digest. The policy is independently

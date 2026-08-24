@@ -20,11 +20,46 @@ not an official evidence-R@10 confirmation dataset.
 
 ## Implemented formal common path
 
-AERP-7 provides the common trusted-host formal path: candidate/custody
+AERP-7 provides the ConvoMem trusted-host formal path: candidate/custody
 separation, independent current and original worker processes, durable
-no-replace publication, HMAC/nonce authorization, and exact-byte retry. Its
-formal data path remains unused; its synthetic fixtures and smoke checks are
+no-replace publication, HMAC/nonce authorization, exact-byte retry, and an
+external AERP-8 checkpoint revalidation before public work and before custody
+opens.  Its source selector is `census-v1`: no RNG, all candidate-visible
+persona/group/context/query units in sorted context order, and any duplicate,
+missing rank, or candidate/custody crosswalk defect invalidates the entire run.
+The checkpoint has an explicit two-layer boundary: AERP-8 revalidates immutable
+driver-source/interpreter bytes and the live pinned-original policy, while the
+later AERP-7 orchestration commit is separately clean-sealed in the formal
+protocol. Thus an orchestration-only AERP-7 commit does not silently weaken or
+require rewriting the immutable AERP-8 receipt.
+Its formal data path remains unused; synthetic fixtures and smoke checks are
 implementation evidence only.
+
+The formal one-shot path deliberately fails closed on Windows and on hosts
+without Linux directory-`fsync` publication semantics.  It therefore makes no
+durability or exact-retry claim for this Windows development machine; synthetic
+rehearsals remain diagnostic only.  A formal run requires a supported Linux
+staging filesystem and records its publication boundaries in the READY and
+progress receipts.  Formal source output directories must be fresh: the
+protocol deliberately disables pre-custody source-generation resume until a
+plan/checkpoint/census-authenticated generation seal is implemented.  Exact-byte
+retry therefore covers only a fully validated published final packet whose
+immutable consumed marker preserves its original file digest.  A crash after
+authorization consumption but before public freeze, any consumed authorization
+whose final packet/marker is absent, or any incomplete source generation is a
+durable terminal infrastructure failure requiring a new signed plan; the
+protocol never mints a replacement authorization or reopens custody.
+The Linux formal host must first mint a fresh Linux-compatible AERP-8 external
+checkpoint; the Windows development checkpoint is not transferable evidence for
+that execution identity.
+
+Any future AERP-7 Pro review packet is a transitive, isolated artifact rather
+than a diff excerpt.  It must include `aerp7_convomem_rank.py`,
+`aerp7_original_product.py`, the imported AERP-5 runtime receipt helpers,
+`aerp8_membench.py`, all direct tests and a canonical file manifest.  Its
+receipt must record the packet-isolated collection/execution command, Python
+and environment identity, manifest digest, collection count and result.  A
+synthetic test receipt is implementation evidence, not a benchmark result.
 
 AERP-8 implements the corresponding MemBench path:
 
@@ -139,8 +174,10 @@ conversation boundaries, declared and actual context sizes, and message order.
 The official-structure LongContext serializer, MemPalace text-only public
 product serializer, and AERP structured Six-View serializer are distinct
 receipts. Exact evidence mapping is normalized `(speaker, text)` within the
-custody-only evidence conversation set; zero or multiple matches fail closed
-without fuzzy fallback.
+custody-only evidence conversation set; in a formal run zero or multiple
+matches fail closed without fuzzy fallback.  Synthetic rehearsals retain those
+states in the private/public mapping ledger solely as diagnostics and cannot
+make a formal endpoint claim.
 
 MemBench is the second confirmation dataset. Its four formal source roles are
 `participation_reflective`, `participation_factual`,
@@ -169,9 +206,15 @@ is threshold-free confidence separability unless a separate source-disjoint
 calibration and decision rule are frozen.
 
 Each untouched confirmation dataset must pass separately against the exact
-pinned original public product: overall P5-minus-original point improvement at
-least `0.01` and 95% paired-bootstrap lower bound greater than zero; hard-slice
-point nonnegative and lower bound at least `-0.01`; all integrity,
+pinned original public product.  ConvoMem's primary current arm is the frozen
+`six_view_secondary` configuration (the existing Six-View product arm), with
+persona-macro exact-evidence Recall@10 point improvement at least `0.01` and a
+95% paired-bootstrap lower bound greater than zero.  It uses 10,000 paired
+persona-cluster draws; each draw uses one global five-original-build multiset
+for every sampled persona, and its seed is domain-separated from the sealed
+protocol digest. P5/raw, question-macro, evidence-micro, NDCG@10, MRR@10,
+context slices, and abstention are secondary diagnostics and cannot rescue a
+failed primary gate. All integrity,
 authorization, physical-audit, and failure/retry guardrails. MemBench reports
 the four cross roles plus factual/reflective and participation/observation
 aggregates, and reports `0-10k` and `100k` profile slices as predeclared
@@ -181,8 +224,7 @@ the same sampled build multiset to every row. It has no official
 adversarial or abstention endpoint, so both are N/A rather than fabricated
 gates.
 
-No pooled statistic may rescue a dataset that fails. Static Six-View is a
-separate secondary arm. Original-product confidence or confidence-margin claims
+No pooled statistic may rescue a dataset that fails. Original-product confidence or confidence-margin claims
 must not be invented where the original method has no comparable confidence.
 
 ## AERP-5 public-product engineering amendment

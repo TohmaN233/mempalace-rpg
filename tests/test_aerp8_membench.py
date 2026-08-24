@@ -51,11 +51,18 @@ def threshold_protocol():
     return value
 
 
+def test_venv_python_uses_the_host_family_layout(tmp_path):
+    assert m._venv_python(tmp_path, os_name="nt") == tmp_path / ".venv" / "Scripts" / "python.exe"
+    assert m._venv_python(tmp_path, os_name="posix") == tmp_path / ".venv" / "bin" / "python"
+    with pytest.raises(m.MemBenchError, match="driver_worker_python_invalid"):
+        m._venv_python(tmp_path, os_name="unsupported")
+
+
 def original_execution_policy():
     root=Path('E:/MemPalaceWorkspace/repos/mempalace').resolve()
     return m.capture_original_execution_policy(
         original_root=root,
-        original_python=root/'.venv'/'Scripts'/'python.exe',
+        original_python=m._venv_python(root),
         model_dir=root,
         git_capability=m._driver_code_receipt()["git_capability"],
     )
@@ -798,7 +805,7 @@ def test_formal_worker_rejects_labelled_projection_and_cleans_only_its_partial_o
 def test_current_worker_config_is_label_free_and_failure_leaves_no_payload(tmp_path, monkeypatch):
     candidate, _ = m.build_bundles(source_role="role-a", source=source(), opacity_secret=b"o" * 32)
     projection = tmp_path / "candidate.json"; projection.write_bytes(m._bytes(candidate))
-    driver = m._driver_code_receipt(); git = driver["git_capability"]; rpg_root = Path(__file__).resolve().parents[1]; rpg_python = rpg_root / ".venv" / "Scripts" / "python.exe"
+    driver = m._driver_code_receipt(); git = driver["git_capability"]; rpg_root = Path(__file__).resolve().parents[1]; rpg_python = m._venv_python(rpg_root)
     config = {"schema": m.CURRENT_WORKER_CONFIG_SCHEMA, "execution_role": "p5_primary", "projection_path": str(projection), "projection_sha256": candidate["projection_sha256"], "rpg_root": str(rpg_root), "rpg_python": str(rpg_python), "model_dir": str(tmp_path), "model_tree_sha256": m.ORIGINAL_MODEL_TREE, "git_executable": git["executable"], "git_sha256": git["sha256"], "git_version": git["version"], "git_system32_required": git["system32_required"], "worker_home_path": str(tmp_path), "artifact_path": str(tmp_path / "artifact.json"), "ready_path": str(tmp_path / "artifact.ready.json"), "driver_code_receipt": driver, "checkpoint_sha256":"c" * 64, "resource_comparability": "unavailable"}
     assert all(field not in json.dumps(config, sort_keys=True) for field in ("target_step_id", "ground_truth", "choices", "strata", "source_locator", "raw_tid", "source_file_role"))
     assert m.validate_current_worker_config(config)["execution_role"] == "p5_primary"

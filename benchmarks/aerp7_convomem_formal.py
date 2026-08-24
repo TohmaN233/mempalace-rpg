@@ -22,6 +22,7 @@ from typing import Any, Callable, Mapping, Sequence
 from benchmarks import aerp7_convomem_rank as rank
 from benchmarks import aerp7_convomem_scoring as score
 from benchmarks import aerp7_convomem_confirmation as confirmation
+from benchmarks import aerp_execution_checkpoint as execution_checkpoint
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256, validate_candidate_projection
 
 
@@ -98,6 +99,25 @@ def _model_receipt(value: Any) -> dict[str, Any]:
     return rank._validate_model_receipt(value)
 
 
+def _ranker_code_sha256() -> str:
+    """Receipt for the exact module that defines the frozen Six-View arm."""
+    try:
+        return hashlib.sha256(Path(rank.__file__).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise CustodyError("formal_ranker_code_receipt_unavailable") from exc
+
+
+def _primary_current_arm(value: Any) -> dict[str, Any]:
+    row = _obj(value, "formal_primary_current_arm_invalid")
+    if set(row) != {"arm_id", "config_sha256", "ranker_code_sha256"} or row.get("arm_id") != "six_view_secondary":
+        raise CustodyError("formal_primary_current_arm_invalid")
+    if row.get("config_sha256") != _digest(rank._arm_method("six_view_secondary")):
+        raise CustodyError("formal_primary_current_arm_invalid")
+    if row.get("ranker_code_sha256") != _ranker_code_sha256():
+        raise CustodyError("formal_primary_current_arm_invalid")
+    return row
+
+
 def _candidate_receipt(value: Any) -> dict[str, Any]:
     row = _obj(value, "formal_candidate_receipt_invalid")
     required = {"generation_id", "ready_sha256", "projection_raw_sha256", "projection_canonical_sha256", "query_count", "candidate_text_count"}
@@ -125,17 +145,10 @@ def projection_query_keys(value: Any) -> list[dict[str, str]]:
 def _resource_thresholds(value: Any) -> dict[str, Any]:
     row = _obj(value, "formal_resource_thresholds_invalid")
     required = {"resource_comparability", "peak_rss_bytes_max", "storage_bytes_max", "ingest_seconds_max", "index_seconds_max", "query_p95_ns_max"}
-    if set(row) != required or row.get("resource_comparability") not in {"strict", "unavailable"}:
+    if set(row) != required or row.get("resource_comparability") != "unavailable":
         raise CustodyError("formal_resource_thresholds_invalid")
-    if row["resource_comparability"] == "unavailable":
-        if any(row[key] is not None for key in required - {"resource_comparability"}):
-            raise CustodyError("formal_resource_thresholds_invalid")
-        return row
-    for key in ("peak_rss_bytes_max", "storage_bytes_max", "query_p95_ns_max"):
-        _positive_int(row.get(key), "formal_resource_thresholds_invalid")
-    for key in ("ingest_seconds_max", "index_seconds_max"):
-        if _finite_nonnegative(row.get(key), "formal_resource_thresholds_invalid") <= 0:
-            raise CustodyError("formal_resource_thresholds_invalid")
+    if any(row[key] is not None for key in required - {"resource_comparability"}):
+        raise CustodyError("formal_resource_thresholds_invalid")
     return row
 
 
@@ -147,17 +160,20 @@ def validate_formal_protocol(value: Any) -> dict[str, Any]:
     """Validate the immutable, pre-execution contract; formal mode is never synthetic."""
     row = _obj(value, "formal_protocol_invalid")
     required = {
-        "schema", "synthetic_test_mode", "candidate", "current_code_receipt", "original_code_receipt", "source_receipt",
-        "model_receipt", "arms", "serializer_contract", "top_k", "tie_break", "original_build_count", "p5_repeat_required",
+        "schema", "synthetic_test_mode", "candidate", "current_code_receipt", "original_code_receipt", "execution_checkpoint", "source_receipt",
+        "model_receipt", "arms", "primary_current_arm", "serializer_contract", "top_k", "tie_break", "original_build_count", "p5_repeat_required",
         "bootstrap", "gates", "resource_thresholds", "protocol_sha256",
     }
     if set(row) != required or row.get("schema") != FORMAL_PROTOCOL_SCHEMA or row.get("synthetic_test_mode") is not False:
         raise CustodyError("formal_protocol_invalid")
     _candidate_receipt(row.get("candidate")); _code_receipt(row.get("current_code_receipt"), "formal_current_code_invalid")
     _code_receipt(row.get("original_code_receipt"), "formal_original_code_invalid")
+    binding = execution_checkpoint.validate_binding(row.get("execution_checkpoint"))
+    if binding["current_code_receipt"] != row["current_code_receipt"]:
+        raise CustodyError("formal_execution_checkpoint_current_code_binding_invalid")
     if row.get("source_receipt") != rank.PROTOCOL_SOURCE:
         raise CustodyError("formal_source_receipt_invalid")
-    _model_receipt(row.get("model_receipt"))
+    _model_receipt(row.get("model_receipt")); _primary_current_arm(row.get("primary_current_arm"))
     if tuple(row.get("arms", ())) != score.FORMAL_ARMS or row.get("serializer_contract") != {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}:
         raise CustodyError("formal_arm_contract_invalid")
     if row.get("top_k") != 10 or row.get("tie_break") != "stable_ranking_key_ascending":
@@ -165,9 +181,9 @@ def validate_formal_protocol(value: Any) -> dict[str, Any]:
     if row.get("original_build_count") != 5 or row.get("p5_repeat_required") is not True or row.get("bootstrap") != score.FORMAL_BOOTSTRAP:
         raise CustodyError("formal_repeat_bootstrap_invalid")
     gates = _obj(row.get("gates"), "formal_gates_invalid")
-    if set(gates) != {"overall_delta_min", "overall_ci_lower_gt_zero", "hard_delta_min", "hard_ci_lower_min", "abstention_ci_lower_min", "guardrails_required"}:
+    if set(gates) != {"primary_delta_min", "primary_ci_lower_gt_zero"}:
         raise CustodyError("formal_gates_invalid")
-    expected_gates = {"overall_delta_min": .01, "overall_ci_lower_gt_zero": 0.0, "hard_delta_min": 0.0, "hard_ci_lower_min": -.01, "abstention_ci_lower_min": -.01, "guardrails_required": True}
+    expected_gates = {"primary_delta_min": .01, "primary_ci_lower_gt_zero": 0.0}
     if gates != expected_gates:
         raise CustodyError("formal_gates_invalid")
     _resource_thresholds(row.get("resource_thresholds"))
@@ -432,7 +448,7 @@ def validate_current_execution_receipts(value: Any, *, current_worker_receipt: M
     for raw in rows:
         row = _obj(raw, "current_execution_receipt_invalid")
         required = {"schema", "execution_mode", "execution_role", "arm_id", "protocol_sha256", "projection_sha256", "worker_config_sha256", "method_input_sha256", "observed_code_before", "observed_code_after", "observed_model_before", "observed_model_after", "provider", "encoder_identity", "artifact_file_sha256", "artifact_sha256", "resource_sha256", "process_id", "supervisor_sha256", "execution_sha256"}
-        if set(row) != required or row.get("schema") != CURRENT_EXECUTION_RECEIPT_SCHEMA or row.get("execution_role") not in expected or row["execution_role"] in seen:
+        if set(row) != required and set(row) != required | {"current_interpreter"} or row.get("schema") != CURRENT_EXECUTION_RECEIPT_SCHEMA or row.get("execution_role") not in expected or row["execution_role"] in seen:
             raise CustodyError("current_execution_receipt_invalid")
         seen.add(row["execution_role"])
         arm_id, resource_role = expected[row["execution_role"]]
@@ -461,6 +477,12 @@ def validate_current_execution_receipts(value: Any, *, current_worker_receipt: M
             if not allow_synthetic:
                 raise CustodyError("current_execution_synthetic_not_formal")
         elif mode == "live_native_adapter":
+            interpreter = row.get("current_interpreter")
+            driver = frozen["execution_checkpoint"]["driver_code_receipt"]
+            # Synthetic protocol fixtures intentionally lack an external driver
+            # runtime receipt.  Every authored formal binding has these fields.
+            if "python" in driver and (not isinstance(interpreter, Mapping) or set(interpreter) != {"python", "sha256"} or interpreter.get("python") != driver.get("python") or interpreter.get("sha256") != driver.get("python_sha256")):
+                raise CustodyError("current_execution_live_interpreter_binding_invalid")
             if row["observed_code_before"] != frozen["current_code_receipt"] or row["observed_code_after"] != frozen["current_code_receipt"]:
                 raise CustodyError("current_execution_live_code_binding_invalid")
             expected_files = frozen["model_receipt"]["files"]
@@ -528,7 +550,7 @@ def freeze_endpoint_manifest(*, projection: Any, protocol: Mapping[str, Any], ra
         "serializer_contract": frozen_protocol["serializer_contract"],
         "arms": [{"arm_id": arm, "ranking_artifact_sha256": by_arm[arm]["artifact_sha256"], "confidence_contract": rank.CONFIDENCE_CONTRACT if arm in rank.CURRENT_ARMS else None} for arm in score.FORMAL_ARMS],
         "directory_endpoints": [{"directory_group": group, "endpoint": endpoint} for group, endpoint in score.UPSTREAM_GROUPS.items()],
-        "bootstrap": score.FORMAL_BOOTSTRAP, "synthetic_test_mode": False, "reference_arm": "strong_raw",
+        "bootstrap": score.formal_bootstrap(frozen_protocol["protocol_sha256"]), "synthetic_test_mode": False, "reference_arm": "six_view_secondary",
     }
     manifest["manifest_sha256"] = score.endpoint_manifest_digest(manifest)
     return score.validate_endpoint_manifest(manifest, projection_sha256=manifest["projection_sha256"])

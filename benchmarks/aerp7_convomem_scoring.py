@@ -26,7 +26,14 @@ UPSTREAM_GROUPS = {
 _FORBIDDEN_REPORT_KEYS = frozenset({"text", "speaker", "answer", "source_locator", "query_text", "evidence_spans", "evidence_conversation_ids", "message_id", "ranked_message_ids", "messages"})
 _METRIC_KEYS = ("recall_at_10", "hit_at_10", "all_at_10", "ndcg_at_10", "mrr_at_10")
 FORMAL_ARMS = ("original_public_product", "strong_raw", "static_p5", "six_view_secondary")
-FORMAL_BOOTSTRAP = {"seed": 20260822, "resamples": 5000, "percentile_lower": 0.025, "percentile_upper": 0.975, "percentile_rule": "linear", "original_replicate_rule": "per_query_arithmetic_mean"}
+FORMAL_BOOTSTRAP = {"resamples": 10000, "percentile_lower": 0.025, "percentile_upper": 0.975, "percentile_rule": "linear", "original_replicate_rule": "global_build_multiset_per_draw", "seed_derivation": "sha256(protocol_sha256|persona-bootstrap-v1)"}
+
+
+def formal_bootstrap(protocol_sha256: str) -> dict[str, Any]:
+    """Derive the one preregistered formal RNG stream from the sealed protocol."""
+    _h(protocol_sha256, "formal_bootstrap_protocol_digest_invalid")
+    seed = int.from_bytes(hashlib.sha256((protocol_sha256 + "|persona-bootstrap-v1").encode("utf-8")).digest()[:8], "big")
+    return {"seed": seed, **FORMAL_BOOTSTRAP}
 
 
 def normalize_v1(value: str) -> str:
@@ -83,6 +90,8 @@ def validate_endpoint_manifest(value: Any, *, projection_sha256: str) -> dict[st
         expected = CONFIDENCE_CONTRACT if arm["arm_id"] in CURRENT_ARMS else None if arm["arm_id"] == "original_public_product" else "__invalid__"
         if arm.get("confidence_contract") != expected: raise CustodyError("endpoint_manifest_arm_contract_invalid")
         arms[arm["arm_id"]] = arm
+    if row["synthetic_test_mode"] is False and tuple(arms) != FORMAL_ARMS:
+        raise CustodyError("formal_manifest_freeze_invalid")
     if not arms or "original_public_product" not in arms or row.get("reference_arm") not in arms:
         raise CustodyError("endpoint_manifest_arm_registry_invalid")
     endpoints: dict[str, str] = {}
@@ -93,14 +102,14 @@ def validate_endpoint_manifest(value: Any, *, projection_sha256: str) -> dict[st
         endpoints[endpoint["directory_group"]] = endpoint["endpoint"]
     if endpoints != UPSTREAM_GROUPS or not isinstance(row.get("synthetic_test_mode"), bool): raise CustodyError("endpoint_manifest_endpoint_invalid")
     bootstrap = _o(row.get("bootstrap"), "endpoint_manifest_bootstrap_invalid")
-    if set(bootstrap) != {"seed", "resamples", "percentile_lower", "percentile_upper", "percentile_rule", "original_replicate_rule"}:
+    if set(bootstrap) not in ({"seed", "resamples", "percentile_lower", "percentile_upper", "percentile_rule", "original_replicate_rule"}, {"seed", "resamples", "percentile_lower", "percentile_upper", "percentile_rule", "original_replicate_rule", "seed_derivation"}):
         raise CustodyError("endpoint_manifest_bootstrap_invalid")
     _integer(bootstrap.get("seed"), "endpoint_manifest_bootstrap_invalid"); _integer(bootstrap.get("resamples"), "endpoint_manifest_bootstrap_invalid", positive=True)
     low, high = _number(bootstrap.get("percentile_lower"), "endpoint_manifest_bootstrap_invalid"), _number(bootstrap.get("percentile_upper"), "endpoint_manifest_bootstrap_invalid")
-    if bootstrap.get("percentile_rule") != "linear" or bootstrap.get("original_replicate_rule") != "per_query_arithmetic_mean" or not 0 <= low < high <= 1:
+    if bootstrap.get("percentile_rule") != "linear" or bootstrap.get("original_replicate_rule") not in {"per_query_arithmetic_mean", "global_build_multiset_per_draw"} or not 0 <= low < high <= 1:
         raise CustodyError("endpoint_manifest_bootstrap_invalid")
     if row["synthetic_test_mode"] is False:
-        if tuple(arms) != FORMAL_ARMS or row["reference_arm"] != "strong_raw" or bootstrap != FORMAL_BOOTSTRAP:
+        if tuple(arms) != FORMAL_ARMS or row["reference_arm"] != "six_view_secondary" or set(bootstrap) != {"seed", *FORMAL_BOOTSTRAP} or {key: bootstrap[key] for key in FORMAL_BOOTSTRAP} != FORMAL_BOOTSTRAP:
             raise CustodyError("formal_manifest_freeze_invalid")
     if row.get("manifest_sha256") != endpoint_manifest_digest(row): raise CustodyError("endpoint_manifest_digest_mismatch")
     return row
@@ -115,7 +124,7 @@ def validate_ranking_artifact(value: Any, *, projection: Mapping[str, Any], mani
     return artifact
 
 
-def _map(projection: Mapping[str, Any], custody: Any, secret: bytes):
+def _map(projection: Mapping[str, Any], custody: Any, secret: bytes, *, formal_live: bool):
     if not isinstance(secret, bytes) or len(secret) < 32: raise CustodyError("scoring_secret_too_short")
     row = _o(custody, "scoring_custody_invalid")
     if set(row) != {"schema", "projection_sha256", "items"} or row.get("schema") != CUSTODY_SCHEMA or row.get("projection_sha256") != _d(projection):
@@ -148,6 +157,12 @@ def _map(projection: Mapping[str, Any], custody: Any, secret: bytes):
             public_ledger.append({"item_id": item["item_id"], "evidence_token": hmac.new(secret, f"aerp7-public-ledger/v1/{item['item_id']}/{ordinal}".encode("utf-8"), hashlib.sha256).hexdigest(), "status": status})
         mappings[item["item_id"]] = resolved
     if seen != set(items): raise CustodyError("scoring_custody_item_coverage_invalid")
+    if formal_live and any(entry["status"] != "mapped" for entry in public_ledger):
+        # Exact-evidence Recall has no defensible denominator when a frozen
+        # span maps to zero or multiple candidate messages.  Abort the formal
+        # run; do not silently score unresolved labels as misses.  Synthetic
+        # rehearsal retains the ledger as a diagnostic, not a formal claim.
+        raise CustodyError("scoring_exact_evidence_mapping_incomplete")
     return mappings, public_ledger, groups, conversations
 
 
@@ -177,6 +192,9 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         result[key] = sum(int(metric[key]) for metric in metrics)
     result["retrieved_evidence_count_at_10"] = sum(float(metric["retrieved_evidence_count_at_10"]) for metric in metrics)
     if result["evidence_item_count"] != result["resolved_evidence_item_count"] + result["unresolved_evidence_item_count"]: raise CustodyError("metric_denominator_identity_invalid")
+    # Explicit secondary endpoint: unlike question-macro Recall@10, every
+    # evidence span contributes one unit to this denominator.
+    result["evidence_micro_recall_at_10"] = result["retrieved_evidence_count_at_10"] / result["evidence_item_count"]
     return result
 
 
@@ -303,12 +321,22 @@ def _artifact_rows(artifact: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def score_frozen(*, projection: Any, endpoint_manifest: Any, ranking_artifacts: Sequence[Any], custody_loader: Callable[[], Any], evidence_token_secret: bytes) -> dict[str, Any]:
+def score_frozen(*, projection: Any, endpoint_manifest: Any, ranking_artifacts: Sequence[Any], custody_loader: Callable[[], Any], evidence_token_secret: bytes, formal_live: bool | None = None) -> dict[str, Any]:
     projection = validate_candidate_projection(projection); manifest = validate_endpoint_manifest(endpoint_manifest, projection_sha256=_d(projection))
     # This complete public validation is intentionally before the first custody call.
     artifacts = [validate_ranking_artifact(artifact, projection=projection, manifest=manifest) for artifact in ranking_artifacts]
     if len(artifacts) != len(manifest["arms"]) or {artifact["arm_id"] for artifact in artifacts} != {arm["arm_id"] for arm in manifest["arms"]}: raise CustodyError("ranking_arm_set_invalid")
-    mappings, ledger, groups, evidence_conversations = _map(projection, custody_loader(), evidence_token_secret)
+    # Execution mode is supplied by the custody boundary when available.  The
+    # endpoint manifest is a public scientific artifact, not authorization to
+    # reinterpret a rehearsal process as a live formal run.
+    if formal_live is None:
+        formal_live = manifest["synthetic_test_mode"] is False
+    if not isinstance(formal_live, bool):
+        raise CustodyError("scoring_execution_mode_invalid")
+    mappings, ledger, groups, evidence_conversations = _map(
+        projection, custody_loader(), evidence_token_secret,
+        formal_live=formal_live,
+    )
     corpora = {row["corpus_id"]: row for row in projection["corpora"]}; items = {row["item_id"]: row for row in projection["items"]}; arms = {}; rows_by_arm = {}
     for artifact in artifacts:
         arm_id = artifact["arm_id"]; ranked = {row["item_id"]: row for row in _artifact_rows(artifact)}; rows = []
@@ -374,7 +402,7 @@ def validate_report(value: Any) -> dict[str, Any]:
     protocol = _o(row["protocol"], "scoring_report_protocol_invalid")
     if set(protocol) != {"synthetic_test_mode", "arm_registry", "reference_arm", "bootstrap"} or not isinstance(protocol["synthetic_test_mode"], bool) or not isinstance(protocol["arm_registry"], list) or len(protocol["arm_registry"]) != len(set(protocol["arm_registry"])) or protocol["reference_arm"] not in protocol["arm_registry"]:
         raise CustodyError("scoring_report_protocol_invalid")
-    if protocol["synthetic_test_mode"] is False and (tuple(protocol["arm_registry"]) != FORMAL_ARMS or protocol["reference_arm"] != "strong_raw" or protocol["bootstrap"] != FORMAL_BOOTSTRAP): raise CustodyError("scoring_report_protocol_invalid")
+    if protocol["synthetic_test_mode"] is False and (tuple(protocol["arm_registry"]) != FORMAL_ARMS or protocol["reference_arm"] != "six_view_secondary" or set(protocol["bootstrap"]) != {"seed", *FORMAL_BOOTSTRAP} or {key: protocol["bootstrap"][key] for key in FORMAL_BOOTSTRAP} != FORMAL_BOOTSTRAP): raise CustodyError("scoring_report_protocol_invalid")
     if protocol != {"synthetic_test_mode": manifest["synthetic_test_mode"], "arm_registry": [arm["arm_id"] for arm in manifest["arms"]], "reference_arm": manifest["reference_arm"], "bootstrap": manifest["bootstrap"]}: raise CustodyError("scoring_report_protocol_invalid")
     if not isinstance(row["ranking_artifact_sha256"], Mapping) or not row["ranking_artifact_sha256"] or not isinstance(row["arms"], Mapping) or set(row["ranking_artifact_sha256"]) != set(row["arms"]) or set(protocol["arm_registry"]) != set(row["arms"]): raise CustodyError("scoring_report_arm_schema_invalid")
     for digest in row["ranking_artifact_sha256"].values(): _h(digest, "scoring_report_digest_invalid")
@@ -383,7 +411,7 @@ def validate_report(value: Any) -> dict[str, Any]:
         if set(entry) != {"item_id", "evidence_token", "status"} or entry["status"] not in {"mapped", "unmatched", "ambiguous"}: raise CustodyError("scoring_report_ledger_invalid")
         _h(entry["item_id"], "scoring_report_ledger_invalid"); _h(entry["evidence_token"], "scoring_report_ledger_invalid")
     if len({(entry["item_id"], entry["evidence_token"]) for entry in row["mapping_ledger"]}) != len(row["mapping_ledger"]): raise CustodyError("scoring_report_ledger_duplicate")
-    metric_keys = {"item_count", "evidence_item_count", "resolved_evidence_item_count", "unresolved_evidence_item_count", "retrieved_evidence_count_at_10", *_METRIC_KEYS}
+    metric_keys = {"item_count", "evidence_item_count", "resolved_evidence_item_count", "unresolved_evidence_item_count", "retrieved_evidence_count_at_10", "evidence_micro_recall_at_10", *_METRIC_KEYS}
     def metric_summary(summary: Any) -> None:
         summary = _o(summary, "scoring_report_metric_schema_invalid")
         if set(summary) != metric_keys: raise CustodyError("scoring_report_metric_schema_invalid")
@@ -397,6 +425,10 @@ def validate_report(value: Any) -> dict[str, Any]:
         for key in _METRIC_KEYS:
             number = _number(summary.get(key), "scoring_report_metric_schema_invalid")
             if not 0 <= number <= 1: raise CustodyError("scoring_report_metric_range_invalid")
+        if summary["evidence_item_count"] <= 0 or not 0 <= _number(summary.get("evidence_micro_recall_at_10"), "scoring_report_metric_schema_invalid") <= 1:
+            raise CustodyError("scoring_report_metric_range_invalid")
+        if not math.isclose(float(summary["evidence_micro_recall_at_10"]), float(summary["retrieved_evidence_count_at_10"]) / int(summary["evidence_item_count"]), rel_tol=0.0, abs_tol=1e-12):
+            raise CustodyError("scoring_report_metric_denominator_invalid")
     def persona_summary(summary: Any) -> None:
         summary = _o(summary, "scoring_report_metric_schema_invalid")
         if set(summary) != {"persona_count", *_METRIC_KEYS}: raise CustodyError("scoring_report_metric_schema_invalid")
@@ -474,7 +506,7 @@ def validate_report(value: Any) -> dict[str, Any]:
     def retrieval_bootstrap(section: Any, expected_subset: str) -> None:
         section = _o(section, "scoring_report_bootstrap_schema_invalid")
         expected = {"subset", "metric", "reference_arm", "original_replicate_rule", "original_replicate_count", "bootstrap_plan_sha256", "resamples", "seed", "percentile_rule", "paired_deltas"}
-        if set(section) != expected or section.get("subset") != expected_subset or section.get("metric") != "positive_persona_macro_recall_at_10" or section.get("reference_arm") not in row["arms"] or section.get("original_replicate_rule") != "per_query_arithmetic_mean" or section.get("original_replicate_count") != 5 or section.get("percentile_rule") != "linear": raise CustodyError("scoring_report_bootstrap_schema_invalid")
+        if set(section) != expected or section.get("subset") != expected_subset or section.get("metric") != "positive_persona_macro_recall_at_10" or section.get("reference_arm") not in row["arms"] or section.get("original_replicate_rule") not in {"per_query_arithmetic_mean", "global_build_multiset_per_draw"} or section.get("original_replicate_rule") != protocol["bootstrap"].get("original_replicate_rule") or section.get("original_replicate_count") != 5 or section.get("percentile_rule") != "linear": raise CustodyError("scoring_report_bootstrap_schema_invalid")
         _h(section.get("bootstrap_plan_sha256"), "scoring_report_bootstrap_schema_invalid")
         _integer(section.get("resamples"), "scoring_report_bootstrap_schema_invalid", positive=True); _integer(section.get("seed"), "scoring_report_bootstrap_schema_invalid")
         if section["resamples"] != protocol["bootstrap"].get("resamples") or section["seed"] != protocol["bootstrap"].get("seed"): raise CustodyError("scoring_report_bootstrap_schema_invalid")

@@ -197,6 +197,15 @@ def test_inconsistent_descendant_observation_is_rejected_before_custody(tmp_path
 
 def test_real_synthetic_bundle_scores_in_a_distinct_subprocess_and_is_idempotent(tmp_path, monkeypatch):
     config, config_path, private, freeze = _public_run(tmp_path, monkeypatch)
+    # This is a real builder -> custody-open -> release/scoring integration,
+    # not a mocked one-shot transport test.  The one formal binding secret is
+    # used for both the source commitments and privileged custody verification.
+    sealed = confirmation.load_sealed_custody(
+        Path(config["candidate_bundle"]),
+        Path(config["custody_bundle"]),
+        binding_secret=private["binding_secret"].encode("utf-8"),
+    )
+    assert sealed["projection_sha256"] == confirmation.canonical_sha256(confirmation.load_candidate_projection(Path(config["candidate_bundle"])))
     launched = custodian.launch_custodian(public_config_path=config_path, private_payload=private)
     assert launched["exit_code"] == 0, launched["stderr"].decode("utf-8", "replace")
     output = Path(config["output_path"])
@@ -212,6 +221,44 @@ def test_real_synthetic_bundle_scores_in_a_distinct_subprocess_and_is_idempotent
     assert retry["exit_code"] == 0, retry["stderr"].decode("utf-8", "replace")
     assert output.read_bytes() == initial
     assert not list(output.parent.glob(".custodian-packet.json.tmp-*"))
+
+
+def test_consumed_marker_requires_capability_hmac_and_rejects_tampering(tmp_path, monkeypatch):
+    config, _config_path, private_payload, _freeze = _public_run(tmp_path, monkeypatch)
+    result = custodian.execute_custodian(config, private_payload)
+    public = custodian.validate_public_freeze(config)
+    output = Path(config["output_path"])
+    parsed = custodian._private(
+        private_payload,
+        packet_sha256=public["packet"]["packet_sha256"],
+        file_sha256=config["freeze_packet_file_sha256"],
+        output_path=output,
+        formal_live=False,
+        require_unexpired=False,
+    )
+    context = custodian._consumed_marker_context(public=public, private=parsed, output=output)
+    _lock, marker_path = custodian._authorization_paths(output, parsed["authorization_id"])
+    original = marker_path.read_bytes()
+    assert custodian._validated_consumed_marker(
+        consumed=marker_path,
+        context=context,
+        custody_capability_secret=parsed["custody_capability_secret"],
+    )["packet_sha256"] == result["packet_sha256"]
+    forged = json.loads(original.decode("utf-8")); forged["marker_hmac"] = "0" * 64
+    marker_path.write_bytes(custodian._bytes(forged))
+    with pytest.raises(CustodyError, match="authorization_consumed_invalid"):
+        custodian._validated_consumed_marker(
+            consumed=marker_path,
+            context=context,
+            custody_capability_secret=parsed["custody_capability_secret"],
+        )
+    marker_path.write_bytes(original)
+    with pytest.raises(CustodyError, match="authorization_consumed_invalid"):
+        custodian._validated_consumed_marker(
+            consumed=marker_path,
+            context=context,
+            custody_capability_secret=b"wrong-custody-capability-secret-value",
+        )
 
 
 def test_same_authorization_replay_does_not_snapshot_or_open_custody(tmp_path, monkeypatch):
@@ -232,6 +279,22 @@ def test_same_authorization_replay_does_not_snapshot_or_open_custody(tmp_path, m
     assert custody_reads == []
 
 
+@pytest.mark.parametrize("field", ("envelope", "custodian_post_score_attestation"))
+def test_forged_existing_final_packet_is_not_a_retry_success(tmp_path, monkeypatch, field):
+    config, _config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
+    custodian.execute_custodian(config, private)
+    output = Path(config["output_path"])
+    packet = json.loads(output.read_text(encoding="utf-8"))
+    if field == "envelope":
+        packet[field]["release_authorization"]["release_hmac"] = "0" * 64
+    else:
+        packet[field]["attestation_hmac"] = "0" * 64
+    packet["packet_sha256"] = custodian._digest({key: value for key, value in packet.items() if key != "packet_sha256"})
+    output.write_bytes(custodian._bytes(packet))
+    with pytest.raises(CustodyError, match="completed_packet_(envelope|attestation)_invalid"):
+        custodian.execute_custodian(config, private)
+
+
 def test_consumed_authorization_with_deleted_result_never_reopens_custody(tmp_path, monkeypatch):
     config, _config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
     custodian.execute_custodian(config, private)
@@ -245,6 +308,17 @@ def test_consumed_authorization_with_deleted_result_never_reopens_custody(tmp_pa
     monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("consumed replay must not open custody")))
     with pytest.raises(CustodyError, match="consumed_result_missing"):
         custodian.execute_custodian(config, private)
+
+
+def test_completed_packet_replay_remains_verifiable_after_execution_expiry(tmp_path, monkeypatch):
+    config, _config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
+    first = custodian.execute_custodian(config, private)
+    # Preserve the original signed identity; only wall time advances past its
+    # execution lease.  Re-signing a changed expiry would be a new capability.
+    monkeypatch.setattr(custodian.time, "time", lambda: private["expires_at_unix"] + 1)
+    monkeypatch.setattr(custodian.formal, "open_custody_after_rehearsal_release", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("completed retry must not reopen custody")))
+    replay = custodian.execute_custodian(config, private)
+    assert replay["retry_idempotent"] is True and replay["packet_sha256"] == first["packet_sha256"]
 
 
 def test_publication_before_consumed_marker_crash_is_healed_without_rescore(tmp_path, monkeypatch):

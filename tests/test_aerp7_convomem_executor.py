@@ -114,6 +114,14 @@ def test_formal_authorization_uses_a_distinct_live_schema(tmp_path):
         executor._authorization(rehearsal, protocol=protocol, output_dir=output, capability=secret)
 
 
+def test_formal_original_worker_command_is_pinned_to_its_distinct_interpreter(tmp_path):
+    original_python = (tmp_path / "original-python.exe").resolve()
+    command = [str(original_python), "-m", "benchmarks.aerp7_convomem_executor", "--original-worker-stdin"]
+    executor.assert_public_command(command, executor._sanitized_env(), expected_python=original_python)
+    with pytest.raises(CustodyError, match="public_command"):
+        executor.assert_public_command([sys.executable, *command[1:]], executor._sanitized_env(), expected_python=original_python)
+
+
 def test_concurrent_same_nonce_has_exactly_one_authorization_consumer(tmp_path):
     authorization = {"nonce": "r" * 32, "authorization_sha256": "a" * 64, "protocol_sha256": "b" * 64}
     output = tmp_path / "out"
@@ -153,9 +161,10 @@ def test_exact_original_worker_packet_requires_cross_process_draft_and_coordinat
         "schema": executor.FORMAL_ORIGINAL_PACKET_SCHEMA,
         "execution_mode": "exact_public_product_worker_draft",
         "draft_file_sha256": hashlib.sha256(draft_bytes).hexdigest(),
-        "palace_path": str(palace_path.resolve()),
-        "resource_receipt": resource,
-        "process_id": 123,
+            "palace_path": str(palace_path.resolve()),
+            "resource_receipt": resource,
+            "worker_execution_identity": {"original_python": str((tmp_path / "original-python.exe").resolve()), "original_execution_policy_sha256": "c" * 64},
+            "process_id": 123,
         "packet_sha256": "",
     }
     packet["packet_sha256"] = _digest({key: value for key, value in packet.items() if key != "packet_sha256"})
@@ -207,11 +216,13 @@ def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, m
 
 
 def test_formal_current_worker_uses_live_runner_without_synthetic_fallback(tmp_path, monkeypatch):
-    protocol = {"protocol_sha256": "a" * 64}
+    protocol = {"protocol_sha256": "a" * 64, "execution_checkpoint": {"synthetic": "checkpoint"}, "current_code_receipt": {"synthetic": "code"}}
     worker_config = {"worker": "config"}; projection = {"projection": "live"}
     model_dir = tmp_path / "model"; model_dir.mkdir()
     output = tmp_path / "current.json"; calls = []
     monkeypatch.setattr(executor.formal, "validate_formal_protocol", lambda value: protocol)
+    monkeypatch.setattr(executor.execution_checkpoint, "require_live_binding", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(executor, "_clean_protocol_code_observation", lambda **_kwargs: protocol["current_code_receipt"])
     monkeypatch.setattr(executor, "_load", lambda path: protocol if path.name == "protocol.json" else worker_config)
     monkeypatch.setattr(executor, "_candidate_projection", lambda *args: projection)
     monkeypatch.setattr(

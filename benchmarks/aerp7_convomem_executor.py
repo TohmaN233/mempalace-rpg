@@ -32,6 +32,7 @@ from typing import Any, Mapping, Sequence
 from benchmarks import aerp7_convomem_formal as formal
 from benchmarks import aerp7_original_product as original_product
 from benchmarks import aerp7_convomem_rank as rank
+from benchmarks import aerp_execution_checkpoint as execution_checkpoint
 from benchmarks import aerp7_convomem_scoring as score
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256, validate_candidate_projection
 from benchmarks import aerp5_product_paired_locomo as v1
@@ -51,7 +52,7 @@ FORMAL_FREEZE_PACKET_SCHEMA = "aerp7-convomem-formal-public-freeze-packet-v1"
 _PUBLIC_ROLE_FLAGS = frozenset({"--current-worker-stdin", "--original-worker-stdin"})
 PUBLIC_CONFIG_KEYS = frozenset({"schema", "synthetic_test_mode", "protocol_path", "candidate_bundle", "output_dir", "authorization_path", "python_executable"})
 FORMAL_PUBLIC_CONFIG_KEYS = frozenset({
-    *PUBLIC_CONFIG_KEYS, "original_root", "model_dir",
+    *PUBLIC_CONFIG_KEYS, "original_root", "model_dir", "original_python",
 })
 CURRENT_CONFIG_KEYS = frozenset({"schema", "synthetic_test_mode", "protocol_path", "candidate_bundle", "worker_config", "output_path", "staging_parent", "execution_role"})
 FORMAL_CURRENT_CONFIG_KEYS = frozenset({*CURRENT_CONFIG_KEYS, "model_dir"})
@@ -59,7 +60,7 @@ ORIGINAL_CONFIG_KEYS = frozenset({"schema", "synthetic_test_mode", "protocol_pat
 FORMAL_ORIGINAL_CONFIG_KEYS = frozenset({
     "schema", "synthetic_test_mode", "protocol_path", "candidate_bundle",
     "output_path", "draft_path", "build_id", "original_root", "model_dir",
-    "palace_path",
+    "palace_path", "original_python",
 })
 
 
@@ -381,7 +382,7 @@ def _sanitized_env() -> dict[str, str]:
     return retained
 
 
-def assert_public_command(command: Sequence[str], env: Mapping[str, str]) -> None:
+def assert_public_command(command: Sequence[str], env: Mapping[str, str], *, expected_python: Path | None = None) -> None:
     # Paths are opaque capabilities: rejecting words such as ``scorer`` inside a
     # random temporary-directory name is both brittle and unrelated to whether a
     # worker received a private capability.  Enforce the exact executable/module/
@@ -389,7 +390,7 @@ def assert_public_command(command: Sequence[str], env: Mapping[str, str]) -> Non
     # separately reject every extra field.
     if (
         len(command) != 4
-        or Path(str(command[0])).resolve() != Path(sys.executable).resolve()
+        or Path(str(command[0])).resolve() != (expected_python or Path(sys.executable)).resolve()
         or list(command[1:3]) != ["-m", "benchmarks.aerp7_convomem_executor"]
         or command[3] not in _PUBLIC_ROLE_FLAGS
     ):
@@ -486,6 +487,10 @@ def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projec
     if role not in {"raw", "p5_primary", "p5_repeat", "six"}:
         raise CustodyError("executor_current_role_invalid")
     arm_id = {"raw": "strong_raw", "p5_primary": "static_p5", "p5_repeat": "static_p5", "six": "six_view_secondary"}[role]
+    driver = frozen["execution_checkpoint"]["driver_code_receipt"]
+    current_python = Path(sys.executable).resolve()
+    if str(current_python) != driver.get("python") or not current_python.is_file() or hashlib.sha256(current_python.read_bytes()).hexdigest() != driver.get("python_sha256"):
+        raise CustodyError("executor_current_interpreter_checkpoint_mismatch")
     code_before = _clean_protocol_code_observation(expected=frozen["current_code_receipt"])
     model_before, encoder = _live_model_observation(model_dir=model_dir, expected=frozen["model_receipt"])
     measurements: list[dict[str, Any]] = []
@@ -513,6 +518,7 @@ def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projec
         # object lifecycle, and the formal contract is CPU provider + pinned
         # model tree, not an in-process sharing implementation detail.
         "provider": {"model": "minilm", "device": "cpu", "providers": ["CPUExecutionProvider"], "model_file_tree_sha256": model_before["model_file_tree_sha256"]},
+        "current_interpreter": {"python": str(current_python), "sha256": hashlib.sha256(current_python.read_bytes()).hexdigest()},
     })
     receipt["execution_sha256"] = _digest({key: item for key, item in receipt.items() if key != "execution_sha256"})
     return {"artifact": artifact, "resource_receipt": resource, "execution_receipt": receipt}
@@ -684,6 +690,10 @@ def current_worker(config: Mapping[str, Any]) -> dict[str, Any]:
     role_to_arm = {"raw": "strong_raw", "p5_primary": "static_p5", "p5_repeat": "static_p5", "six": "six_view_secondary"}
     if role not in role_to_arm: raise CustodyError("executor_current_role_invalid")
     if synthetic is False:
+        execution_checkpoint.require_live_binding(
+            protocol["execution_checkpoint"],
+            current_code_receipt=_clean_protocol_code_observation(expected=protocol["current_code_receipt"]),
+        )
         model_dir = Path(str(config["model_dir"]))
         if not model_dir.is_dir() or model_dir.is_symlink():
             raise CustodyError("executor_current_live_input_invalid")
@@ -710,6 +720,7 @@ def current_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         peak_rss_bytes=monitor.peak_bytes,
         passage_embedding={"calls": encoder.passage_calls, "texts": encoder.passage_texts},
         query_embedding={"calls": encoder.query_calls, "texts": encoder.query_texts},
+        resource_comparability=protocol["resource_thresholds"]["resource_comparability"],
     )
     execution_receipt = _current_execution_receipt(role=role, arm_id=role_to_arm[role], protocol=protocol, projection=projection, worker_config=worker_config, encoder=encoder, artifact=artifact, resource=resource)
     packet = {"schema": CURRENT_PACKET_SCHEMA, "execution_role": role, "artifact": artifact, "resource_receipt": resource, "execution_receipt": execution_receipt, "process_id": os.getpid(), "packet_sha256": ""}
@@ -737,6 +748,11 @@ def _synthetic_original_replicate(projection: Mapping[str, Any], protocol: Mappi
 def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
     synthetic = _assert_original_mode(config)
     protocol = formal.validate_formal_protocol(_load(Path(str(config["protocol_path"]))))
+    if synthetic is False:
+        execution_checkpoint.require_live_binding(
+            protocol["execution_checkpoint"],
+            current_code_receipt=_clean_protocol_code_observation(expected=protocol["current_code_receipt"]),
+        )
     bundle = Path(str(config["candidate_bundle"])); output = Path(str(config["output_path"])); build_id = str(config["build_id"])
     # Candidate worker config is created in memory only for reading label-free data.
     worker_config = {"role": "candidate_ranker", "projection_sha256": protocol["candidate"]["projection_canonical_sha256"], "projection_raw_sha256": protocol["candidate"]["projection_raw_sha256"], "projection_path": "projection.json", "model_receipt": protocol["model_receipt"], "code_receipt": protocol["current_code_receipt"], "staging_root": "staging", "arms": ["strong_raw", "static_p5", "six_view_secondary"], "top_k": 10, "tie_break": "stable_ranking_key_ascending", "serializer_contract": protocol["serializer_contract"]}
@@ -759,6 +775,7 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
             peak_rss_bytes=monitor.peak_bytes,
             passage_embedding={"calls": len(projection["corpora"]), "texts": denominators["candidate_text_count"]},
             query_embedding={"calls": denominators["query_count"], "texts": denominators["query_count"]},
+            resource_comparability=protocol["resource_thresholds"]["resource_comparability"],
             storage_bytes=1,
         )
         packet = {"schema": ORIGINAL_PACKET_SCHEMA, "replicate": replicate, "resource_receipt": resource, "process_id": os.getpid(), "packet_sha256": ""}
@@ -766,7 +783,15 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         draft_path = Path(str(config["draft_path"])); palace_path = Path(str(config["palace_path"]))
         if output.parent.resolve() != draft_path.parent.resolve() or output.parent.resolve() != palace_path.parent.resolve() or any(path.exists() or path.is_symlink() for path in (output, draft_path, palace_path)):
             raise CustodyError("executor_original_output_capability_invalid")
-        original_root, model_dir = Path(str(config["original_root"])), Path(str(config["model_dir"]))
+        policy = protocol["execution_checkpoint"]["original_execution_policy"]
+        original_root, model_dir, original_python = (Path(str(config[key])) for key in ("original_root", "model_dir", "original_python"))
+        if (
+            str(original_root.resolve()) != policy["original_root"]
+            or str(model_dir.resolve()) != policy["model_dir"]
+            or str(original_python.resolve()) != policy["original_python"]
+            or Path(sys.executable).resolve() != original_python.resolve()
+        ):
+            raise CustodyError("executor_original_execution_policy_mismatch")
         if not original_root.is_dir() or original_root.is_symlink() or not model_dir.is_dir() or model_dir.is_symlink():
             raise CustodyError("executor_original_live_input_invalid")
         with original_product.pinned_live_original_product(
@@ -792,6 +817,10 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
             "schema": FORMAL_ORIGINAL_PACKET_SCHEMA, "execution_mode": "exact_public_product_worker_draft",
             "draft_file_sha256": hashlib.sha256(draft_bytes).hexdigest(),
             "palace_path": str(palace_path.resolve()), "resource_receipt": resource,
+            "worker_execution_identity": {
+                "original_python": str(original_python.resolve()),
+                "original_execution_policy_sha256": protocol["execution_checkpoint"]["original_execution_policy_sha256"],
+            },
             "process_id": os.getpid(), "packet_sha256": "",
         }
     packet["packet_sha256"] = _digest({key: item for key, item in packet.items() if key != "packet_sha256"})
@@ -805,10 +834,13 @@ def coordinator_reaudit_original_worker_packet(*, packet: Mapping[str, Any], dra
     has exited.  It never trusts a worker-supplied coordinator receipt or index
     digest and retains the palace so the coordinator can remeasure it directly.
     """
-    required = {"schema", "execution_mode", "draft_file_sha256", "palace_path", "resource_receipt", "process_id", "packet_sha256"}
+    required = {"schema", "execution_mode", "draft_file_sha256", "palace_path", "resource_receipt", "worker_execution_identity", "process_id", "packet_sha256"}
     if set(packet) != required or packet.get("schema") != FORMAL_ORIGINAL_PACKET_SCHEMA or packet.get("execution_mode") != "exact_public_product_worker_draft":
         raise CustodyError("executor_original_worker_packet_invalid")
     if packet.get("packet_sha256") != _digest({key: item for key, item in packet.items() if key != "packet_sha256"}) or packet.get("palace_path") != str(palace_path.resolve()):
+        raise CustodyError("executor_original_worker_packet_invalid")
+    identity = packet.get("worker_execution_identity")
+    if not isinstance(identity, Mapping) or set(identity) != {"original_python", "original_execution_policy_sha256"}:
         raise CustodyError("executor_original_worker_packet_invalid")
     if not draft_path.is_file() or draft_path.is_symlink():
         raise CustodyError("executor_original_worker_draft_missing")
@@ -843,8 +875,9 @@ def _load_stdin() -> dict[str, Any]:
     return dict(value)
 
 
-def _run_subprocess(command: Sequence[str], *, config: Mapping[str, Any], output: Path, timeout_seconds: float = 120.0) -> dict[str, Any]:
-    env = _sanitized_env(); assert_public_command(command, env)
+def _run_subprocess(command: Sequence[str], *, config: Mapping[str, Any], output: Path, timeout_seconds: float | None = None,
+                    expected_python: Path | None = None) -> dict[str, Any]:
+    env = _sanitized_env(); assert_public_command(command, env, expected_python=expected_python)
     if Path(str(config.get("output_path", ""))).resolve() != output.resolve():
         raise CustodyError("executor_public_config_capability_invalid")
     # Config arrives over stdin from an already validated in-memory mapping.  A
@@ -863,7 +896,7 @@ def _run_subprocess(command: Sequence[str], *, config: Mapping[str, Any], output
                 for child in root.children(recursive=True): child.kill()
             except BaseException:
                 pass
-            process.kill(); process.communicate(); raise TimeoutError("executor_worker_timeout")
+            process.kill(); process.communicate(); raise CustodyError("executor_worker_infrastructure_failure", reason="wall_timeout", timeout_seconds=timeout_seconds)
         finally:
             shutil.rmtree(cwd, ignore_errors=True)
     if code != 0:
@@ -918,6 +951,13 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             raise CustodyError("executor_current_packet_schema_invalid")
         current_packets.append(current_packet)
     original_packets = []; original_jobs: list[tuple[Path, Path]] = []
+    original_policy = protocol["execution_checkpoint"]["original_execution_policy"] if not synthetic else None
+    if not synthetic and (
+        str(Path(str(config["original_root"])).resolve()) != original_policy["original_root"]
+        or str(Path(str(config["model_dir"])).resolve()) != original_policy["model_dir"]
+        or str(Path(str(config["original_python"])).resolve()) != original_policy["original_python"]
+    ):
+        raise CustodyError("executor_original_execution_policy_mismatch")
     for number in range(5):
         path = staging / f"original-{number}.json"
         if synthetic:
@@ -931,16 +971,23 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
                 "output_path": str(path.resolve()), "draft_path": str(draft_path.resolve()),
                 "build_id": f"formal-build-{number}", "original_root": str(Path(str(config["original_root"])).resolve()),
                 "model_dir": str(Path(str(config["model_dir"])).resolve()), "palace_path": str(palace_path.resolve()),
+                "original_python": str(Path(str(config["original_python"])).resolve()),
             }
             original_jobs.append((draft_path, palace_path))
         supervisors[f"original-{number}"] = _run_subprocess(
-            [executable, "-m", "benchmarks.aerp7_convomem_executor", "--original-worker-stdin"],
+            [str(Path(str(original_policy["original_python"])).resolve()) if not synthetic else executable, "-m", "benchmarks.aerp7_convomem_executor", "--original-worker-stdin"],
             config=child, output=path,
+            expected_python=Path(str(original_policy["original_python"])) if not synthetic else None,
         )
         original_packet = _load(path)
         expected_original_packet_schema = ORIGINAL_PACKET_SCHEMA if synthetic else FORMAL_ORIGINAL_PACKET_SCHEMA
         if original_packet.get("schema") != expected_original_packet_schema:
             raise CustodyError("executor_original_packet_schema_invalid")
+        if not synthetic and original_packet.get("worker_execution_identity") != {
+            "original_python": original_policy["original_python"],
+            "original_execution_policy_sha256": protocol["execution_checkpoint"]["original_execution_policy_sha256"],
+        }:
+            raise CustodyError("executor_original_worker_execution_identity_invalid")
         original_packets.append(original_packet)
     projection = formal.load_candidate_worker_projection(worker_config=worker, protocol=protocol, candidate_bundle_root=public_bundle, staging_parent=staging)
     if synthetic:
@@ -1027,15 +1074,25 @@ def public_coordinator(config: Mapping[str, Any]) -> dict[str, Any]:
         _assert_synthetic(config)
     elif synthetic is not False:
         raise CustodyError("executor_formal_execution_blocked")
+    if synthetic is False and os.name != "posix":
+        raise CustodyError("executor_formal_durability_host_unsupported")
     protocol_path = Path(str(config["protocol_path"]))
     protocol = formal.validate_formal_protocol(_load(protocol_path))
+    if synthetic is False:
+        driver = protocol["execution_checkpoint"]["driver_code_receipt"]
+        configured_python = Path(str(config["python_executable"])).resolve()
+        if str(configured_python) != driver.get("python") or configured_python != Path(sys.executable).resolve() or not configured_python.is_file() or hashlib.sha256(configured_python.read_bytes()).hexdigest() != driver.get("python_sha256"):
+            raise CustodyError("executor_current_interpreter_checkpoint_mismatch")
     output = Path(str(config["output_dir"]))
     authorization = _authorization(
         _load(Path(str(config["authorization_path"]))), protocol=protocol,
         output_dir=output, capability=_operator_secret(),
     )
     if synthetic is False:
-        _clean_protocol_code_observation(expected=protocol["current_code_receipt"])
+        execution_checkpoint.require_live_binding(
+            protocol["execution_checkpoint"],
+            current_code_receipt=_clean_protocol_code_observation(expected=protocol["current_code_receipt"]),
+        )
     _consume_authorization(authorization=authorization, output_dir=output)
     staging = _new_staging_generation(output=output, authorization=authorization)
     staging_identity = _generation_identity(staging)
