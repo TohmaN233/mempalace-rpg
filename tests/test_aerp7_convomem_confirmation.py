@@ -490,14 +490,107 @@ def test_many_cases_streaming_proxy_keeps_no_staged_json_after_indexing(tmp_path
         index.close()
 
 
-def test_streaming_path_preserves_duplicate_outer_and_empty_message_failures(tmp_path: Path) -> None:
+def test_duplicate_outer_row_normalization_preserves_raw_locator_ordinals_and_is_deterministic(tmp_path: Path) -> None:
     canonical, premix = _roots(tmp_path)
     cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
     cases = json.loads(cases_path.read_text(encoding="utf-8"))
-    cases[0]["conversations"].append(dict(cases[0]["conversations"][0]))
+    first = cases[0]["conversations"][0]
+    second = json.loads(json.dumps(first))
+    second["id"] = "second-conversation"
+    second["messages"][0]["text"] = "second-candidate"
+    # Retained rows are A@0 and B@2; the remaining three rows are exact
+    # duplicates distributed over both ids.
+    cases[0]["conversations"] = [
+        first,
+        json.loads(json.dumps(first)),
+        second,
+        json.loads(json.dumps(second)),
+        json.loads(json.dumps(first)),
+    ]
     _write(cases_path, cases)
-    with pytest.raises(custody.CrosswalkError, match="premix_outer_conversation_id_duplicate"):
-        _publish(canonical=canonical, premix=premix, output=tmp_path / "duplicate", staging=_staging(tmp_path))
+
+    nonstream_cases, _excluded = custody._premix(
+        [{"locator": "cases.json", "raw": cases_path.read_bytes()}], SECRET, "a" * 64,
+    )
+    nonstream_messages = nonstream_cases[0]["messages"]
+    assert [
+        (row["conversation_order"], row["source_locator"]["conversation_id"], row["source_locator"]["conversation_ordinal"])
+        for row in nonstream_messages
+    ] == [(0, first["id"], 0), (1, second["id"], 2)]
+
+    def indexed_normalization(staging_root: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+        index = custody._streaming_index(
+            custody._subroot(canonical, "evidence_questions"),
+            custody._subroot(premix, "pre_mixed_testcases"), staging_root,
+        )
+        try:
+            connection = __import__("sqlite3").connect(index.database)
+            try:
+                assert connection.execute("SELECT count(*) FROM premix_exact_duplicate_normalizations").fetchone()[0] == 3
+                locator = custody._bytes({"path": "cases.json", "case_ordinal": 0}).decode()
+                messages = json.loads(connection.execute("SELECT messages FROM premix_cases WHERE locator=?", (locator,)).fetchone()[0])
+            finally:
+                connection.close()
+            return index.staging_receipt["premix_exact_duplicate_normalization"], messages
+        finally:
+            index.close()
+
+    normalization, streaming_messages = indexed_normalization(_staging(tmp_path / "first"))
+    normalization_again, _ = indexed_normalization(_staging(tmp_path / "second"))
+    assert normalization == normalization_again
+    assert [
+        (row["conversation_ordinal"], row["source_locator"]["conversation_id"], row["source_locator"]["conversation_ordinal"])
+        for row in streaming_messages
+    ] == [(0, first["id"], 0), (1, second["id"], 2)]
+    assert normalization["schema"] == custody.PREMIX_EXACT_DUPLICATE_NORMALIZATION["schema"]
+    assert normalization["duplicate_case_count"] == 1
+    assert normalization["duplicate_extra_row_count"] == 3
+
+    output = tmp_path / "duplicate"
+    _publish(
+        canonical=canonical, premix=premix, output=output,
+        staging=_staging(tmp_path / "published"), config=custody.SelectionConfig.census_v1(),
+    )
+    projection = custody.load_candidate_projection(output)
+    sealed = custody.load_sealed_custody(output, _custody_bundle(output), binding_secret=SECRET)
+    selected = next(item for item in sealed["items"] if item["source_locator"]["case"] == {"path": "cases.json", "case_ordinal": 0})
+    selected_corpus = next(corpus for corpus in projection["corpora"] if corpus["corpus_id"] == selected["corpus_id"])
+    assert [
+        (candidate["conversation_order"], message["source_locator"]["conversation_id"], message["source_locator"]["conversation_ordinal"])
+        for candidate, message in zip(selected_corpus["candidates"], selected["messages"])
+    ] == [(0, first["id"], 0), (1, second["id"], 2)]
+
+    cases[0]["conversations"][-1]["messages"][0]["text"] = "conflicting duplicate"
+    _write(cases_path, cases)
+    with pytest.raises(custody.CrosswalkError, match="premix_outer_conversation_content_conflict") as error:
+        _publish(canonical=canonical, premix=premix, output=tmp_path / "conflict-output", staging=_staging(tmp_path / "conflict"))
+    assert error.value.receipt["locator"] == "cases.json" and error.value.receipt["case_ordinal"] == 0
+
+
+def test_streaming_path_normalizes_exact_duplicate_outer_rows_and_rejects_content_conflicts(tmp_path: Path) -> None:
+    canonical, premix = _roots(tmp_path)
+    cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
+    cases = json.loads(cases_path.read_text(encoding="utf-8"))
+    cases[0]["conversations"].append(json.loads(json.dumps(cases[0]["conversations"][0])))
+    _write(cases_path, cases)
+    index = custody._streaming_index(custody._subroot(canonical, "evidence_questions"), custody._subroot(premix, "pre_mixed_testcases"), _staging(tmp_path))
+    try:
+        connection = __import__("sqlite3").connect(index.database)
+        try:
+            assert connection.execute("SELECT count(*) FROM premix_exact_duplicate_normalizations").fetchone()[0] == 1
+        finally:
+            connection.close()
+        normalization = index.staging_receipt["premix_exact_duplicate_normalization"]
+        assert normalization["schema"] == custody.PREMIX_EXACT_DUPLICATE_NORMALIZATION["schema"]
+        assert normalization["duplicate_case_count"] == normalization["duplicate_extra_row_count"] == 1
+    finally:
+        index.close()
+    _publish(canonical=canonical, premix=premix, output=tmp_path / "duplicate", staging=_staging(tmp_path))
+    cases[0]["conversations"][-1]["messages"][0]["text"] = "conflicting duplicate"
+    _write(cases_path, cases)
+    with pytest.raises(custody.CrosswalkError, match="premix_outer_conversation_content_conflict") as error:
+        _publish(canonical=canonical, premix=premix, output=tmp_path / "conflict", staging=_staging(tmp_path))
+    assert error.value.receipt["locator"] == "cases.json" and error.value.receipt["case_ordinal"] == 0
     canonical, premix = _roots(tmp_path / "empty")
     cases_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
     cases = json.loads(cases_path.read_text(encoding="utf-8"))

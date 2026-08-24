@@ -30,6 +30,10 @@ CUSTODY_READY_SCHEMA = "aerp7-convomem-custody-ready-v3"
 SELECTION_ALGORITHM = "hmac-sha256-revision-bound-persona-group-tier-context-v1"
 CENSUS_SELECTION_ALGORITHM = "aerp7-convomem-census-v1"
 BOUND_CUSTODY_ALGORITHM = "hmac-sha256-revision-bound-custody-binding-v1"
+PREMIX_EXACT_DUPLICATE_NORMALIZATION = {
+    "schema": "aerp7-premix-exact-outer-conversation-normalization-v1",
+    "rule": "retain_first_outer_row_per_case_conversation_id_when_canonical_content_sha256_matches",
+}
 SQLITE_INDEX_EXPANSION_FACTOR = 3
 STAGING_HEADROOM_BYTES = 8 * 1024 * 1024 * 1024
 _HEX = set("0123456789abcdef")
@@ -328,6 +332,40 @@ def _crosswalk_fields(item: Mapping[str, Any], code: str) -> tuple[str, str, tup
     return _text(item.get("answer"), code), _text(item.get("category"), code), _conversation_ids(item.get("conversations"), code)
 
 
+def _normalized_premix_outer_rows(outer: Any, *, locator: str, case_ordinal: int) -> tuple[list[tuple[str, Mapping[str, Any], int]], list[dict[str, Any]]]:
+    """Keep first exact duplicate rows, retaining each row's original ordinal."""
+    rows: list[tuple[str, Mapping[str, Any], int]] = []
+    seen: dict[str, tuple[str, int]] = {}
+    normalized: list[dict[str, Any]] = []
+    for outer_ordinal, conversation in enumerate(_list(outer, "premix_conversations_invalid")):
+        row = _object(conversation, "premix_conversation_invalid")
+        conversation_id = _text(row.get("id"), "premix_conversation_id_invalid")
+        signature = canonical_sha256(row)
+        prior = seen.get(conversation_id)
+        if prior is None:
+            seen[conversation_id] = (signature, outer_ordinal)
+            rows.append((conversation_id, row, outer_ordinal))
+            continue
+        prior_signature, retained_outer_ordinal = prior
+        conversation_id_sha256 = canonical_sha256(conversation_id)
+        if prior_signature != signature:
+            raise CrosswalkError(
+                "premix_outer_conversation_content_conflict",
+                locator=locator,
+                case_ordinal=case_ordinal,
+                conversation_id_sha256=conversation_id_sha256,
+                retained_outer_ordinal=retained_outer_ordinal,
+                conflicting_outer_ordinal=outer_ordinal,
+            )
+        normalized.append({
+            "conversation_id_sha256": conversation_id_sha256,
+            "content_sha256": signature,
+            "retained_outer_ordinal": retained_outer_ordinal,
+            "duplicate_outer_ordinal": outer_ordinal,
+        })
+    return rows, normalized
+
+
 def _directory(relative: Path) -> dict[str, str | None]:
     parts = relative.parts[:-1]
     # Do not infer abstention: group-to-abstention mapping is not frozen for this slice.
@@ -358,17 +396,14 @@ def _premix(files: Sequence[dict[str, Any]], secret: bytes, revision: str) -> tu
     for source_file in files:
         for case_ordinal, raw_case in enumerate(_list(_decode(source_file["raw"], "premix_json_invalid"), "premix_root_must_be_array")):
             case = _object(raw_case, "premix_case_invalid")
-            outer = _list(case.get("conversations"), "premix_conversations_invalid")
-            outer_rows: list[tuple[str, Mapping[str, Any]]] = []
-            for conversation in outer:
-                row = _object(conversation, "premix_conversation_invalid")
-                conversation_id = _text(row.get("id"), "premix_conversation_id_invalid")
+            locator = {"path": source_file["locator"], "case_ordinal": case_ordinal}
+            outer_rows, _normalization = _normalized_premix_outer_rows(
+                case.get("conversations"), locator=source_file["locator"], case_ordinal=case_ordinal,
+            )
+            for conversation_id, row, _retained_outer_ordinal in outer_rows:
                 signature = canonical_sha256(row)
                 prior = conversations_seen.setdefault(conversation_id, signature)
                 if prior != signature: raise CustodyError("premix_conversation_content_conflict")
-                outer_rows.append((conversation_id, row))
-            if len({row[0] for row in outer_rows}) != len(outer_rows):
-                raise CrosswalkError("premix_outer_conversation_id_duplicate")
             embedded = _list(case.get("evidenceItems"), "premix_evidence_items_invalid")
             personas = set(); keys = []
             for raw_evidence in embedded:
@@ -382,15 +417,14 @@ def _premix(files: Sequence[dict[str, Any]], secret: bytes, revision: str) -> tu
             if len(personas) != 1:
                 excluded["multi_persona_cases"] += 1
                 continue
-            locator = {"path": source_file["locator"], "case_ordinal": case_ordinal}
             messages = []
-            for conversation_ordinal, (conversation_id, conversation) in enumerate(outer_rows):
+            for conversation_order, (conversation_id, conversation, retained_outer_ordinal) in enumerate(outer_rows):
                 for message_ordinal, raw_message in enumerate(_list(conversation.get("messages"), "premix_messages_invalid")):
                     message = _object(raw_message, "premix_message_invalid")
                     text = _text(message.get("text"), "premix_message_text_invalid")
                     speaker = _text(message.get("speaker"), "premix_message_speaker_invalid")
-                    source = {**locator, "conversation_id": conversation_id, "conversation_ordinal": conversation_ordinal, "message_ordinal": message_ordinal}
-                    messages.append({"message_id": _opaque(secret, revision, "message", {"conversation_id": conversation_id, "message_ordinal": message_ordinal}), "opaque_conversation_id": _opaque(secret, revision, "conversation", conversation_id), "conversation_order": conversation_ordinal, "message_order": message_ordinal, "corpus_order": len(messages), "speaker": speaker, "text": text, "source_locator": source})
+                    source = {**locator, "conversation_id": conversation_id, "conversation_ordinal": retained_outer_ordinal, "message_ordinal": message_ordinal}
+                    messages.append({"message_id": _opaque(secret, revision, "message", {"conversation_id": conversation_id, "message_ordinal": message_ordinal}), "opaque_conversation_id": _opaque(secret, revision, "conversation", conversation_id), "conversation_order": conversation_order, "message_order": message_ordinal, "corpus_order": len(messages), "speaker": speaker, "text": text, "source_locator": source})
             if not messages:
                 raise CustodyError("premix_case_has_no_messages")
             context_size = case.get("contextSize")
@@ -952,6 +986,7 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
             CREATE TABLE premix_keys(key_sha TEXT NOT NULL, case_sha TEXT NOT NULL);
             CREATE INDEX premix_key ON premix_keys(key_sha);
             CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY, content_sha TEXT NOT NULL);
+            CREATE TABLE premix_exact_duplicate_normalizations(case_sha TEXT NOT NULL, locator TEXT NOT NULL, case_ordinal INTEGER NOT NULL, conversation_id_sha256 TEXT NOT NULL, content_sha TEXT NOT NULL, retained_outer_ordinal INTEGER NOT NULL, duplicate_outer_ordinal INTEGER NOT NULL, PRIMARY KEY(case_sha, conversation_id_sha256, duplicate_outer_ordinal));
             CREATE TABLE explicit_quarantine(reason TEXT NOT NULL, key_sha TEXT NOT NULL, PRIMARY KEY(reason, key_sha));
         """)
         digests = {}
@@ -997,14 +1032,16 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
                                 if isinstance(context_size, bool) or not isinstance(context_size, int) or context_size <= 0:
                                     raise CustodyError("premix_context_size_invalid")
                                 locator_case = {"path": locator, "case_ordinal": ordinal}; case_sha = canonical_sha256(locator_case)
-                                outer = _list(case.get("conversations"), "premix_conversations_invalid")
-                                outer_ids: set[str] = set(); messages = []
-                                for conversation_ordinal, conversation in enumerate(outer):
-                                    row = _object(conversation, "premix_conversation_invalid")
-                                    conversation_id = _text(row.get("id"), "premix_conversation_id_invalid")
-                                    if conversation_id in outer_ids:
-                                        raise CrosswalkError("premix_outer_conversation_id_duplicate")
-                                    outer_ids.add(conversation_id)
+                                outer_rows, duplicate_normalizations = _normalized_premix_outer_rows(
+                                    case.get("conversations"), locator=locator, case_ordinal=ordinal,
+                                )
+                                outer_ids = {conversation_id for conversation_id, _row, _retained_outer_ordinal in outer_rows}; messages = []
+                                for duplicate in duplicate_normalizations:
+                                    connection.execute(
+                                        "INSERT INTO premix_exact_duplicate_normalizations VALUES(?,?,?,?,?,?,?)",
+                                        (case_sha, locator, ordinal, duplicate["conversation_id_sha256"], duplicate["content_sha256"], duplicate["retained_outer_ordinal"], duplicate["duplicate_outer_ordinal"]),
+                                    )
+                                for conversation_order, (conversation_id, row, retained_outer_ordinal) in enumerate(outer_rows):
                                     content_sha = canonical_sha256(row)
                                     prior = connection.execute("SELECT content_sha FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
                                     if prior is None:
@@ -1013,7 +1050,7 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
                                         raise CustodyError("premix_conversation_content_conflict")
                                     for message_ordinal, message in enumerate(_list(row.get("messages"), "premix_messages_invalid")):
                                         parsed_message = _object(message, "premix_message_invalid")
-                                        messages.append({"conversation_id": conversation_id, "conversation_ordinal": conversation_ordinal, "message_ordinal": message_ordinal, "corpus_ordinal": len(messages), "speaker": _text(parsed_message.get("speaker"), "premix_message_speaker_invalid"), "text": _text(parsed_message.get("text"), "premix_message_text_invalid"), "source_locator": {**locator_case, "conversation_id": conversation_id, "conversation_ordinal": conversation_ordinal, "message_ordinal": message_ordinal}})
+                                        messages.append({"conversation_id": conversation_id, "conversation_ordinal": conversation_order, "message_ordinal": message_ordinal, "corpus_ordinal": len(messages), "speaker": _text(parsed_message.get("speaker"), "premix_message_speaker_invalid"), "text": _text(parsed_message.get("text"), "premix_message_text_invalid"), "source_locator": {**locator_case, "conversation_id": conversation_id, "conversation_ordinal": retained_outer_ordinal, "message_ordinal": message_ordinal}})
                                 if not messages:
                                     raise CustodyError("premix_case_has_no_messages")
                                 keys = []
@@ -1048,6 +1085,18 @@ def _streaming_index(canonical_root: Path, premix_root: Path, staging_root: Path
                     staged.unlink()
                     owned_files.pop(staged)
             digests[role] = canonical_sha256([{"locator": row["locator"], "sha256": row["sha256"]} for row in rows]); receipt.extend({"role": role, "locator": row["locator"], "sha256": row["sha256"], "identity": list(row["identity"]), "size": row["size"]} for row in rows)
+        normalization_digest = hashlib.sha256(); normalization_count = 0
+        for row in connection.execute("SELECT locator, case_ordinal, conversation_id_sha256, content_sha, retained_outer_ordinal, duplicate_outer_ordinal FROM premix_exact_duplicate_normalizations ORDER BY locator, case_ordinal, conversation_id_sha256, duplicate_outer_ordinal"):
+            normalization_digest.update(_bytes({"locator": row[0], "case_ordinal": row[1], "conversation_id_sha256": row[2], "content_sha256": row[3], "retained_outer_ordinal": row[4], "duplicate_outer_ordinal": row[5]}))
+            normalization_digest.update(b"\n")
+            normalization_count += 1
+        normalization_cases = connection.execute("SELECT count(DISTINCT case_sha) FROM premix_exact_duplicate_normalizations").fetchone()[0]
+        staging_receipt["premix_exact_duplicate_normalization"] = {
+            **PREMIX_EXACT_DUPLICATE_NORMALIZATION,
+            "duplicate_case_count": normalization_cases,
+            "duplicate_extra_row_count": normalization_count,
+            "normalization_stream_sha256": normalization_digest.hexdigest(),
+        }
         connection.commit(); connection.close(); connection = None
         _raw, database_identity, database_sha256 = _snapshot(database, "streaming_index_database_invalid", retain=False)
         owned_files[database] = database_identity
