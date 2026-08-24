@@ -466,6 +466,55 @@ def test_original_index_receipt_fails_closed_on_id_embedding_or_config_drift_and
         runner.validate_repeat_identity(runner.ARM_ORIGINAL, repeats)
 
 
+def test_sqlite_hnsw_configuration_drift_reports_canonical_resolved_and_expected_values(
+    monkeypatch, tmp_path
+):
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    (palace_path / "chroma.sqlite3").touch()
+    expected = runner._sqlite_hnsw_configuration_expected()
+    resolved = {**expected, "ef_search": 77}
+    schema = {
+        "keys": {
+            "#embedding": {
+                "float_list": {
+                    "vector_index": {
+                        "config": {
+                            "space": resolved["space"],
+                            "hnsw": {
+                                key: value for key, value in resolved.items() if key != "space"
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    class Cursor:
+        def fetchone(self):
+            return (json.dumps(schema),)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args):
+            return Cursor()
+
+    monkeypatch.setattr(runner, "_readonly_sqlite_connection", lambda _path: Connection())
+    with pytest.raises(RuntimeError) as excinfo:
+        runner._sqlite_hnsw_configuration(palace_path)
+    assert str(excinfo.value) == (
+        "original Chroma resolved HNSW configuration drifted: "
+        f"resolved={runner._canonical(resolved).decode('utf-8')}; "
+        f"expected={runner._canonical(expected).decode('utf-8')}"
+    )
+
+
 def test_original_identity_namespace_requires_exact_fixed_dialog_count():
     with pytest.raises(RuntimeError, match="exactly 5882"):
         runner.original_identity_namespace({"conversation": {"sessions": [{"dialogs": [{"opaque_dialog_id": "dialog_000000", "speaker": "s", "date": "d", "caption": "c", "text": "x"}]}]}})

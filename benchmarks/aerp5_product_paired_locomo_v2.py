@@ -603,7 +603,11 @@ def _sqlite_hnsw_configuration(palace_path: Path) -> dict[str, Any]:
     }
     expected = _sqlite_hnsw_configuration_expected()
     if resolved != expected:
-        raise RuntimeError("original Chroma resolved HNSW configuration drifted")
+        raise RuntimeError(
+            "original Chroma resolved HNSW configuration drifted: "
+            f"resolved={_canonical(resolved).decode('utf-8')}; "
+            f"expected={_canonical(expected).decode('utf-8')}"
+        )
     return resolved
 
 
