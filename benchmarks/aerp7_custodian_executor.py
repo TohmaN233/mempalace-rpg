@@ -6,8 +6,8 @@ accept the four private capabilities needed to open the sealed confirmation
 bundle and score it.  The capabilities arrive once on stdin; they are neither
 accepted in argv/environment/configuration nor written to a receipt.
 
-``FORMAL_CUSTODIAN_ENABLED`` is intentionally false.  This module is an E2E
-rehearsal seam, not permission to inspect official ConvoMem data.
+Formal and rehearsal public/private capabilities have distinct schemas.  This
+module never discovers data paths: it receives explicitly authorized bundles.
 """
 from __future__ import annotations
 
@@ -35,12 +35,13 @@ from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha25
 
 SCHEMA = "aerp7-convomem-custodian-executor-v1"
 PUBLIC_CONFIG_SCHEMA = "aerp7-convomem-custodian-public-config-v1"
+FORMAL_PUBLIC_CONFIG_SCHEMA = "aerp7-convomem-formal-custodian-public-config-v1"
 PRIVATE_SCHEMA = "aerp7-convomem-custodian-private-capability-v1"
+FORMAL_PRIVATE_SCHEMA = "aerp7-convomem-formal-custodian-private-capability-v1"
 PACKET_SCHEMA = "aerp7-convomem-custodian-packet-v1"
+FORMAL_PACKET_SCHEMA = "aerp7-convomem-formal-custodian-packet-v1"
 GATE_SCHEMA = "aerp7-convomem-scientific-gate-decision-v1"
 OUTER_ATTESTATION_SCHEMA = "aerp7-convomem-custodian-post-score-attestation-v1"
-FORMAL_CUSTODIAN_ENABLED = False
-SYNTHETIC_CUSTODIAN_ONLY = True
 
 PUBLIC_CONFIG_KEYS = frozenset({
     "schema", "synthetic_test_mode", "public_freeze_packet", "candidate_bundle",
@@ -149,8 +150,9 @@ def sign_private_payload(value: Mapping[str, Any], *, custody_capability_secret:
     return row
 
 
-def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: Path) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != PRIVATE_KEYS or value.get("schema") != PRIVATE_SCHEMA:
+def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: Path, formal_live: bool) -> dict[str, Any]:
+    expected_schema = FORMAL_PRIVATE_SCHEMA if formal_live else PRIVATE_SCHEMA
+    if not isinstance(value, Mapping) or set(value) != PRIVATE_KEYS or value.get("schema") != expected_schema:
         raise CustodyError("custodian_private_capability_invalid")
     row = dict(value)
     result: dict[str, Any] = {name: _secret(row[name], "custodian_private_capability_invalid") for name in (
@@ -171,11 +173,13 @@ def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: P
 
 
 def _public_config(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != PUBLIC_CONFIG_KEYS or value.get("schema") != PUBLIC_CONFIG_SCHEMA:
+    if not isinstance(value, Mapping) or set(value) != PUBLIC_CONFIG_KEYS:
         raise CustodyError("custodian_public_config_invalid")
     row = dict(value)
-    if row.get("synthetic_test_mode") is not True or not SYNTHETIC_CUSTODIAN_ONLY or FORMAL_CUSTODIAN_ENABLED:
-        raise CustodyError("custodian_formal_execution_blocked")
+    synthetic = row.get("synthetic_test_mode")
+    expected_schema = PUBLIC_CONFIG_SCHEMA if synthetic is True else FORMAL_PUBLIC_CONFIG_SCHEMA
+    if row.get("schema") != expected_schema or synthetic not in {True, False}:
+        raise CustodyError("custodian_public_config_invalid")
     for key in ("public_freeze_packet", "candidate_bundle", "custody_bundle", "output_path"):
         if not isinstance(row.get(key), str) or not row[key]:
             raise CustodyError("custodian_public_config_invalid")
@@ -251,7 +255,9 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
         "projection_sha256", "current_worker_receipt", "ranking_artifacts", "endpoint_manifest",
         "resource_receipts", "supervisors", "packet_sha256",
     }
-    if set(packet) != required or packet.get("schema") != executor.FREEZE_PACKET_SCHEMA or packet.get("synthetic_test_mode") is not True or packet.get("formal_eligible") is not False:
+    synthetic = cfg["synthetic_test_mode"]
+    expected_schema = executor.FREEZE_PACKET_SCHEMA if synthetic else executor.FORMAL_FREEZE_PACKET_SCHEMA
+    if set(packet) != required or packet.get("schema") != expected_schema or packet.get("synthetic_test_mode") is not synthetic or packet.get("formal_eligible") is not (not synthetic):
         raise CustodyError("custodian_freeze_packet_invalid")
     if packet.get("packet_sha256") != _digest({key: item for key, item in packet.items() if key != "packet_sha256"}):
         raise CustodyError("custodian_freeze_packet_digest_invalid")
@@ -297,7 +303,7 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
     formal.validate_current_execution_receipts(
         current["execution_receipts"], current_worker_receipt=current, protocol=protocol, projection=projection,
         resources=resources, ranking_artifacts=[item for item in artifacts if item["arm_id"] != "original_public_product"],
-        supervisors=supervisors, allow_synthetic=True,
+        supervisors=supervisors, allow_synthetic=synthetic,
     )
     return {"config": cfg, "packet": packet, "protocol": protocol, "projection": projection, "current_worker_receipt": current, "ranking_artifacts": artifacts, "endpoint_manifest": endpoint, "resource_receipts": resources, "supervisors": supervisors}
 
@@ -315,12 +321,12 @@ def _resource_map(resources: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _release(*, public: Mapping[str, Any], custody_ready_sha256: str, custody_bundle_sha256: str, capability: bytes) -> dict[str, Any]:
+def _release(*, public: Mapping[str, Any], custody_ready_sha256: str, custody_bundle_sha256: str, capability: bytes, formal_live: bool) -> dict[str, Any]:
     protocol, endpoint = public["protocol"], public["endpoint_manifest"]
     resources, artifacts = public["resource_receipts"], public["ranking_artifacts"]
     originals = next(item for item in artifacts if item["arm_id"] == "original_public_product")["replicates"]
     unsigned = {
-        "schema": formal.REHEARSAL_RELEASE_SCHEMA,
+        "schema": formal.RELEASE_SCHEMA if formal_live else formal.REHEARSAL_RELEASE_SCHEMA,
         "protocol_sha256": protocol["protocol_sha256"],
         "endpoint_manifest_sha256": endpoint["manifest_sha256"],
         "candidate_ready_sha256": protocol["candidate"]["ready_sha256"],
@@ -333,7 +339,8 @@ def _release(*, public: Mapping[str, Any], custody_ready_sha256: str, custody_bu
         "original_build_index_sha256": {item["build_id"]: item["index_sha256"] for item in originals},
         "current_worker_sha256": public["current_worker_receipt"]["worker_sha256"],
     }
-    return formal.sign_rehearsal_release_authorization(unsigned, custody_capability_secret=capability)
+    signer = formal.sign_release_authorization if formal_live else formal.sign_rehearsal_release_authorization
+    return signer(unsigned, custody_capability_secret=capability)
 
 
 def scientific_gate_decision(report: Mapping[str, Any], protocol: Mapping[str, Any]) -> dict[str, Any]:
@@ -411,14 +418,15 @@ def _authorization_paths(output: Path, authorization_id: str) -> tuple[Path, Pat
     )
 
 
-def _validated_existing_result(*, output: Path, authorization_id: str, packet_sha256: str, file_sha256: str) -> dict[str, Any] | None:
+def _validated_existing_result(*, output: Path, authorization_id: str, packet_sha256: str, file_sha256: str, formal_live: bool) -> dict[str, Any] | None:
     """Authenticate an existing successful publication without opening custody."""
     if not output.exists():
         return None
     if not output.is_file() or output.is_symlink():
         raise CustodyError("custodian_existing_output_invalid")
     outer = _load_public(output, code="custodian_existing_output_invalid")
-    if outer.get("schema") != PACKET_SCHEMA or outer.get("packet_sha256") != _digest({key: item for key, item in outer.items() if key != "packet_sha256"}) or outer.get("custodian_authorization_id") != authorization_id or outer.get("public_freeze_packet_sha256") != packet_sha256 or outer.get("public_freeze_file_sha256") != file_sha256:
+    expected_schema = FORMAL_PACKET_SCHEMA if formal_live else PACKET_SCHEMA
+    if outer.get("schema") != expected_schema or outer.get("synthetic_test_mode") is formal_live or outer.get("formal_eligible") is not formal_live or outer.get("packet_sha256") != _digest({key: item for key, item in outer.items() if key != "packet_sha256"}) or outer.get("custodian_authorization_id") != authorization_id or outer.get("public_freeze_packet_sha256") != packet_sha256 or outer.get("public_freeze_file_sha256") != file_sha256:
         raise CustodyError("custodian_existing_output_conflict")
     return {"published": False, "retry_idempotent": True, "sha256": _file_sha256(output), "packet_sha256": outer["packet_sha256"], "gate_outcome": outer["gate_decision"]["outcome"]}
 
@@ -480,6 +488,7 @@ def _validated_consumed_marker(*, consumed: Path, authorization_id: str) -> dict
 def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]) -> dict[str, Any]:
     """The one permitted custody-open path, called only while the lock is held."""
     cfg, packet = public["config"], public["packet"]
+    formal_live = cfg["synthetic_test_mode"] is False
     if os.getpid() in {row["pid"] for row in public["supervisors"].values()}:
         raise CustodyError("custodian_pid_not_isolated")
     # The release's custody digests are public commitments made before opening
@@ -489,8 +498,10 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     release = _release(
         public=public, custody_ready_sha256=cfg["custody_ready_sha256"],
         custody_bundle_sha256=cfg["custody_bundle_sha256"], capability=private["custody_capability_secret"],
+        formal_live=formal_live,
     )
-    formal.validate_rehearsal_release_authorization(
+    release_validator = formal.validate_release_authorization if formal_live else formal.validate_rehearsal_release_authorization
+    release_validator(
         release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
         endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
@@ -507,7 +518,8 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     if release["custody_ready_sha256"] != custody_ready or release["custody_bundle_sha256"] != custody_bundle:
         raise CustodyError("custodian_release_actual_custody_binding_invalid")
     scorer_before = live_custodian_code_receipt()
-    opened = formal.open_custody_after_rehearsal_release(
+    custody_opener = formal.open_custody_after_release if formal_live else formal.open_custody_after_rehearsal_release
+    opened = custody_opener(
         release_authorization=release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
         endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
@@ -543,7 +555,8 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     scorer_after = live_custodian_code_receipt()
     if scorer_before != scorer_after:
         raise CustodyError("custodian_live_code_drift")
-    envelope = formal.rehearsal_audit_envelope(
+    envelope_builder = formal.audit_envelope if formal_live else formal.rehearsal_audit_envelope
+    envelope = envelope_builder(
         report=report, post_score_attestation=post, scorer_attestation_secret=private["scorer_attestation_secret"],
         release_authorization=release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
@@ -552,7 +565,8 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
         custody_capability_secret=private["custody_capability_secret"],
     )
     outer = {
-        "schema": PACKET_SCHEMA, "synthetic_test_mode": True, "formal_eligible": False,
+        "schema": FORMAL_PACKET_SCHEMA if formal_live else PACKET_SCHEMA,
+        "synthetic_test_mode": not formal_live, "formal_eligible": formal_live,
         "public_freeze_packet_sha256": packet["packet_sha256"], "public_freeze_file_sha256": cfg["freeze_packet_file_sha256"],
         "envelope": envelope, "gate_decision": decision, "scorer_code_before": scorer_before,
         "scorer_code_after": scorer_after, "custodian_authorization_id": private["authorization_id"],
@@ -569,17 +583,19 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
 
 
 def execute_custodian(config: Mapping[str, Any], private_payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Run one exact-once synthetic custodian authorization; formal data stays blocked."""
+    """Run one exact-once rehearsal or live custodian authorization."""
     public = validate_public_freeze(config)
     cfg, packet = public["config"], public["packet"]
     output = Path(cfg["output_path"])
+    formal_live = cfg["synthetic_test_mode"] is False
     private = _private(
         private_payload, packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"], output_path=output,
+        formal_live=formal_live,
     )
     _lock_path, consumed_path = _authorization_paths(output, private["authorization_id"])
     consumed_marker = _validated_consumed_marker(consumed=consumed_path, authorization_id=private["authorization_id"])
     existing = _validated_existing_result(
-        output=output, authorization_id=private["authorization_id"], packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"],
+        output=output, authorization_id=private["authorization_id"], packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"], formal_live=formal_live,
     )
     if consumed_marker is not None:
         if existing is None:
@@ -601,7 +617,7 @@ def execute_custodian(config: Mapping[str, Any], private_payload: Mapping[str, A
         # A concurrent first execution may have published between the initial
         # output check and lock acquisition.  Authenticate it, never rescore.
         existing = _validated_existing_result(
-            output=output, authorization_id=private["authorization_id"], packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"],
+            output=output, authorization_id=private["authorization_id"], packet_sha256=packet["packet_sha256"], file_sha256=cfg["freeze_packet_file_sha256"], formal_live=formal_live,
         )
         if consumed_marker is not None:
             if existing is None:
@@ -677,7 +693,9 @@ def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, 
         "public_freeze_file_sha256", "envelope", "gate_decision", "scorer_code_before",
         "scorer_code_after", "custodian_authorization_id", "custodian_post_score_attestation", "packet_sha256",
     }
-    if set(packet) != required or packet.get("schema") != PACKET_SCHEMA or packet.get("synthetic_test_mode") is not True or packet.get("formal_eligible") is not False or packet.get("packet_sha256") != _digest({key: item for key, item in packet.items() if key != "packet_sha256"}):
+    formal_live = public_config["synthetic_test_mode"] is False
+    expected_schema = FORMAL_PACKET_SCHEMA if formal_live else PACKET_SCHEMA
+    if set(packet) != required or packet.get("schema") != expected_schema or packet.get("synthetic_test_mode") is formal_live or packet.get("formal_eligible") is not formal_live or packet.get("packet_sha256") != _digest({key: item for key, item in packet.items() if key != "packet_sha256"}):
         raise CustodyError("custodian_subprocess_output_invalid")
     if packet["public_freeze_file_sha256"] != public_config["freeze_packet_file_sha256"]:
         raise CustodyError("custodian_subprocess_output_public_binding_invalid")

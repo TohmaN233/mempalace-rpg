@@ -144,6 +144,7 @@ def test_rehearsal_authorization_cannot_validate_as_a_formal_release(tmp_path, m
     rehearsal = custodian._release(
         public=public, custody_ready_sha256=config["custody_ready_sha256"],
         custody_bundle_sha256=config["custody_bundle_sha256"], capability=private["custody_capability_secret"].encode(),
+        formal_live=False,
     )
     assert rehearsal["schema"] == custodian.formal.REHEARSAL_RELEASE_SCHEMA
     assert custodian.formal.validate_rehearsal_release_authorization(
@@ -358,7 +359,16 @@ def test_after_score_exception_cannot_publish_a_partial_packet(tmp_path, monkeyp
     assert not list(output.parent.glob(".custodian-packet.json.tmp-*"))
 
 
-def test_formal_mode_is_not_an_argv_escape_hatch():
-    assert custodian.FORMAL_CUSTODIAN_ENABLED is False
-    with pytest.raises(SystemExit):
-        custodian.main(["--formal"])
+def test_custodian_formal_and_rehearsal_schemas_are_not_interchangeable():
+    rehearsal = {
+        "schema": custodian.PUBLIC_CONFIG_SCHEMA, "synthetic_test_mode": True,
+        "public_freeze_packet": "freeze.json", "candidate_bundle": "candidate", "custody_bundle": "custody",
+        "output_path": "out.json", "freeze_packet_file_sha256": "a" * 64,
+        "candidate_ready_sha256": "b" * 64, "custody_ready_sha256": "c" * 64,
+        "custody_bundle_sha256": "d" * 64,
+    }
+    assert custodian._public_config(rehearsal)["synthetic_test_mode"] is True
+    formal = dict(rehearsal, schema=custodian.FORMAL_PUBLIC_CONFIG_SCHEMA, synthetic_test_mode=False)
+    assert custodian._public_config(formal)["synthetic_test_mode"] is False
+    with pytest.raises(CustodyError, match="public_config_invalid"):
+        custodian._public_config(dict(formal, schema=custodian.PUBLIC_CONFIG_SCHEMA))

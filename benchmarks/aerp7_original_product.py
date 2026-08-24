@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from benchmarks import aerp5_product_paired_locomo as v1
 from benchmarks import aerp5_product_paired_locomo_v2 as v2
 from benchmarks import aerp7_convomem_rank as rank
+from benchmarks import aerp7_original_core as original_core
 
 
 WING = "aerp7-convomem"
@@ -30,6 +31,7 @@ LIVE_PINNED = "live_pinned"
 PUBLIC_UPSERT_MEASUREMENT = "public_upsert_document_request_ledger_native_internal_calls_unobservable"
 PUBLIC_SEARCH_MEASUREMENT = "public_search_request_ledger_native_internal_calls_unobservable"
 DRAFT_SCHEMA = "aerp7-original-product-worker-draft-v1"
+GENERIC_DRAFT_SCHEMA = "aerp-original-product-generic-worker-draft-v1"
 CLOCK_RECEIPT_SCHEMA = "aerp7-original-product-clock-receipt-v1"
 _LIVE_CAPABILITIES: set[int] = set()
 
@@ -48,6 +50,21 @@ class ResourceObserver(Protocol):
 
 class IndexAuditor(Protocol):
     def __call__(self, *, palace_path: Path, expected_namespace: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+class LiveOriginalObserver:
+    """Dataset-neutral worker-side resource observer for the public product."""
+    def __init__(self, *, palace_path: Path, provider: Mapping[str, Any], denominators: Mapping[str, int], corpus_count: int) -> None:
+        self._palace_path = palace_path; self._provider = dict(provider); self._denominators = dict(denominators); self._corpus_count = int(corpus_count); self._phases: list[str] = []
+    def checkpoint(self, phase: str) -> None:
+        expected = ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]
+        if len(self._phases) >= len(expected) or phase != expected[len(self._phases)]: raise RuntimeError("original product observer lifecycle invalid")
+        self._phases.append(phase)
+    def receipt(self) -> dict[str, Any]:
+        if self._phases != ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]: raise RuntimeError("original product observer lifecycle incomplete")
+        storage = sum(path.stat().st_size for path in self._palace_path.rglob("*") if path.is_file() and not path.is_symlink())
+        if storage <= 0: raise RuntimeError("original product resource observation incomplete")
+        return {"peak_rss_bytes": 0, "storage_bytes": int(storage), "passage_embedding": {"calls": self._corpus_count, "texts": int(self._denominators["candidate_text_count"]), "measurement": PUBLIC_UPSERT_MEASUREMENT}, "query_embedding": {"calls": int(self._denominators["query_count"]), "texts": int(self._denominators["query_count"]), "measurement": PUBLIC_SEARCH_MEASUREMENT}, "provider": self._provider}
 
 
 @dataclass(frozen=True)
@@ -197,18 +214,36 @@ def _physical_id(corpus_id: str, message_id: str) -> str:
     return f"{corpus_id}{PHYSICAL_SEPARATOR}{message_id}"
 
 
+def convomem_lifecycle_adapter() -> original_core.LifecycleAdapter:
+    """Compatibility adapter for the unchanged AERP-7 rank receipt contract."""
+    def format_row(*, item: Mapping[str, Any], ranked_candidate_ids: list[str], trace: Mapping[str, Any], product_row: Mapping[str, Any]) -> Mapping[str, Any]:
+        return dict(product_row)
+    def completed(projection: Mapping[str, Any], replicate: Mapping[str, Any]) -> None:
+        rank._original_replicate(projection, replicate)
+    return original_core.LifecycleAdapter(
+        validate_projection=rank.validate_candidate_projection,
+        identity_namespace=original_identity_namespace,
+        input_receipt=lambda projection: rank._input_receipt(projection, rank.ORIGINAL_MEMPALACE_SERIALIZER),
+        format_row=format_row,
+        validate_completed_replicate=completed,
+        runtime_projection=lambda projection: projection,
+        adapter_id="aerp7-convomem-original-lifecycle-v1",
+    )
+
+
 def original_identity_namespace(projection: Any) -> dict[str, Any]:
     """Create the dynamic, globally unique physical namespace for one collection."""
     frozen = rank.validate_candidate_projection(projection)
-    rows: list[dict[str, str]] = []
-    for corpus in sorted(frozen["corpora"], key=lambda row: row["corpus_id"]):
-        corpus_id = _token(corpus["corpus_id"], "corpus_id")
-        for candidate in corpus["candidates"]:
-            message_id = _token(candidate["message_id"], "message_id")
-            rows.append({"corpus_id": corpus_id, "message_id": message_id, "physical_id": _physical_id(corpus_id, message_id)})
-    rows.sort(key=lambda row: row["physical_id"])
-    if not rows or len({row["physical_id"] for row in rows}) != len(rows):
-        raise OriginalProductError("AERP7 physical IDs must be non-empty and globally unique")
+    # Compatibility wrapper: the generic core owns label-free namespace math;
+    # this retains the historical AERP-7 receipt field names byte-for-byte.
+    normalized = {"schema": original_core.NORMALIZED_PROJECTION_SCHEMA,
+        "corpora": [{"corpus_id": corpus["corpus_id"], "candidates": [{"candidate_id": candidate["message_id"], "order": candidate["corpus_order"], "text": candidate["text"]} for candidate in corpus["candidates"]]} for corpus in frozen["corpora"]],
+        "items": [{"item_id": item["item_id"], "corpus_id": item["corpus_id"], "query_text": item["query_text"]} for item in frozen["items"]]}
+    try:
+        generic = original_core.identity_namespace(normalized, separator=PHYSICAL_SEPARATOR, schema="aerp7-original-identity-namespace-generic-v1", require_global_candidate_ids=False)
+    except original_core.OriginalCoreError as exc:
+        raise OriginalProductError("AERP7 generic original namespace rejected projection") from exc
+    rows = [{"corpus_id": row["corpus_id"], "message_id": row["candidate_id"], "physical_id": row["physical_id"]} for row in generic["rows"]]
     return {
         "schema": "aerp7-original-identity-namespace-v1",
         "scheme": "corpus_id::aerp7::message_id",
@@ -305,6 +340,30 @@ def worker_draft_packet(draft: OriginalProductWorkerDraft) -> dict[str, Any]:
 def serialize_worker_draft(draft: OriginalProductWorkerDraft) -> bytes:
     """Canonical wire format for worker-to-coordinator transfer."""
     return _canonical_bytes(worker_draft_packet(draft))
+
+
+def serialize_generic_worker_draft(*, draft: OriginalProductWorkerDraft, adapter_id: str) -> bytes:
+    """Versioned cross-process envelope for a non-ConvoMem lifecycle adapter."""
+    if not isinstance(draft, OriginalProductWorkerDraft) or not isinstance(adapter_id, str) or not adapter_id:
+        raise OriginalProductError("generic worker draft input is invalid")
+    value = {"schema": GENERIC_DRAFT_SCHEMA, "adapter_id": adapter_id, "projection": draft.projection,
+        "namespace": draft.namespace, "replicate_without_coordinator_audit": draft.replicate_without_coordinator_audit,
+        "worker_physical_receipt": draft.worker_physical_receipt, "telemetry": draft.telemetry}
+    value["draft_sha256"] = _digest(value)
+    return _canonical_bytes(value)
+
+
+def load_generic_worker_draft(*, payload: bytes, adapter_id: str) -> OriginalProductWorkerDraft:
+    if not isinstance(payload, bytes) or not isinstance(adapter_id, str) or not adapter_id:
+        raise OriginalProductError("generic worker draft input is invalid")
+    try: value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc: raise OriginalProductError("generic worker draft payload is invalid") from exc
+    required = {"schema", "adapter_id", "projection", "namespace", "replicate_without_coordinator_audit", "worker_physical_receipt", "telemetry", "draft_sha256"}
+    if not isinstance(value, Mapping) or set(value) != required or value.get("schema") != GENERIC_DRAFT_SCHEMA or value.get("adapter_id") != adapter_id or _canonical_bytes(value) != payload:
+        raise OriginalProductError("generic worker draft schema is invalid")
+    unsigned = {key: child for key, child in value.items() if key != "draft_sha256"}
+    if value["draft_sha256"] != _digest(unsigned): raise OriginalProductError("generic worker draft digest is invalid")
+    return OriginalProductWorkerDraft(projection=dict(value["projection"]), namespace=dict(value["namespace"]), replicate_without_coordinator_audit=dict(value["replicate_without_coordinator_audit"]), worker_physical_receipt=dict(value["worker_physical_receipt"]), telemetry=dict(value["telemetry"]))
 
 
 def load_worker_draft(payload: bytes) -> OriginalProductWorkerDraft:
@@ -586,7 +645,7 @@ def _validate_resource_telemetry(*, value: Mapping[str, Any], seams: OriginalPro
     return row
 
 
-def run_original_public_replicate(*, projection: Any, build_id: str, collection_identity: str, palace_path: Path, observer: ResourceObserver | None, seams: OriginalProductSeams, live_receipt: Mapping[str, Any] | None = None, formal: bool = False, resource_sink: Callable[[Mapping[str, Any]], None] | None = None, wall_clock_ns: Callable[[], int] | None = None, cpu_clock_ns: Callable[[], int] | None = None) -> OriginalProductWorkerDraft:
+def run_original_public_replicate(*, projection: Any, build_id: str, collection_identity: str, palace_path: Path, observer: ResourceObserver | None, seams: OriginalProductSeams, live_receipt: Mapping[str, Any] | None = None, formal: bool = False, resource_sink: Callable[[Mapping[str, Any]], None] | None = None, wall_clock_ns: Callable[[], int] | None = None, cpu_clock_ns: Callable[[], int] | None = None, lifecycle_adapter: original_core.LifecycleAdapter | None = None) -> OriginalProductWorkerDraft:
     """Run the worker phase; a coordinator audit is mandatory before publication.
 
     Return a deliberately non-publishable draft.  The only function that creates
@@ -604,8 +663,12 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
             raise OriginalProductError("formal original worker requires a resource sink")
     elif seams.provenance != SYNTHETIC_INJECTED or seams._live_capability is not None:
         raise OriginalProductError("non-formal execution requires an explicitly synthetic injected seam")
-    frozen = rank.validate_candidate_projection(projection)
-    namespace = original_identity_namespace(frozen)
+    lifecycle = convomem_lifecycle_adapter() if lifecycle_adapter is None else lifecycle_adapter
+    frozen = dict(lifecycle.validate_projection(projection))
+    runtime = dict(lifecycle.runtime_projection(frozen))
+    if not isinstance(runtime.get("corpora"), list) or not isinstance(runtime.get("items"), list):
+        raise OriginalProductError("lifecycle adapter runtime projection is malformed")
+    namespace = dict(lifecycle.identity_namespace(frozen))
     by_corpus = _namespace_by_corpus(namespace)
     if len({build_id, collection_identity}) != 2 or not all(isinstance(value, str) and value.strip() for value in (build_id, collection_identity)):
         raise OriginalProductError("build/collection identity must be distinct non-empty strings")
@@ -616,7 +679,7 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
     ledger: list[dict[str, Any]] = []
     observer.checkpoint("before_ingest")
     started = time.perf_counter()
-    for corpus in sorted(frozen["corpora"], key=lambda row: row["corpus_id"]):
+    for corpus in sorted(runtime["corpora"], key=lambda row: row["corpus_id"]):
         ingest_corpus_once(palace=seams.palace, palace_path=palace_path, corpus=corpus, physical_by_message=by_corpus[corpus["corpus_id"]], ledger=ledger)
     ingest_seconds = time.perf_counter() - started
     observer.checkpoint("after_ingest")
@@ -627,10 +690,10 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
         raise OriginalProductError("original product did not prove cold close/reset")
     ledger.append({"event": "cold_reopen_barrier", "cleanup": cleanup})
     observer.checkpoint("after_cold_close")
-    corpora = {row["corpus_id"]: row for row in frozen["corpora"]}
+    corpora = {row["corpus_id"]: row for row in runtime["corpora"]}
     rows, traces, query_latencies, query_measurements = [], [], [], []
-    for item in sorted(frozen["items"], key=lambda row: row["item_id"]):
-        row, trace = _row_for_query(
+    for item in sorted(runtime["items"], key=lambda row: row["item_id"]):
+        product_row, trace = _row_for_query(
             item=item,
             corpus=corpora[item["corpus_id"]],
             physical_by_message=by_corpus[item["corpus_id"]],
@@ -643,7 +706,7 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
             query_measurements=query_measurements,
         )
         query_latencies.append(query_measurements[-1]["wall_ns"] / 1_000_000_000)
-        rows.append(row); traces.append(trace)
+        rows.append(dict(lifecycle.format_row(item=item, ranked_candidate_ids=list(product_row["ranked_message_ids"]), trace=trace, product_row=product_row))); traces.append(trace)
     observer.checkpoint("after_queries")
     worker_physical = dynamic_original_index_build_receipt(palace_path=palace_path, expected_namespace=namespace, auditor=seams.auditor)
     request_counts = _public_request_counts(ledger)
@@ -659,8 +722,8 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
         "native_internal_embedding_calls_observable": False,
         "native_internal_embedding_limitation": "exact_public_product_uses_cached_native_callable; internal_embedding_calls_unobservable",
     })
-    resources = _validate_resource_telemetry(value=resources, seams=seams, formal=formal, public_request_counts=request_counts, expected_query_count=len(frozen["items"]), expected_corpus_count=len(frozen["corpora"]), expected_candidate_count=sum(len(corpus["candidates"]) for corpus in frozen["corpora"]))
-    input_receipt = rank._input_receipt(frozen, rank.ORIGINAL_MEMPALACE_SERIALIZER)
+    resources = _validate_resource_telemetry(value=resources, seams=seams, formal=formal, public_request_counts=request_counts, expected_query_count=len(runtime["items"]), expected_corpus_count=len(runtime["corpora"]), expected_candidate_count=sum(len(corpus["candidates"]) for corpus in runtime["corpora"]))
+    input_receipt = dict(lifecycle.input_receipt(frozen))
     query_coverage = _digest([{"item_id": item["item_id"], "query_sha256": hashlib.sha256(item["query_text"].encode("utf-8")).hexdigest()} for item in sorted(frozen["items"], key=lambda row: row["item_id"])])
     output_coverage = _digest([{"item_id": trace["item_id"], "ranking_sha256": trace["ranking_sha256"]} for trace in traces])
     index_receipt = {
@@ -677,7 +740,7 @@ def run_original_public_replicate(*, projection: Any, build_id: str, collection_
     return OriginalProductWorkerDraft(projection=frozen, namespace=namespace, replicate_without_coordinator_audit=value, worker_physical_receipt=worker_physical, telemetry=telemetry)
 
 
-def coordinator_reaudit_replicate(*, draft: OriginalProductWorkerDraft, palace_path: Path, projection: Any, auditor: IndexAuditor | None = None) -> dict[str, Any]:
+def coordinator_reaudit_replicate(*, draft: OriginalProductWorkerDraft, palace_path: Path, projection: Any, auditor: IndexAuditor | None = None, lifecycle_adapter: original_core.LifecycleAdapter | None = None) -> dict[str, Any]:
     """Independently remeasure, then produce the sole publishable replica.
 
     A worker cannot fill its own coordinator receipt: passing a Mapping/replica
@@ -685,8 +748,9 @@ def coordinator_reaudit_replicate(*, draft: OriginalProductWorkerDraft, palace_p
     """
     if not isinstance(draft, OriginalProductWorkerDraft):
         raise OriginalProductError("coordinator requires an original-product worker draft")
-    frozen = rank.validate_candidate_projection(projection)
-    if frozen != draft.projection or original_identity_namespace(frozen) != draft.namespace:
+    lifecycle = convomem_lifecycle_adapter() if lifecycle_adapter is None else lifecycle_adapter
+    frozen = dict(lifecycle.validate_projection(projection))
+    if frozen != draft.projection or dict(lifecycle.identity_namespace(frozen)) != draft.namespace:
         raise OriginalProductError("coordinator projection/namespace drift")
     measured = dynamic_original_index_build_receipt(palace_path=palace_path, expected_namespace=draft.namespace, auditor=auditor)
     worker = draft.worker_physical_receipt
@@ -702,5 +766,5 @@ def coordinator_reaudit_replicate(*, draft: OriginalProductWorkerDraft, palace_p
     raw["index_sha256"] = _digest(completed_index)
     # This now has exactly the frozen original-replicate schema and is the
     # required handoff to the five-build rank wrapper.
-    rank._original_replicate(frozen, raw)
+    lifecycle.validate_completed_replicate(frozen, raw)
     return raw

@@ -124,9 +124,13 @@ def projection_query_keys(value: Any) -> list[dict[str, str]]:
 
 def _resource_thresholds(value: Any) -> dict[str, Any]:
     row = _obj(value, "formal_resource_thresholds_invalid")
-    required = {"peak_rss_bytes_max", "storage_bytes_max", "ingest_seconds_max", "index_seconds_max", "query_p95_ns_max"}
-    if set(row) != required:
+    required = {"resource_comparability", "peak_rss_bytes_max", "storage_bytes_max", "ingest_seconds_max", "index_seconds_max", "query_p95_ns_max"}
+    if set(row) != required or row.get("resource_comparability") not in {"strict", "unavailable"}:
         raise CustodyError("formal_resource_thresholds_invalid")
+    if row["resource_comparability"] == "unavailable":
+        if any(row[key] is not None for key in required - {"resource_comparability"}):
+            raise CustodyError("formal_resource_thresholds_invalid")
+        return row
     for key in ("peak_rss_bytes_max", "storage_bytes_max", "query_p95_ns_max"):
         _positive_int(row.get(key), "formal_resource_thresholds_invalid")
     for key in ("ingest_seconds_max", "index_seconds_max"):
@@ -272,7 +276,7 @@ def _latency_percentiles(values: Sequence[int]) -> dict[str, int]:
 def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[str, Any], expected_denominators: Mapping[str, int], expected_query_keys: Sequence[Mapping[str, str]] | None = None) -> dict[str, Any]:
     """Validate measurement coverage and enforce thresholds frozen in protocol."""
     limits = _resource_thresholds(thresholds); row = _obj(value, "formal_resource_receipt_invalid")
-    required = {"schema", "arm_id", "execution_role", "resource_semantics", "measurement_scope", "measurement_mode", "p5_repeat_accounting", "ingest_seconds", "index_seconds", "query_measurements", "query_latency_ns", "passage_embedding", "query_embedding", "storage_scope", "storage_bytes", "peak_rss_bytes", "artifact_sha256", "build_id", "index_sha256", "input_denominators", "hardware_runtime", "resource_sha256"}
+    required = {"schema", "arm_id", "execution_role", "resource_semantics", "measurement_scope", "measurement_mode", "resource_comparability", "p5_repeat_accounting", "ingest_seconds", "index_seconds", "query_measurements", "query_latency_ns", "passage_embedding", "query_embedding", "storage_scope", "storage_bytes", "peak_rss_bytes", "artifact_sha256", "build_id", "index_sha256", "input_denominators", "hardware_runtime", "resource_sha256"}
     if set(row) != required or row.get("schema") != RESOURCE_SCHEMA or row.get("arm_id") != arm_id or arm_id not in _RESOURCE_ARMS:
         raise CustodyError("formal_resource_receipt_invalid")
     expected_semantics = "all_six_views_computed_then_raw_fusion_weights" if arm_id == "strong_raw" else "native_public_product" if arm_id == "original_public_product" else "all_six_views_computed_then_fixed_fusion"
@@ -289,6 +293,8 @@ def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[st
         raise CustodyError("formal_resource_measurement_scope_invalid")
     if row.get("measurement_mode") not in {"synthetic_rehearsal", "live_native_adapter", "live_original_public_product"}:
         raise CustodyError("formal_resource_measurement_mode_invalid")
+    if row.get("resource_comparability") != limits["resource_comparability"]:
+        raise CustodyError("formal_resource_comparability_invalid")
     ingest, index = _finite_nonnegative(row.get("ingest_seconds"), "formal_resource_receipt_invalid"), _finite_nonnegative(row.get("index_seconds"), "formal_resource_receipt_invalid")
     measurements = row.get("query_measurements")
     if not isinstance(measurements, list) or not measurements:
@@ -353,7 +359,7 @@ def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[st
     _hex(row.get("artifact_sha256"), "formal_resource_receipt_invalid")
     if row.get("resource_sha256") != resource_digest(row):
         raise CustodyError("formal_resource_digest_mismatch")
-    if ingest > limits["ingest_seconds_max"] or index > limits["index_seconds_max"] or latency["wall"]["p95"] > limits["query_p95_ns_max"] or storage > limits["storage_bytes_max"] or rss > limits["peak_rss_bytes_max"]:
+    if limits["resource_comparability"] == "strict" and (ingest > limits["ingest_seconds_max"] or index > limits["index_seconds_max"] or latency["wall"]["p95"] > limits["query_p95_ns_max"] or storage > limits["storage_bytes_max"] or rss > limits["peak_rss_bytes_max"]):
         raise CustodyError("formal_resource_threshold_exceeded")
     return row
 

@@ -225,7 +225,7 @@ def test_worker_draft_canonical_wire_packet_reloads_for_independent_coordinator_
     worker_index_sha256 = draft.replicate_without_coordinator_audit["index_sha256"]
     resource = {"build_id": "wire-build", "index_sha256": worker_index_sha256, "resource_sha256": "worker-only"}
     packet = {
-        "schema": executor.ORIGINAL_PACKET_SCHEMA, "execution_mode": "exact_public_product_worker_draft",
+        "schema": executor.FORMAL_ORIGINAL_PACKET_SCHEMA, "execution_mode": "exact_public_product_worker_draft",
         "draft_file_sha256": hashlib.sha256(payload).hexdigest(), "palace_path": str((tmp_path / "palace").resolve()),
         "resource_receipt": resource, "process_id": 123, "packet_sha256": "",
     }

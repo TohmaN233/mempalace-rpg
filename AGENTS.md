@@ -86,8 +86,13 @@ until the evidence selects a mechanism:
 A retrieval-paper claim additionally requires a frozen implementation, one blind
 execution with no subsequent tuning, and at least two untouched confirmatory
 datasets. P1/P2, ACL leakage, trace completeness, exact-span replay, performance,
-and failure-injection gates remain unchanged. A systems-paper path is separate and
-would require a formal threat model, explicit invariants, and security evaluation.
+and failure-injection measurements remain unchanged, but production-grade OS
+isolation is not a prerequisite for the Track A efficacy result. The minimal
+formal benchmark threat model trusts frozen benchmark code while separating
+ranking and custody into independent subprocesses with explicit file
+capabilities. A systems-paper path is separate and would require a formal threat
+model, explicit invariants, Docker/cgroup or equivalent enforcement, and a
+security evaluation.
 Paper statistics must report question-macro and conversation-weighted estimands
 separately; the existing conversation bootstrap must not be presented as an
 interval for a differently weighted point estimate.
@@ -104,6 +109,62 @@ must execute `palace.get_collection(...).upsert(...)` followed by
 evidence-R@10 dataset because its public package omits answer-bearing evidence
 annotations.
 
+Current formal-path status is implementation evidence, not a paper result.
+AERP-7 supplies the trusted-host candidate/custody, worker, authorization, and
+durable publication common path. AERP-8 supplies an isolated manifest-bound
+MemBench source-builder, four current workers, five exact-original public-product
+workers with physical re-audit, and a custody-after-public/release scorer. Formal
+source bytes for both ConvoMem and MemBench remain unopened, unenumerated,
+unhashed, undownloaded, and unrun. MemBench `selected_profiles` is frozen as
+exactly `['0', '100']` (the official `0-10k` and `100k` labels), with all four
+fixed `data2test` role paths per profile. Those payloads are external to the
+pinned Git tree: an authorized acquisition receipt must bind archive/file byte
+digests before JSON parsing. The implementation never discovers, samples,
+shuffles, or drops profiles/files.
+Before any original worker starts, the external AERP-8 checkpoint is now schema
+`aerp8-membench-current-checkpoint-v2` and binds an
+`aerp8-membench-original-execution-policy-v1` digest. The policy is independently
+re-probed with the frozen original interpreter and scrubbed environment: exact
+original root/interpreter bytes, `sys.executable`, `sys.version`,
+`sys._base_executable` (or equivalent base identity) and its bytes, the actual
+`mempalace.__file__` (which must be the pinned root's `mempalace/__init__.py`),
+model tree, and Git capability must all match. Its digest is carried through
+each original worker config/runtime/receipt/READY, the original artifact, public
+packet, capability release, `_formal_public`, and custodian pre-custody checks.
+The current worker identity is likewise bound to the reviewed `.venv/Scripts/python.exe`
+and `.venv/pyvenv.cfg` paths and SHA-256 values. Because the source tree deliberately
+does not track the local `.venv`, the final clean checkpoint's external runtime/checkpoint
+receipt must preserve exact paths, byte hashes, and live revalidation evidence instead;
+the review closure carries both files only for isolated reproduction.
+The pinned original is commit
+`72ccd2f3653ab902e419d15bb542c88045342b04`, tree
+`5e4ad9cf1d6387cebe16dd03b6da8355d899f70c`, model tree
+`76217893f057779cee29c903aa24444154ad0da7645853f1041fd970cca275a0`.
+Synthetic live smoke artifacts are not data results: original
+`21917673215412ba42cbc2e1fabd4ea019bb8fcb6ed47b17418211c705e4e30d`;
+current raw `2389a5e51955fa448d1a6e4b65477772fa70fd882a1fe63c89be257d9f4d945b`,
+P5 `23f008fa4bf7f1a61b3c341d49fa07a2bfa8806e9b1290bb4202a173cda80a7d`,
+and Six-View `330fee44e051cbf126aca6534719372dbfc9a05876f6685fc6c386b5e792b7c3`.
+The AERP-8 v2 same-checkpoint attack regressions keep checkpoint/commit/tree/model/Git
+at A while ordinary visible receipts are resealed; they reject (1) an in-root
+ordinary text file as `original_python`, (2) another real interpreter, and (3)
+another pinned-tree file as `mempalace` import origin. Rejection occurs at public
+freeze or formal-public/release before a valid release can be minted; the custodian
+does not stat/read custody or invoke the scorer.
+Independent root verification on 2026-08-23 used fresh E-drive basetemps and
+`-p no:cacheprovider`: `python -m pytest tests/test_aerp8_membench.py -q --basetemp
+E:\MemPalaceWorkspace\repos\.pytest-root-aerp8-pro6-3c71 -p no:cacheprovider`
+returned `48 passed in 276.81s (0:04:36)`; `python -m pytest -q --basetemp
+E:\MemPalaceWorkspace\repos\.pytest-root-aerp8-pro6-full-73d2 -p no:cacheprovider`
+returned `716 passed, 4 skipped in 433.42s (0:07:13)`. `py_compile` and
+`git diff --check` also passed. These are implementation/pre-formal-checkpoint
+receipts, not benchmark results.
+Docker/cgroup work does not block Track A
+efficacy, but
+`resource_comparability=unavailable` cannot support an efficiency claim. The
+remaining order is Pro review, clean checkpoint, source-manifest/profile freeze
+and acquisition, one-shot per-dataset execution/gates, then Track B.
+
 ConvoMem's official primary metric is category-specific LLM-judged answer
 accuracy by conversation-count context; message-level exact-evidence Recall@10,
 NDCG@10, and MRR@10 are this project's blinded retrieval protocol and must not
@@ -115,14 +176,14 @@ text-only.  Exact evidence mapping is `(speaker, text)` within the custody-only
 evidence-conversation set; ambiguity or absence fails closed without fuzzy
 fallback.
 
-Formal AERP-7 resource comparisons must use the same descendant-inclusive Linux
-cgroup-v2 CPU accounting for current and original workers.  Host-side PID/RSS
-polling is rehearsal diagnostics only and cannot prove that a short-lived child
-did not run.  Report `memory.current` only as query-boundary charged-memory
-snapshots and `memory.peak` only as a container-lifetime charged-memory peak;
-neither may be relabeled as per-query peak RSS.  On Windows Docker Desktop,
-Docker `State.Pid` is daemon/VM evidence and must not be treated as a Windows
-host PID for formal resource attribution.
+Docker/cgroup evidence belongs to the optional systems-security or strict
+resource-accounting appendix and must not block the two-dataset Track A efficacy
+run. If such a descendant-inclusive resource claim is reported, current and
+original workers must use the same Linux cgroup-v2 CPU accounting; host PID/RSS
+polling cannot prove that a short-lived child did not run. `memory.current` is a
+query-boundary charged-memory snapshot and `memory.peak` is a container-lifetime
+charged-memory peak, never per-query peak RSS. Docker `State.Pid` on Windows
+Docker Desktop is daemon/VM evidence, not a Windows host PID.
 
 ## Verification
 

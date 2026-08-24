@@ -94,6 +94,26 @@ def test_authorization_requires_live_hmac_expiry_and_single_consume(tmp_path, mo
         executor._authorization(expired, protocol=protocol, output_dir=output, capability=secret)
 
 
+def test_formal_authorization_uses_a_distinct_live_schema(tmp_path):
+    receipt = {"head": "a" * 64, "tree": "b" * 64, "diff_digest": "c" * 64, "dirty_policy": "clean_required"}
+    protocol = {"protocol_sha256": "d" * 64, "current_code_receipt": receipt}
+    output = tmp_path / "out"; secret = b"x" * 32
+    unsigned = {
+        "schema": executor.FORMAL_AUTH_SCHEMA, "mode": "formal_live", "synthetic_test_mode": False,
+        "protocol_sha256": protocol["protocol_sha256"], "executor_code_receipt": receipt,
+        "output_dir": str(output.resolve()), "nonce": "f" * 32,
+        "expires_at_unix": int(time.time()) + 60, "output_absent": True,
+    }
+    digest = _digest(unsigned)
+    formal = {**unsigned, "authorization_sha256": digest, "operator_hmac": hmac.new(secret, executor._bytes({**unsigned, "authorization_sha256": digest}), hashlib.sha256).hexdigest()}
+    assert executor._authorization(formal, protocol=protocol, output_dir=output, capability=secret)["mode"] == "formal_live"
+    rehearsal = dict(formal, schema=executor.AUTH_SCHEMA, mode="synthetic_rehearsal", synthetic_test_mode=True)
+    rehearsal["authorization_sha256"] = _digest({key: value for key, value in rehearsal.items() if key not in {"authorization_sha256", "operator_hmac"}})
+    rehearsal["operator_hmac"] = hmac.new(secret, executor._bytes({key: value for key, value in rehearsal.items() if key != "operator_hmac"}), hashlib.sha256).hexdigest()
+    with pytest.raises(CustodyError, match="code_invalid"):
+        executor._authorization(rehearsal, protocol=protocol, output_dir=output, capability=secret)
+
+
 def test_concurrent_same_nonce_has_exactly_one_authorization_consumer(tmp_path):
     authorization = {"nonce": "r" * 32, "authorization_sha256": "a" * 64, "protocol_sha256": "b" * 64}
     output = tmp_path / "out"
@@ -130,7 +150,7 @@ def test_exact_original_worker_packet_requires_cross_process_draft_and_coordinat
         lambda **kwargs: calls.append(kwargs) or replicate,
     )
     packet = {
-        "schema": executor.ORIGINAL_PACKET_SCHEMA,
+        "schema": executor.FORMAL_ORIGINAL_PACKET_SCHEMA,
         "execution_mode": "exact_public_product_worker_draft",
         "draft_file_sha256": hashlib.sha256(draft_bytes).hexdigest(),
         "palace_path": str(palace_path.resolve()),
@@ -186,11 +206,44 @@ def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, m
         executor.public_coordinator(config)
 
 
-def test_live_current_helper_is_not_reachable_from_synthetic_execution(tmp_path):
-    fixture = runpy.run_path("tests/test_aerp7_convomem_formal.py")
-    projection = fixture["projection"](); protocol = fixture["protocol"](projection)
-    with pytest.raises(CustodyError, match="live_execution_blocked"):
-        executor.run_live_current_execution(role="raw", protocol=protocol, projection=projection, worker_config=fixture["worker_config"](projection, protocol), model_dir=tmp_path)
+def test_formal_current_worker_uses_live_runner_without_synthetic_fallback(tmp_path, monkeypatch):
+    protocol = {"protocol_sha256": "a" * 64}
+    worker_config = {"worker": "config"}; projection = {"projection": "live"}
+    model_dir = tmp_path / "model"; model_dir.mkdir()
+    output = tmp_path / "current.json"; calls = []
+    monkeypatch.setattr(executor.formal, "validate_formal_protocol", lambda value: protocol)
+    monkeypatch.setattr(executor, "_load", lambda path: protocol if path.name == "protocol.json" else worker_config)
+    monkeypatch.setattr(executor, "_candidate_projection", lambda *args: projection)
+    monkeypatch.setattr(
+        executor, "run_live_current_execution",
+        lambda **kwargs: calls.append(kwargs) or {
+            "artifact": {"artifact_sha256": "b" * 64},
+            "resource_receipt": {"resource_sha256": "c" * 64},
+            "execution_receipt": {"execution_sha256": "d" * 64},
+        },
+    )
+    config = {
+        "schema": executor.FORMAL_SCHEMA, "synthetic_test_mode": False,
+        "protocol_path": str(tmp_path / "protocol.json"), "candidate_bundle": str(tmp_path / "candidate"),
+        "worker_config": str(tmp_path / "worker.json"), "output_path": str(output),
+        "staging_parent": str(tmp_path), "execution_role": "raw", "model_dir": str(model_dir),
+    }
+    packet = executor.current_worker(config)
+    assert packet["schema"] == executor.FORMAL_CURRENT_PACKET_SCHEMA
+    assert calls == [{"role": "raw", "protocol": protocol, "projection": projection, "worker_config": worker_config, "model_dir": model_dir}]
+
+
+def test_formal_public_config_omits_and_rejects_worker_isolation_attestation():
+    assert "worker_isolation_attestation" not in executor.FORMAL_PUBLIC_CONFIG_KEYS
+    config = {
+        "schema": executor.FORMAL_SCHEMA, "synthetic_test_mode": False,
+        "protocol_path": "protocol.json", "candidate_bundle": "candidate", "output_dir": "output",
+        "authorization_path": "authorization.json", "python_executable": sys.executable,
+        "original_root": "original", "model_dir": "model",
+        "worker_isolation_attestation": "forbidden",
+    }
+    with pytest.raises(CustodyError, match="coordinator_config_invalid"):
+        executor.public_coordinator(config)
 
 
 def test_original_resource_requires_external_supervisor_rebind_before_publish():
@@ -324,7 +377,7 @@ def test_supervisor_observer_records_transient_descendants_and_non_exhaustive_no
     assert no_child["supervisor_observation_samples"] >= 2
 
 
-def test_original_resource_rejects_polling_as_formal_zero_descendant_proof():
+def test_original_resource_requires_unavailable_comparability_for_polling_observation():
     resource = executor._resource(
         arm_id="original_public_product",
         artifact_sha256="4" * 64,
@@ -342,7 +395,7 @@ def test_original_resource_rejects_polling_as_formal_zero_descendant_proof():
         measurement_mode="live_original_public_product",
         storage_bytes=13,
     )
-    with pytest.raises(CustodyError, match="descendant_observation_insufficient"):
+    with pytest.raises(CustodyError, match="strict_comparability_unavailable"):
         executor.finalize_original_resource(
             resource=resource,
             supervisor={
@@ -357,6 +410,18 @@ def test_original_resource_rejects_polling_as_formal_zero_descendant_proof():
             },
             worker_pid=321,
         )
+    unavailable = dict(resource)
+    unavailable["resource_comparability"] = "unavailable"
+    unavailable["resource_sha256"] = executor.formal.resource_digest(unavailable)
+    assert executor.finalize_original_resource(
+        resource=unavailable,
+        supervisor={
+            "pid": 321, "exit_code": 0, "observed_process_tree_peak_rss_bytes": 97,
+            "descendant_process_count": 0, "descendant_processes_observed": False,
+            "descendant_observation_method": "psutil_polling_non_exhaustive",
+            "supervisor_observation_samples": 3, "supervisor_observation_complete": True,
+        }, worker_pid=321,
+    )["peak_rss_bytes"] == 97
 
 
 def test_worker_failure_discards_staging_and_consumes_authorization(tmp_path, monkeypatch):

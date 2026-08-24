@@ -3,9 +3,8 @@
 The module has two deliberately separate concerns.  Its public coordinator and
 ranking workers only receive the candidate bundle and label-free protocol.  Its
 custodian entrypoint is a separate process and is the sole place where custody
-capabilities could be accepted.  The formal switch is intentionally disabled:
-the executable paths are exercised with synthetic fixtures only until a fresh
-review authorizes the one-shot data run.
+capabilities could be accepted.  Formal and rehearsal invocations use separate
+schemas, so a synthetic capability can never select a live worker or freeze.
 
 This is not a replacement for the upstream MemPalace product runner.  The
 formal original-worker seam is where that exact public-product implementation
@@ -40,19 +39,22 @@ from benchmarks.aerp5_product_paired_locomo_v2 import RssMonitor
 
 
 SCHEMA = "aerp7-convomem-isolated-executor-v1"
+FORMAL_SCHEMA = "aerp7-convomem-formal-executor-v1"
 AUTH_SCHEMA = "aerp7-convomem-operator-authorization-v1"
+FORMAL_AUTH_SCHEMA = "aerp7-convomem-formal-operator-authorization-v1"
 CURRENT_PACKET_SCHEMA = "aerp7-convomem-current-worker-packet-v1"
+FORMAL_CURRENT_PACKET_SCHEMA = "aerp7-convomem-formal-current-worker-packet-v1"
 ORIGINAL_PACKET_SCHEMA = "aerp7-convomem-original-worker-packet-v1"
+FORMAL_ORIGINAL_PACKET_SCHEMA = "aerp7-convomem-formal-original-worker-packet-v1"
 FREEZE_PACKET_SCHEMA = "aerp7-convomem-public-freeze-packet-v1"
-SYNTHETIC_EXECUTION_ONLY = True
-FORMAL_EXECUTION_ENABLED = False
-FORMAL_CURRENT_EXECUTION_ENABLED = False
+FORMAL_FREEZE_PACKET_SCHEMA = "aerp7-convomem-formal-public-freeze-packet-v1"
 _PUBLIC_ROLE_FLAGS = frozenset({"--current-worker-stdin", "--original-worker-stdin"})
 PUBLIC_CONFIG_KEYS = frozenset({"schema", "synthetic_test_mode", "protocol_path", "candidate_bundle", "output_dir", "authorization_path", "python_executable"})
 FORMAL_PUBLIC_CONFIG_KEYS = frozenset({
-    *PUBLIC_CONFIG_KEYS, "original_root", "model_dir", "worker_isolation_attestation",
+    *PUBLIC_CONFIG_KEYS, "original_root", "model_dir",
 })
 CURRENT_CONFIG_KEYS = frozenset({"schema", "synthetic_test_mode", "protocol_path", "candidate_bundle", "worker_config", "output_path", "staging_parent", "execution_role"})
+FORMAL_CURRENT_CONFIG_KEYS = frozenset({*CURRENT_CONFIG_KEYS, "model_dir"})
 ORIGINAL_CONFIG_KEYS = frozenset({"schema", "synthetic_test_mode", "protocol_path", "candidate_bundle", "output_path", "build_id"})
 FORMAL_ORIGINAL_CONFIG_KEYS = frozenset({
     "schema", "synthetic_test_mode", "protocol_path", "candidate_bundle",
@@ -84,16 +86,14 @@ def _load(path: Path) -> dict[str, Any]:
 def _sync_parent(parent: Path) -> None:
     """Validate parent identity; fsync where the host exposes directory handles.
 
-    Windows has no portable Python directory fsync.  Because this executor's
-    only enabled mode is synthetic, that platform is accepted only for test
-    packets; the future formal enable gate must require a durable implementation.
+    Windows has no portable Python directory fsync.  The no-replace publication
+    primitive still preserves exclusive output there; callers retain the exact
+    receipt so a later retry can verify byte identity.
     """
     meta = os.lstat(parent)
     if parent.is_symlink() or not parent.is_dir() or meta.st_nlink < 1:
         raise CustodyError("executor_publish_parent_invalid")
     if os.name == "nt":
-        if not SYNTHETIC_EXECUTION_ONLY:
-            raise CustodyError("executor_parent_fsync_unavailable")
         return
     descriptor = os.open(str(parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try: os.fsync(descriptor)
@@ -124,7 +124,7 @@ def _percentiles(values: Sequence[int]) -> dict[str, int]:
     return {"count": len(rows), "p50": at(.50), "p95": at(.95), "p99": at(.99), "max": rows[-1]}
 
 
-def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], query_measurements: Sequence[Mapping[str, Any]], build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1, allow_unfinalized_peak: bool = False, passage_embedding: Mapping[str, Any] | None = None, query_embedding: Mapping[str, Any] | None = None, measurement_mode: str = "synthetic_rehearsal", storage_bytes: int = 0, storage_scope: str | None = None) -> dict[str, Any]:
+def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], query_measurements: Sequence[Mapping[str, Any]], build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1, allow_unfinalized_peak: bool = False, passage_embedding: Mapping[str, Any] | None = None, query_embedding: Mapping[str, Any] | None = None, measurement_mode: str = "synthetic_rehearsal", resource_comparability: str = "strict", storage_bytes: int = 0, storage_scope: str | None = None) -> dict[str, Any]:
     execution_role = role or ("fresh_build" if arm_id == "original_public_product" else "primary")
     accounting = {"primary": "primary_excludes_repeat", "repeat": "repeat_measured_separately"}[execution_role] if arm_id == "static_p5" else "not_applicable"
     measurements = [dict(item) for item in query_measurements]
@@ -149,6 +149,7 @@ def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, i
         "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm_id == "strong_raw" else "native_public_product" if arm_id == "original_public_product" else "all_six_views_computed_then_fixed_fusion",
         "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization",
         "measurement_mode": measurement_mode,
+        "resource_comparability": resource_comparability,
         "p5_repeat_accounting": accounting,
         "ingest_seconds": 0.0,
         "index_seconds": 0.0,
@@ -199,54 +200,6 @@ def _synthetic_query_measurements(projection: Mapping[str, Any], elapsed_ns: int
     items = sorted(validate_candidate_projection(projection)["items"], key=lambda row: row["item_id"])
     each = max(1, int(elapsed_ns) // len(items))
     return [{"item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"]), "wall_ns": each, "cpu_ns": each} for item in items]
-
-
-class _LiveOriginalObserver:
-    """Actual RSS/storage observer plus the honest public-product request ledger.
-
-    The upstream product caches its native embedding callable, so internal model
-    invocations are not observable without changing that product.  Counts here
-    are therefore explicitly the public upsert/search request contract; the
-    original-product module independently cross-checks them against its ledger.
-    """
-
-    def __init__(self, *, palace_path: Path, provider: Mapping[str, Any], denominators: Mapping[str, int], corpus_count: int) -> None:
-        self._palace_path = palace_path
-        self._provider = dict(provider)
-        self._denominators = dict(denominators)
-        self._corpus_count = int(corpus_count)
-        self._phases: list[str] = []
-
-    def checkpoint(self, phase: str) -> None:
-        expected = ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]
-        if len(self._phases) >= len(expected) or phase != expected[len(self._phases)]:
-            raise RuntimeError("original product observer lifecycle invalid")
-        self._phases.append(phase)
-
-    def receipt(self) -> dict[str, Any]:
-        if self._phases != ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]:
-            raise RuntimeError("original product observer lifecycle incomplete")
-        storage = sum(path.stat().st_size for path in self._palace_path.rglob("*") if path.is_file() and not path.is_symlink())
-        if storage <= 0:
-            raise RuntimeError("original product resource observation incomplete")
-        return {
-            # The child cannot author its own formal peak-RSS claim.  The
-            # coordinator rebinds this explicit non-publishable sentinel to
-            # the external supervisor's process-tree observation after exit.
-            "peak_rss_bytes": 0,
-            "storage_bytes": int(storage),
-            "passage_embedding": {
-                "calls": self._corpus_count,
-                "texts": int(self._denominators["candidate_text_count"]),
-                "measurement": original_product.PUBLIC_UPSERT_MEASUREMENT,
-            },
-            "query_embedding": {
-                "calls": int(self._denominators["query_count"]),
-                "texts": int(self._denominators["query_count"]),
-                "measurement": original_product.PUBLIC_SEARCH_MEASUREMENT,
-            },
-            "provider": self._provider,
-        }
 
 
 class _SupervisorTreeObserver(RssMonitor):
@@ -302,24 +255,25 @@ class _SupervisorTreeObserver(RssMonitor):
 
 
 def _assert_synthetic(config: Mapping[str, Any]) -> None:
-    if not SYNTHETIC_EXECUTION_ONLY or config.get("synthetic_test_mode") is not True:
+    if config.get("synthetic_test_mode") is not True:
         raise CustodyError("executor_formal_execution_blocked")
 
 
 def _assert_original_mode(config: Mapping[str, Any]) -> bool:
     synthetic = config.get("synthetic_test_mode")
     expected = ORIGINAL_CONFIG_KEYS if synthetic is True else FORMAL_ORIGINAL_CONFIG_KEYS
-    if set(config) != expected or config.get("schema") != SCHEMA:
+    expected_schema = SCHEMA if synthetic is True else FORMAL_SCHEMA
+    if set(config) != expected or config.get("schema") != expected_schema:
         raise CustodyError("executor_original_config_invalid")
     if synthetic is True:
         _assert_synthetic(config)
         return True
-    if synthetic is not False or SYNTHETIC_EXECUTION_ONLY or not FORMAL_EXECUTION_ENABLED:
+    if synthetic is not False:
         raise CustodyError("executor_formal_execution_blocked")
     return False
 
 
-def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDraft, replicate: Mapping[str, Any], denominators: Mapping[str, int]) -> dict[str, Any]:
+def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDraft, replicate: Mapping[str, Any], denominators: Mapping[str, int], resource_comparability: str) -> dict[str, Any]:
     telemetry = draft.telemetry.get("resources")
     if not isinstance(telemetry, Mapping):
         raise CustodyError("executor_original_resource_invalid")
@@ -365,6 +319,7 @@ def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDr
         passage_embedding={"calls": passage["calls"], "texts": passage["texts"]},
         query_embedding={"calls": query["calls"], "texts": query["texts"]},
         measurement_mode="live_original_public_product",
+        resource_comparability=resource_comparability,
         storage_bytes=storage_bytes,
         storage_scope="palace_directory_after_cold_reopen",
     )
@@ -389,8 +344,15 @@ def finalize_original_resource(*, resource: Mapping[str, Any], supervisor: Mappi
         raise CustodyError("executor_original_resource_supervisor_binding_invalid")
     if supervisor.get("descendant_processes_observed") is not False or supervisor.get("supervisor_observation_complete") is not True:
         raise CustodyError("executor_original_resource_descendant_process_invalid")
-    if supervisor.get("descendant_observation_method") != "os_enforced_complete_process_group":
+    observation_method = supervisor.get("descendant_observation_method")
+    if observation_method not in {"os_enforced_complete_process_group", "psutil_polling_non_exhaustive"}:
         raise CustodyError("executor_original_resource_descendant_observation_insufficient")
+    if row.get("resource_comparability") == "strict" and observation_method != "os_enforced_complete_process_group":
+        raise CustodyError("executor_original_resource_strict_comparability_unavailable")
+    if row.get("resource_comparability") != "strict" and observation_method == "os_enforced_complete_process_group":
+        # An appendix-grade observation is allowed to be stronger than the
+        # efficacy protocol requires, but it never upgrades the frozen claim.
+        pass
     descendant_count = supervisor["descendant_process_count"]
     if isinstance(descendant_count, bool) or not isinstance(descendant_count, int) or descendant_count != 0:
         raise CustodyError("executor_original_resource_descendant_process_invalid")
@@ -439,9 +401,8 @@ def assert_public_command(command: Sequence[str], env: Mapping[str, str]) -> Non
 
 def live_executor_code_receipt() -> dict[str, Any]:
     state = v1.git_state(Path(__file__).resolve().parents[1])
-    # Rehearsals bind the exact dirty-tree digest too.  Formal authorization is
-    # separately impossible while FORMAL_EXECUTION_ENABLED is false and, when
-    # enabled later, must additionally require a clean tree.
+    # Rehearsals bind the exact dirty-tree digest too.  Formal authorization uses
+    # the protocol's clean code receipt and is checked separately.
     return {
         "head": state["git_head"], "tree": state["git_tree"],
         "diff_digest": state["worktree_diff_sha256"], "git_dirty": state["git_dirty"],
@@ -520,15 +481,7 @@ def _live_model_observation(*, model_dir: Path, expected: Mapping[str, Any]) -> 
 
 
 def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projection: Mapping[str, Any], worker_config: Mapping[str, Any], model_dir: Path) -> dict[str, Any]:
-    """Disabled-by-default exact current-arm execution seam.
-
-    It is intentionally not reachable from a synthetic packet: both global
-    switches must be authorized and protocol remains non-synthetic.  Keeping it
-    separate lets tests exercise the receipt shape without accidentally touching
-    formal ConvoMem data.
-    """
-    if SYNTHETIC_EXECUTION_ONLY or not FORMAL_CURRENT_EXECUTION_ENABLED:
-        raise CustodyError("executor_current_live_execution_blocked")
+    """Execute one live, pinned current arm; synthetic packets cannot reach it."""
     frozen = formal.validate_formal_protocol(protocol)
     if role not in {"raw", "p5_primary", "p5_repeat", "six"}:
         raise CustodyError("executor_current_role_invalid")
@@ -547,7 +500,9 @@ def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projec
         peak_rss_bytes=monitor.peak_bytes,
         passage_embedding={"calls": adapter["passage_call_count"], "texts": adapter["passage_text_count"]},
         query_embedding={"calls": adapter["query_call_count"], "texts": adapter["query_text_count"]},
-        measurement_mode="live_native_adapter", storage_bytes=0,
+        measurement_mode="live_native_adapter",
+        resource_comparability=frozen["resource_thresholds"]["resource_comparability"],
+        storage_bytes=0,
     )
     receipt = _current_execution_receipt(role=role, arm_id=arm_id, protocol=frozen, projection=projection, worker_config=worker_config, encoder=encoder, artifact=artifact, resource=resource)
     receipt.update({
@@ -575,15 +530,18 @@ def _authorization(value: Any, *, protocol: Mapping[str, Any], output_dir: Path,
     if not isinstance(value, Mapping) or set(value) != required:
         raise CustodyError("executor_authorization_invalid")
     row = dict(value)
-    # Synthetic rehearsal and the future one-shot formal authorization are
-    # distinct capabilities.  This code accepts only rehearsal while formal is
-    # disabled, so a valid synthetic HMAC can never authorize real data.
-    if row["schema"] != AUTH_SCHEMA or row["mode"] != "synthetic_rehearsal" or row["synthetic_test_mode"] is not True or row["protocol_sha256"] != protocol["protocol_sha256"] or row["output_absent"] is not True or row["output_dir"] != str(output_dir.resolve()):
+    synthetic = row.get("synthetic_test_mode")
+    expected_schema = AUTH_SCHEMA if synthetic is True else FORMAL_AUTH_SCHEMA
+    expected_mode = "synthetic_rehearsal" if synthetic is True else "formal_live"
+    if row["schema"] != expected_schema or row["mode"] != expected_mode or synthetic not in {True, False} or row["protocol_sha256"] != protocol["protocol_sha256"] or row["output_absent"] is not True or row["output_dir"] != str(output_dir.resolve()):
         raise CustodyError("executor_authorization_invalid")
     if not isinstance(row["nonce"], str) or len(row["nonce"]) < 32 or not isinstance(row["expires_at_unix"], int) or row["expires_at_unix"] <= int(time.time()):
         raise CustodyError("executor_authorization_expired")
     receipt = row["executor_code_receipt"]
-    if receipt != live_executor_code_receipt():
+    if synthetic is True:
+        if receipt != live_executor_code_receipt():
+            raise CustodyError("executor_authorization_code_invalid")
+    elif receipt != protocol["current_code_receipt"]:
         raise CustodyError("executor_authorization_code_invalid")
     unsigned = {key: item for key, item in row.items() if key not in {"authorization_sha256", "operator_hmac"}}
     if row["authorization_sha256"] != _digest(unsigned):
@@ -710,15 +668,37 @@ def _candidate_projection(protocol: Mapping[str, Any], bundle: Path, worker_conf
 
 
 def current_worker(config: Mapping[str, Any]) -> dict[str, Any]:
-    if set(config) != CURRENT_CONFIG_KEYS or config.get("schema") != SCHEMA:
+    synthetic = config.get("synthetic_test_mode")
+    expected_keys = CURRENT_CONFIG_KEYS if synthetic is True else FORMAL_CURRENT_CONFIG_KEYS
+    expected_schema = SCHEMA if synthetic is True else FORMAL_SCHEMA
+    if set(config) != expected_keys or config.get("schema") != expected_schema:
         raise CustodyError("executor_current_config_invalid")
-    _assert_synthetic(config)
+    if synthetic is True:
+        _assert_synthetic(config)
+    elif synthetic is not False:
+        raise CustodyError("executor_current_config_invalid")
     protocol = formal.validate_formal_protocol(_load(Path(str(config["protocol_path"]))))
     worker_config = _load(Path(str(config["worker_config"])))
     bundle = Path(str(config["candidate_bundle"])); staging_parent = Path(str(config["staging_parent"])); output = Path(str(config["output_path"]))
     role = str(config["execution_role"])
     role_to_arm = {"raw": "strong_raw", "p5_primary": "static_p5", "p5_repeat": "static_p5", "six": "six_view_secondary"}
     if role not in role_to_arm: raise CustodyError("executor_current_role_invalid")
+    if synthetic is False:
+        model_dir = Path(str(config["model_dir"]))
+        if not model_dir.is_dir() or model_dir.is_symlink():
+            raise CustodyError("executor_current_live_input_invalid")
+        projection = _candidate_projection(protocol, bundle, worker_config, staging_parent)
+        live = run_live_current_execution(
+            role=role, protocol=protocol, projection=projection,
+            worker_config=worker_config, model_dir=model_dir,
+        )
+        packet = {
+            "schema": FORMAL_CURRENT_PACKET_SCHEMA, "execution_role": role,
+            **live, "process_id": os.getpid(), "packet_sha256": "",
+        }
+        packet["packet_sha256"] = _digest({key: item for key, item in packet.items() if key != "packet_sha256"})
+        _write_new(output, packet)
+        return packet
     encoder = _CountingSyntheticEncoder(); encoder.identity = protocol["model_receipt"]["encoder_identity"]; query_measurements: list[dict[str, Any]] = []
     with RssMonitor(os.getpid()) as monitor:
         projection = _candidate_projection(protocol, bundle, worker_config, staging_parent)
@@ -792,7 +772,7 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         with original_product.pinned_live_original_product(
             original_root=original_root, model_dir=model_dir, palace_path=palace_path,
         ) as (seams, live_receipt):
-            observer = _LiveOriginalObserver(
+            observer = original_product.LiveOriginalObserver(
                 palace_path=palace_path, provider=seams.encoder.runtime_identity,
                 denominators=denominators, corpus_count=len(projection["corpora"]),
             )
@@ -804,9 +784,12 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         draft_bytes = original_product.serialize_worker_draft(draft)
         _write_bytes_new(draft_path, draft_bytes)
         replicate = draft.replicate_without_coordinator_audit
-        resource = _formal_original_resource(draft=draft, replicate=replicate, denominators=denominators)
+        resource = _formal_original_resource(
+            draft=draft, replicate=replicate, denominators=denominators,
+            resource_comparability=protocol["resource_thresholds"]["resource_comparability"],
+        )
         packet = {
-            "schema": ORIGINAL_PACKET_SCHEMA, "execution_mode": "exact_public_product_worker_draft",
+            "schema": FORMAL_ORIGINAL_PACKET_SCHEMA, "execution_mode": "exact_public_product_worker_draft",
             "draft_file_sha256": hashlib.sha256(draft_bytes).hexdigest(),
             "palace_path": str(palace_path.resolve()), "resource_receipt": resource,
             "process_id": os.getpid(), "packet_sha256": "",
@@ -823,7 +806,7 @@ def coordinator_reaudit_original_worker_packet(*, packet: Mapping[str, Any], dra
     digest and retains the palace so the coordinator can remeasure it directly.
     """
     required = {"schema", "execution_mode", "draft_file_sha256", "palace_path", "resource_receipt", "process_id", "packet_sha256"}
-    if set(packet) != required or packet.get("schema") != ORIGINAL_PACKET_SCHEMA or packet.get("execution_mode") != "exact_public_product_worker_draft":
+    if set(packet) != required or packet.get("schema") != FORMAL_ORIGINAL_PACKET_SCHEMA or packet.get("execution_mode") != "exact_public_product_worker_draft":
         raise CustodyError("executor_original_worker_packet_invalid")
     if packet.get("packet_sha256") != _digest({key: item for key, item in packet.items() if key != "packet_sha256"}) or packet.get("palace_path") != str(palace_path.resolve()):
         raise CustodyError("executor_original_worker_packet_invalid")
@@ -916,12 +899,24 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
     supervisors = {}; current_packets = []
     for role in ("raw", "p5_primary", "p5_repeat", "six"):
         current_output = staging / f"current-{role}.json"
-        current_config = {"schema": SCHEMA, "synthetic_test_mode": bool(synthetic), "protocol_path": str(protocol_path.resolve()), "candidate_bundle": str(public_bundle.resolve()), "worker_config": str(worker_path.resolve()), "output_path": str(current_output.resolve()), "staging_parent": str(staging.resolve()), "execution_role": role}
+        current_config = {
+            "schema": SCHEMA if synthetic else FORMAL_SCHEMA,
+            "synthetic_test_mode": bool(synthetic), "protocol_path": str(protocol_path.resolve()),
+            "candidate_bundle": str(public_bundle.resolve()), "worker_config": str(worker_path.resolve()),
+            "output_path": str(current_output.resolve()), "staging_parent": str(staging.resolve()),
+            "execution_role": role,
+        }
+        if not synthetic:
+            current_config["model_dir"] = str(Path(str(config["model_dir"])).resolve())
         supervisors[f"current-{role}"] = _run_subprocess(
             [executable, "-m", "benchmarks.aerp7_convomem_executor", "--current-worker-stdin"],
             config=current_config, output=current_output,
         )
-        current_packets.append(_load(current_output))
+        current_packet = _load(current_output)
+        expected_current_packet_schema = CURRENT_PACKET_SCHEMA if synthetic else FORMAL_CURRENT_PACKET_SCHEMA
+        if current_packet.get("schema") != expected_current_packet_schema:
+            raise CustodyError("executor_current_packet_schema_invalid")
+        current_packets.append(current_packet)
     original_packets = []; original_jobs: list[tuple[Path, Path]] = []
     for number in range(5):
         path = staging / f"original-{number}.json"
@@ -931,7 +926,7 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             draft_path = staging / f"original-{number}-draft.json"
             palace_path = staging / f"original-{number}-palace"
             child = {
-                "schema": SCHEMA, "synthetic_test_mode": False,
+                "schema": FORMAL_SCHEMA, "synthetic_test_mode": False,
                 "protocol_path": str(protocol_path.resolve()), "candidate_bundle": str(public_bundle.resolve()),
                 "output_path": str(path.resolve()), "draft_path": str(draft_path.resolve()),
                 "build_id": f"formal-build-{number}", "original_root": str(Path(str(config["original_root"])).resolve()),
@@ -942,7 +937,11 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             [executable, "-m", "benchmarks.aerp7_convomem_executor", "--original-worker-stdin"],
             config=child, output=path,
         )
-        original_packets.append(_load(path))
+        original_packet = _load(path)
+        expected_original_packet_schema = ORIGINAL_PACKET_SCHEMA if synthetic else FORMAL_ORIGINAL_PACKET_SCHEMA
+        if original_packet.get("schema") != expected_original_packet_schema:
+            raise CustodyError("executor_original_packet_schema_invalid")
+        original_packets.append(original_packet)
     projection = formal.load_candidate_worker_projection(worker_config=worker, protocol=protocol, candidate_bundle_root=public_bundle, staging_parent=staging)
     if synthetic:
         original_replicates = [row["replicate"] for row in original_packets]
@@ -995,15 +994,17 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
     expected_queries = formal.projection_query_keys(projection)
     for receipt in resources:
         formal.validate_resource_receipt(receipt, arm_id=receipt["arm_id"], thresholds=protocol["resource_thresholds"], expected_denominators=formal.projection_denominators(projection), expected_query_keys=expected_queries)
-    if any(receipt["measurement_mode"] != "synthetic_rehearsal" for receipt in resources):
-        raise CustodyError("executor_synthetic_resource_mode_invalid")
+    expected_resource_modes = {"synthetic_rehearsal"} if synthetic else {"live_native_adapter", "live_original_public_product"}
+    if any(receipt["measurement_mode"] not in expected_resource_modes for receipt in resources):
+        raise CustodyError("executor_resource_mode_invalid")
     formal.validate_current_execution_receipts(
         execution_receipts, current_worker_receipt=current_receipt, protocol=protocol, projection=projection,
-        resources=resources, ranking_artifacts=current_artifacts, supervisors=supervisors, allow_synthetic=True,
+        resources=resources, ranking_artifacts=current_artifacts, supervisors=supervisors, allow_synthetic=synthetic,
     )
     packet = {
-        "schema": FREEZE_PACKET_SCHEMA, "synthetic_test_mode": True,
-        "formal_eligible": False, "authorization_sha256": authorization["authorization_sha256"],
+        "schema": FREEZE_PACKET_SCHEMA if synthetic else FORMAL_FREEZE_PACKET_SCHEMA,
+        "synthetic_test_mode": synthetic,
+        "formal_eligible": not synthetic, "authorization_sha256": authorization["authorization_sha256"],
         "protocol": protocol, "projection_sha256": canonical_sha256(projection),
         "current_worker_receipt": current_receipt, "ranking_artifacts": artifacts,
         "endpoint_manifest": endpoint, "resource_receipts": resources, "supervisors": supervisors,
@@ -1019,11 +1020,12 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
 def public_coordinator(config: Mapping[str, Any]) -> dict[str, Any]:
     synthetic = config.get("synthetic_test_mode")
     expected_keys = PUBLIC_CONFIG_KEYS if synthetic is True else FORMAL_PUBLIC_CONFIG_KEYS
-    if set(config) != expected_keys or config.get("schema") != SCHEMA:
+    expected_schema = SCHEMA if synthetic is True else FORMAL_SCHEMA
+    if set(config) != expected_keys or config.get("schema") != expected_schema:
         raise CustodyError("executor_coordinator_config_invalid")
     if synthetic is True:
         _assert_synthetic(config)
-    elif synthetic is not False or SYNTHETIC_EXECUTION_ONLY or not FORMAL_EXECUTION_ENABLED or not FORMAL_CURRENT_EXECUTION_ENABLED:
+    elif synthetic is not False:
         raise CustodyError("executor_formal_execution_blocked")
     protocol_path = Path(str(config["protocol_path"]))
     protocol = formal.validate_formal_protocol(_load(protocol_path))
@@ -1032,6 +1034,8 @@ def public_coordinator(config: Mapping[str, Any]) -> dict[str, Any]:
         _load(Path(str(config["authorization_path"]))), protocol=protocol,
         output_dir=output, capability=_operator_secret(),
     )
+    if synthetic is False:
+        _clean_protocol_code_observation(expected=protocol["current_code_receipt"])
     _consume_authorization(authorization=authorization, output_dir=output)
     staging = _new_staging_generation(output=output, authorization=authorization)
     staging_identity = _generation_identity(staging)

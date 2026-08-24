@@ -39,7 +39,7 @@ def projection():
 def protocol(p, candidate=None):
     model, code = receipts()
     candidate = candidate or {"generation_id": h("generation"), "ready_sha256": h("ready"), "projection_raw_sha256": h("raw"), "projection_canonical_sha256": canonical_sha256(p)}
-    row = {"schema": formal.FORMAL_PROTOCOL_SCHEMA, "synthetic_test_mode": False, "candidate": candidate, "current_code_receipt": code, "original_code_receipt": code, "source_receipt": rank.PROTOCOL_SOURCE, "model_receipt": model, "arms": list(rank_score_arms()), "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}, "top_k": 10, "tie_break": "stable_ranking_key_ascending", "original_build_count": 5, "p5_repeat_required": True, "bootstrap": {"seed": 20260822, "resamples": 5000, "percentile_lower": .025, "percentile_upper": .975, "percentile_rule": "linear", "original_replicate_rule": "per_query_arithmetic_mean"}, "gates": {"overall_delta_min": .01, "overall_ci_lower_gt_zero": 0.0, "hard_delta_min": 0.0, "hard_ci_lower_min": -.01, "abstention_ci_lower_min": -.01, "guardrails_required": True}, "resource_thresholds": {"peak_rss_bytes_max": 2_000_000_000, "storage_bytes_max": 2_000_000_000, "ingest_seconds_max": 100.0, "index_seconds_max": 100.0, "query_p95_ns_max": 1_000_000_000}}
+    row = {"schema": formal.FORMAL_PROTOCOL_SCHEMA, "synthetic_test_mode": False, "candidate": candidate, "current_code_receipt": code, "original_code_receipt": code, "source_receipt": rank.PROTOCOL_SOURCE, "model_receipt": model, "arms": list(rank_score_arms()), "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}, "top_k": 10, "tie_break": "stable_ranking_key_ascending", "original_build_count": 5, "p5_repeat_required": True, "bootstrap": {"seed": 20260822, "resamples": 5000, "percentile_lower": .025, "percentile_upper": .975, "percentile_rule": "linear", "original_replicate_rule": "per_query_arithmetic_mean"}, "gates": {"overall_delta_min": .01, "overall_ci_lower_gt_zero": 0.0, "hard_delta_min": 0.0, "hard_ci_lower_min": -.01, "abstention_ci_lower_min": -.01, "guardrails_required": True}, "resource_thresholds": {"resource_comparability": "strict", "peak_rss_bytes_max": 2_000_000_000, "storage_bytes_max": 2_000_000_000, "ingest_seconds_max": 100.0, "index_seconds_max": 100.0, "query_p95_ns_max": 1_000_000_000}}
     row["protocol_sha256"] = formal.protocol_digest(row)
     return row
 
@@ -86,7 +86,7 @@ def resource(arm, artifact_sha, build_id=None, index_sha=None, p=None, execution
     original = arm == "original_public_product"
     passage = {"calls": 1, "texts": c, "measurement_kind": "public_upsert_request_proxy" if original else "encoder_adapter_api_calls", "native_embedding_observable": not original, "limitation": "synthetic public proxy" if original else None}
     query = {"calls": q, "texts": q, "measurement_kind": "public_search_request_proxy" if original else "encoder_adapter_api_calls", "native_embedding_observable": not original, "limitation": "synthetic public proxy" if original else None}
-    row = {"schema": formal.RESOURCE_SCHEMA, "arm_id": arm, "execution_role": execution_role, "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm == "strong_raw" else "native_public_product" if original else "all_six_views_computed_then_fixed_fusion", "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization", "measurement_mode": "live_original_public_product" if original else "live_native_adapter", "p5_repeat_accounting": accounting, "ingest_seconds": 1.0, "index_seconds": 1.0, "query_measurements": measurements, "query_latency_ns": {"wall": formal._latency_percentiles([row["wall_ns"] for row in measurements]), "cpu": formal._latency_percentiles([row["cpu_ns"] for row in measurements])}, "passage_embedding": passage, "query_embedding": query, "storage_scope": "palace_directory_after_cold_reopen" if original else "no_persistent_index", "storage_bytes": 100 if original else 0, "peak_rss_bytes": 100, "artifact_sha256": artifact_sha, "build_id": build_id, "index_sha256": index_sha, "input_denominators": {"query_count": q, "candidate_text_count": c}, "hardware_runtime": {"python": "synthetic-python", "platform": "synthetic-platform", "processor": "synthetic-cpu"}}
+    row = {"schema": formal.RESOURCE_SCHEMA, "arm_id": arm, "execution_role": execution_role, "resource_semantics": "all_six_views_computed_then_raw_fusion_weights" if arm == "strong_raw" else "native_public_product" if original else "all_six_views_computed_then_fixed_fusion", "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization", "measurement_mode": "live_original_public_product" if original else "live_native_adapter", "resource_comparability": "strict", "p5_repeat_accounting": accounting, "ingest_seconds": 1.0, "index_seconds": 1.0, "query_measurements": measurements, "query_latency_ns": {"wall": formal._latency_percentiles([row["wall_ns"] for row in measurements]), "cpu": formal._latency_percentiles([row["cpu_ns"] for row in measurements])}, "passage_embedding": passage, "query_embedding": query, "storage_scope": "palace_directory_after_cold_reopen" if original else "no_persistent_index", "storage_bytes": 100 if original else 0, "peak_rss_bytes": 100, "artifact_sha256": artifact_sha, "build_id": build_id, "index_sha256": index_sha, "input_denominators": {"query_count": q, "candidate_text_count": c}, "hardware_runtime": {"python": "synthetic-python", "platform": "synthetic-platform", "processor": "synthetic-cpu"}}
     row["resource_sha256"] = formal.resource_digest(row)
     return row
 
@@ -147,6 +147,28 @@ def test_resource_v2_retains_raw_measurements_and_recomputes_both_percentiles():
         forged = copy.deepcopy(good); mutate(forged["query_measurements"]); forged["resource_sha256"] = formal.resource_digest(forged)
         with pytest.raises(CustodyError, match="query_binding_invalid"):
             formal.validate_resource_receipt(forged, arm_id="strong_raw", thresholds=proto["resource_thresholds"], expected_denominators=formal.projection_denominators(p), expected_query_keys=expected_queries)
+
+
+def test_unavailable_resource_comparability_preserves_efficacy_receipts_without_thresholds():
+    p = projection(); proto = protocol(p)
+    proto["candidate"].update(formal.projection_denominators(p))
+    proto["resource_thresholds"] = {
+        "resource_comparability": "unavailable",
+        "peak_rss_bytes_max": None, "storage_bytes_max": None,
+        "ingest_seconds_max": None, "index_seconds_max": None,
+        "query_p95_ns_max": None,
+    }
+    proto["protocol_sha256"] = formal.protocol_digest(proto)
+    receipt = resource("strong_raw", h("artifact"), p=p)
+    receipt["resource_comparability"] = "unavailable"
+    receipt["peak_rss_bytes"] = 9_999_999_999
+    receipt["resource_sha256"] = formal.resource_digest(receipt)
+    assert formal.validate_formal_protocol(proto)["resource_thresholds"]["resource_comparability"] == "unavailable"
+    assert formal.validate_resource_receipt(
+        receipt, arm_id="strong_raw", thresholds=proto["resource_thresholds"],
+        expected_denominators=formal.projection_denominators(p),
+        expected_query_keys=formal.projection_query_keys(p),
+    )["resource_comparability"] == "unavailable"
 
 
 def scoring_custody(p):

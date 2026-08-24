@@ -1,524 +1,259 @@
 # Paper research program
 
-This document is the single source of truth for the paper-oriented research
-program.  The program has two independently gated tracks.  Track A must first
-establish retrieval quality; Track B then measures whether that memory layer
-causes better story generation.  A result in one track cannot rescue a failed
-gate in the other.
+This is the single source of truth for paper-oriented work. Track A establishes
+retrieval effectiveness; Track B tests story generation and character-memory
+isolation. Neither track can rescue a failed gate in the other.
 
-## Claim boundary
+## Claim boundary and current status
 
-The project does not construct a benchmark whose purpose is to make AERP win.
-It freezes adapters, splits, metrics, resource budgets, and thresholds before
-confirmation results are read, then asks whether the frozen method wins.  Public
-data already inspected during development is engineering evidence, never blind
-confirmation.
+Track A is incomplete. Burned LoCoMo/AERP-5 results are engineering evidence,
+not confirmation. No ConvoMem or MemBench formal source has been opened,
+enumerated, hashed, downloaded, or run. Therefore there is no current paper
+result and no current per-dataset gate result. Track B has a protocol but no
+completed controlled experiment.
 
-The intended paper claim is conditional:
+ConvoMem's official primary endpoint is category-specific LLM-judged answer
+accuracy by conversation-count context. The blinded exact-evidence
+Recall@10/NDCG@10/MRR@10 protocol is an added AERP retrieval endpoint, not an
+official ConvoMem metric. LongMemEval-V2 is external QA/latency/LAFS evidence,
+not an official evidence-R@10 confirmation dataset.
 
-1. an authorization-preserving, raw-anchored multi-view retriever improves
-   exact evidence recall over MemPalace and strong raw controls without moving
-   the adversarial failure elsewhere; and
-2. under a fixed story generator, that memory layer reduces forbidden-knowledge
-   leakage and continuity errors while improving authorized character-memory
-   use.
+## Implemented formal common path
 
-Until both claims pass their own gates, the repository may report engineering
-progress but not a paper-level result.
+AERP-7 provides the common trusted-host formal path: candidate/custody
+separation, independent current and original worker processes, durable
+no-replace publication, HMAC/nonce authorization, and exact-byte retry. Its
+formal data path remains unused; its synthetic fixtures and smoke checks are
+implementation evidence only.
 
-## Current status
+AERP-8 implements the corresponding MemBench path:
 
-Track A is not complete.  The repository has engineering results on burned
-LoCoMo data, a frozen static-P5 primary arm, and now a formal real-1,982
-public-product paired result, but it does not yet contain an untouched-dataset
-confirmation.  The original repository benchmark candidate's historical result
-is not interchangeable with the public-product result.  Track B has a protocol
-but no completed controlled story-generation experiment.  No current artifact
-is a paper-level result.
+- An isolated formal source-builder accepts only a frozen manifest, exact file
+  capabilities, an operator-HMAC authorization, and an opacity-secret
+  capability; it emits a label-free candidate projection plus sealed custody
+  and byte-bound READY receipts.
+- Four current workers execute strong raw, static-P5 primary, static-P5 repeat,
+  and fixed Six-View in independent processes; the two P5 artifact bytes must
+  match.
+- Five fresh exact-original workers use the public `upsert -> cold reopen ->
+  search` lifecycle and a coordinator physical-index re-audit.
+- Before any original worker starts, an external checkpoint with schema
+  `aerp8-membench-current-checkpoint-v2` freezes an
+  `aerp8-membench-original-execution-policy-v1` digest. A shared no-data probe
+  executes the frozen original interpreter under a scrubbed environment and
+  verifies exact root/interpreter bytes, `sys.executable`, `sys.version`,
+  `sys._base_executable` (or equivalent base identity) and bytes, and the real
+  imported `mempalace.__file__` (only the pinned
+  `mempalace/__init__.py` is accepted), alongside model and Git identity.
+  The same policy digest binds all five worker configs/runtimes/receipts/READY
+  files, the original artifact, public packet, release, formal-public check,
+  and custodian pre-custody validation.
+- A formal custodian validates public/release/READY bytes before opening
+  custody; a completed retry does not stat, read, or score custody.
+- Formal scoring uses the four fixed MemBench source roles, HMAC `(role, tid)`
+  groups pooled across the frozen context profiles, 5,000 stratified bootstrap
+  draws with a complete-original-build layer, and
+  the frozen overall and reflective gates. Adversarial and abstention are N/A
+  for the official MemBench protocol.
 
-The burned-data AERP-6 transition ledger is a read-only mechanism gate over the
-frozen staged LoCoMo artifact.  It records per-evidence six-view and cumulative
-full-order ranks, Top-10 boundary margins, raw-to-full transitions, the fixed
-no-checkpoint and joint-removal diagnostics, and separate identities for the
-published raw-fusion comparator versus the full-order raw prefix.  Its only
-router-related output is rank-only preparation evidence for the existing
-`RawAnchoredP5Policy`; it cannot select `tau`, alter live ranking, or make a
-confirmation claim.
+Synthetic helpers use separate schemas and cannot authorize formal release or
+custody scoring. This path trusts frozen benchmark code and does not claim
+hostile same-user containment.
 
-### AERP-5 v2 public-product rehearsal
+## Pins and smoke evidence
 
-The AERP-5 v2 specification harness binds the exact 1,982 AERP-4 members (and
-the four custody exclusions) and consumes one independently byte-pinned,
-label-free projection for a public, non-blind product pairing.  Its
-intended arms are the pinned original public-product seam, fixed static P5,
-and secondary fixed six-view.  The implemented core enforces two frozen
-label-free repeats, AERP4 membership/query/input/policy-lineage binding, and a
-two-repeat MiniLM-P5 checkpoint before label custody, per-query cold-first latency,
-process-tree RSS, and score-after-freeze custody.  The subprocess runner
-constructs the pinned original/current product arms from that projection in
-fresh temporary backends.  The formal coordinator may not rebuild projection
-from, hash, parse, or load the full official LoCoMo bundle: that bundle remains
-custodian-only until both the AERP4 BGE-lineage anchor and the two-repeat
-MiniLM-P5 checkpoint have passed.  Before the custodian may even hash the
-official bundle, it re-binds the score-config projection path and both
-projection digests, dataset path and digest, MiniLM tree digest, and clean
-original checkout to the canonical manifest; config-local matching hashes cannot
-redirect any input.  It also cross-binds the lineage and MiniLM checkpoint's
-membership/query-input identities and canonical fixed-P5 semantics.  The label
-consumer itself is independently anchored in that manifest by normalized source
-digests of scoring, aggregation, bootstrap, replicate-report, and decision
-functions plus exact AERP1/original-protocol dependencies; a live receipt and
-its score-config copy cannot jointly authorize a scorer change.  The post-label
-item/token join, score computation, unresolved-ledger check,
-slice aggregation, decision, and scored-result assembly are one pure pinned
-score core; its source digest is part of the same contract, while the custodian
-shell only performs label loading, postchecks, and publication.  Before any
-freeze bytes are hashed or parsed, the custodian also requires every dynamic
-freeze to be a unique non-symlink, non-hard-linked regular file named
-`{arm}-{repeat}.json` under the coordinator's external work namespace, with no
-filesystem alias to projection, dataset, manifest, or scorer inputs.  The
-2026-08-23 `retry7` is now the formal public-product result, bound to commit
-`c7d737ee217a71ff6a60f1c30313d8e6e1ea3c61` and tree
-`65af2cc3b97d6e790ce9e0563380bab3bbb3911b`.  Its formal artifact is
-`benchmark-artifacts/aerp5-v2-real-c7d737e-retry7.json` with SHA-256
-`afc596566a37b1cacf561bd0971c1cff44064faba1d23ed159960f1d2ebbb916`.
-The result covers 1,982 items, five original-product replicates, and two exact
-repeats for each of fixed P5 and secondary fixed six-view.  P5 versus the
-original public product has question-macro Recall@10 `0.59416156` versus
-`0.46623866`, delta `+0.12792290`, with paired 95% CI
-`[0.10722680, 0.14660648]`; the conversation-macro delta is `+0.12827231`
-with CI `[0.10771112, 0.14653054]`.  The frozen scientific decision is
-`GO=true`, with 9 unresolved evidence items.  P5's question-macro deltas by
-category are Cat. 1 `+0.06702051`, Cat. 2 `+0.12087227`, Cat. 3
-`+0.08960222`, Cat. 4 `+0.13174792`, and Cat. 5 `+0.17219731`.
+The exact original pin is commit
+`72ccd2f3653ab902e419d15bb542c88045342b04`, tree
+`5e4ad9cf1d6387cebe16dd03b6da8355d899f70c`, and model-tree SHA-256
+`76217893f057779cee29c903aa24444154ad0da7645853f1041fd970cca275a0`.
+The formal path also binds interpreter/source import paths, clean Git state,
+driver code receipts, and model receipts. Current-worker provenance binds the
+reviewed `.venv/Scripts/python.exe` and `.venv/pyvenv.cfg` paths plus byte hashes.
+The source tree deliberately leaves local `.venv` untracked: the final clean
+checkpoint therefore uses an external runtime/checkpoint receipt with exact paths,
+byte hashes, and live revalidation evidence, while the review closure carries both
+files only for isolated reproduction.
 
-This remains a burned-LoCoMo, `public_nonblind` engineering result, not a
-confirmation claim.  The secondary fixed-six-view overall question-macro
-Recall@10 is `0.58868328`; it exceeds P5 in Categories 2 and 5, while Category
-1 is `0.04184089` below P5.  `resource_gate_eligible=false` remains in force:
-the blockers are mixed-visibility, blind-180, 30k-event, SQLite/drawer
-failure-injection, and frozen resource thresholds.  Track A therefore remains
-incomplete; the next untouched confirmation datasets are ConvoMem and
-MemBench.
+Small synthetic live smoke evidence is not a dataset result. The five-original
+smoke artifact SHA-256 is
+`21917673215412ba42cbc2e1fabd4ea019bb8fcb6ed47b17418211c705e4e30d`.
+The current-four smoke artifact SHA-256 values are strong raw
+`2389a5e51955fa448d1a6e4b65477772fa70fd882a1fe63c89be257d9f4d945b`,
+static P5 primary/repeat
+`23f008fa4bf7f1a61b3c341d49fa07a2bfa8806e9b1290bb4202a173cda80a7d`,
+and Six-View
+`330fee44e051cbf126aca6534719372dbfc9a05876f6685fc6c386b5e792b7c3`.
 
-The first real execution of commit `9caacc6` failed the pre-registered 2 GiB
-RSS cap before any label scoring or formal report publication.  The observed
-worker/supervisor peaks were about 2.209/2.209 GB.  Diagnosis showed that the
-label-free transport repeated each conversation's sessions once per question,
-producing a 405,116,475-byte projection; the ranking phase itself stayed below
-the cap and receipt serialization crossed it.  The allowed follow-up is a
-representation-only normalization that stores each conversation corpus once,
-keeps the 1,982 query membership and frozen rankings unchanged, and retains the
-same 2 GiB threshold.  Raising the threshold or using labels during this repair
-is forbidden.
+The v2 regression set keeps checkpoint/commit/tree/model/Git at A while ordinary
+runtime/worker/artifact/READY/public digests are resealed. It rejects an in-root
+ordinary text file substituted as `original_python`, a different real interpreter,
+and a different pinned-tree file substituted as `mempalace` import origin. The
+freeze/formal-public/release chain fails before an acceptable release can exist;
+the custodian neither stats nor reads custody and never invokes scoring.
 
-The formal coordinator likewise never opens the AERP4 study or custody bundle:
-the custody bundle is label-bearing.  It derives allowed membership solely from
-the two immutable, label-free train/dev ranking freezes, whose byte digests and
-`study_sha256` fields are checked against the canonical manifest; the manifest's
-four exclusion tokens are the only exclusion input available before custody.
+Independent root verification on 2026-08-23 used fresh E-drive basetemps with
+`-p no:cacheprovider`. `python -m pytest tests/test_aerp8_membench.py -q
+--basetemp E:\MemPalaceWorkspace\repos\.pytest-root-aerp8-pro6-3c71
+-p no:cacheprovider` returned `48 passed in 276.81s (0:04:36)`. `python -m
+pytest -q --basetemp E:\MemPalaceWorkspace\repos\.pytest-root-aerp8-pro6-full-73d2
+-p no:cacheprovider` returned `716 passed, 4 skipped in 433.42s (0:07:13)`.
+`py_compile` and `git diff --check` also passed. This remains pre-formal-checkpoint
+implementation evidence, not a MemBench or ConvoMem result.
 
-The later `retry5` at checkpoint
-`982252aa85cbcff2fca200a8725fb24b9da7806a` reached all nine completed label-free
-workers but stopped before label custody because its then-current gate demanded
-byte-identical Top-10 output from the historical AERP4 BGE-fp32 freeze and the
-matched-encoder native-MiniLM product arm.  That is a protocol-gate error, not
-a quality result: the 1,982 item membership plus every query and input digest
-matched, while the encoders are intentionally different.  The corrected v2
-protocol keeps the immutable AERP4 freeze as BGE lineage (including its model
-pins and fixed-P5 semantics), never as a cross-encoder ranking oracle.  It
-instead freezes two exact label-free native-MiniLM P5 repeats as the
-`AERP5-MiniLM-P5` checkpoint and binds that checkpoint into the scoring config
-before any official evidence labels are read.  A BGE replay, if run, is an
-optional lineage check and cannot become the primary comparison.
-The immutable external failure receipt is SHA-256
-`da7051d79bd8e434d40480c9a6df492beafd2c5d88ea4e4ef69fece1502f221a`.
+## Required review and execution order
 
-## Track A: retrieval
+MemBench `selected_profiles` is frozen as exactly `['0', '100']`, corresponding
+to the official paper-sampled `0-10k` and `100k` labels. The source inventory is
+the four exact `data/data2test/*_multiple_{0|100}.json` paths per profile; it
+does not permit discovery, wildcard expansion, sampling, or post-result drops.
+Because these external payloads are not Git/LFS objects in the pinned official
+tree, acquisition records the external archive/file byte digests before parsing,
+while a clean pinned checkout proves the official generator/code provenance.
 
-### Frozen method and comparators
+The remaining order is:
 
-The frozen primary retrieval method is now static P5: `SixViewRanker` with
-`FixedP5Policy`.  AERP-4b closed the low-complexity sparse routing branch as a
-controlled train-only null result, so the formal AERP-5 v2 product comparison
-has no `tau` or router selection surface.  `RawAnchoredP5Policy` remains a
-historical mechanism experiment rather than the method under confirmation.
+1. Pro review and a clean checkpoint.
+2. Freeze ConvoMem and MemBench source manifests/profiles and acquire authorized
+   inputs without reopening a tuning surface.
+3. Run each dataset one time through its source-builder, current-four,
+   original-five, and custodian path.
+4. Apply each dataset's gates separately; do not pool a failure away.
+5. Only after Track A, run the frozen Track B experiment.
 
-Every comparison table must distinguish these arms:
+Docker/cgroup work is not a Track A efficacy blocker. `resource_comparability`
+may be `unavailable`; no efficiency, matched-resource, or systems-security
+claim may be made without the separately required evidence.
 
-- original repository benchmark candidate: code from the pinned MemPalace
-  repository that directly constructs its benchmark index;
-- original public product: the pinned product path
-  `palace.get_collection(...).upsert(...) -> searcher.search_memories(...)`;
-- matched-encoder product comparison: original public product and AERP use the
-  same MiniLM implementation, corpus bytes, query bytes, and TopK;
-- architecture-controlled raw vector comparison: same BGE encoder and direct
-  vector scoring, labelled as a control rather than the original product;
-- raw BM25+dense, fixed Product Six-View, static P5, and gated AERP-4 ablations.
+## Dataset roles and information flow
 
-The original repository benchmark candidate and the original public product are
-different experimental arms.  Neither may be renamed or summarized as the
-other.
+LoCoMo and LongMemEval-S are burned engineering data and cannot become blind
+confirmation data. ConvoMem is the first confirmation dataset and is split by
+persona. `message_evidences`, answers, source locators, and exact evidence
+crosswalks are custody-only. Positive retrieval and abstention are separate
+endpoints. ConvoMem is bound to upstream commit
+`624f582ecf0d336ae1d4539d19186089800774b1` and tree
+`1699a58948e7ac4e3263110a40d06bab457bcf8b`.
 
-### Data roles
+ConvoMem preserves ordered structured speaker/text messages, opaque
+conversation boundaries, declared and actual context sizes, and message order.
+The official-structure LongContext serializer, MemPalace text-only public
+product serializer, and AERP structured Six-View serializer are distinct
+receipts. Exact evidence mapping is normalized `(speaker, text)` within the
+custody-only evidence conversation set; zero or multiple matches fail closed
+without fuzzy fallback.
 
-- LoCoMo and LongMemEval-S are burned engineering data.  They may be used for
-  adapter rehearsal and diagnosis; the completed AERP-4 train/dev work cannot
-  be reopened as a tuning surface.  They cannot support a blind confirmation
-  claim.
-- ConvoMem is the first retrieval confirmation dataset.  Split by persona, not
-  by question or premixed context.  `message_evidences` belongs only to the
-  label custodian.  Abstention items are a separate safety endpoint and do not
-  enter positive-evidence R@10.
-  The AERP-7 prelabel slice is not a confirmation run and must not score: its
-  custodian publishes a normalized candidate projection with opaque HMAC IDs
-  plus a separately published custody bundle under a different filesystem
-  access boundary.  The candidate-ranking process receives only the candidate
-  bundle path; it must not receive or access the custody path or binding secret.
-  The custodian later receives both paths and the secret.  The custody bundle
-  records that evidence span mapping is unresolved/not attempted; it is the
-  only place where answers, evidence labels, directory-derived metadata, and
-  source locators may exist.
-  The protocol implementation is bound to the upstream
-  `SalesforceAIResearch/ConvoMem` commit
-  `624f582ecf0d336ae1d4539d19186089800774b1` and tree
-  `1699a58948e7ac4e3263110a40d06bab457bcf8b`.  ConvoMem has no single official
-  retriever serializer: its `MemoryAnswerer` receives ordered structured
-  conversations, while the official LongContext baseline renders messages as
-  `speaker: text`.  AERP-7 therefore preserves candidate-safe speaker, opaque
-  conversation boundaries, conversation/message order, declared context size,
-  actual conversation count, and actual message count.  It separately binds
-  the official-structure-compatible LongContext serializer, MemPalace's
-  text-only public-product serializer, and AERP's structured SixView event
-  serializer.  The opaque-ID adaptation is not a byte-exact reproduction of
-  the official LongContext prompt, which includes source conversation IDs.
-  Before any labels are unsealed, AERP-7 must also freeze exact-only span
-  mapping, a strong raw BM25+dense comparator, static-P5 ranking outputs, and a
-  persona/context-stratified paired bootstrap.  Positive evidence retrieval and
-  abstention are separate endpoints.  Static P5 has no abstain decision, so the
-  latter may report only threshold-free confidence separability unless a
-  source-disjoint burned calibration set and decision rule are frozen first.
-  The streaming SQLite index must use the explicitly approved staging volume.
-  On Windows, launch the isolated benchmark process after setting both
-  `$env:TMP=$staging` and `$env:TEMP=$staging`, then pass
-  `--staging-root $staging`; on Linux launch it with
-  `SQLITE_TMPDIR=$staging` and the same flag.  The builder is supported only on
-  Windows or Linux with `renameat2(RENAME_NOREPLACE)` and rejects other systems
-  before reading official inputs.  Content-digest bundle loaders remain
-  portable beyond those builder platforms.  The process verifies the OS temp
-  route and `PRAGMA temp_store=FILE` before reading official inputs.
-  Exact message-evidence mapping uses normalized `(speaker, text)` only within
-  the item's custody-only evidence-conversation set.  Zero matches are
-  unmatched and multiple matches are ambiguous; neither case admits a fuzzy
-  fallback.  The official primary ConvoMem metric is category-specific
-  LLM-judged answer accuracy by conversation-count context.  AERP-7's blinded
-  message-level exact-evidence Recall@10/NDCG@10/MRR@10 is an added retrieval
-  protocol, not an official ConvoMem metric.  The upstream
-  `retrievedRelevantConversations` count is reported separately as a
-  conversation-level diagnostic.  Official answer accuracy is outside Track A
-  unless an answer model, prompt, category-specific judge, and their source and
-  model digests are frozen before the run.
-  Before the one permitted formal execution, a fail-closed coordinator binds
-  the candidate `READY`/raw/canonical receipts, clean code/model/source
-  identity, all arms and serializers, five isolated original builds,
-  byte-identical P5 repeat, bootstrap/gates, and pre-frozen resource limits.
-  Candidate workers receive only a label-free allowlist.  A separate custodian
-  may open labels only after ranking/resource receipts are cross-bound by a
-  release authorization; final publication is exclusive/non-replacing and an
-  exact-byte retry is the only idempotent retry.  This synthetic-tested gate is
-  explicit about P5 accounting: its primary and repeat executions each require
-  a separately digested resource receipt; the release HMAC collectively binds
-  both receipts, while the current-worker receipt binds their identical
-  artifact digest and exactly two P5 executions.
-  `benchmarks.aerp7_convomem_executor` now proves the public coordinator, four
-  isolated current-arm processes, five original-worker processes, label-free
-  candidate copy, a closed environment allowlist, HMAC-and-nonce operator
-  authorization, and exclusive publication using synthetic fixtures.  All nine
-  worker outputs are built and validated inside a sibling staging generation;
-  worker, validation, or publish failure verifies the staging root identity,
-  removes that unpublished generation, and leaves the final path absent, while success uses a platform
-  no-replace atomic directory move.  A failed consumed authorization requires a
-  newly signed authorization, so two worker populations can never be mixed.  The
-  exact original-product route is separately wired to the unchanged public
-  `upsert -> reset/close -> cold reopen -> search` lifecycle: each worker emits
-  only a canonical, digest-bound, non-publishable draft and leaves its palace in
-  place; only the coordinator's independent physical-index re-audit can produce
-  a publishable replicate.  Native internal embedding calls are not observable
-  behind the upstream cached callable, so the resource evidence truthfully uses
-  a cross-checked public upsert/search request ledger and preserves that
-  limitation out of band.  The custodian authorization binds packet/file/output,
-  nonce and expiry; a successful replay authenticates the existing result and
-  never opens custody or scores again.
-  The executor deliberately retains `FORMAL_EXECUTION_ENABLED = False` and
-  `FORMAL_CURRENT_EXECUTION_ENABLED = False`: it does not read, enumerate, or
-  hash ConvoMem, and no formal run may flip either constant without a fresh
-  review.  The synthetic resource shape uses a test-only encoder and cannot be
-  reported as a resource result.  Formal use still requires exact current-arm
-  phase measurements, an OS-enforced worker capability boundary, and a Windows
-  durable parent-directory publication primitive.  A blank cwd and environment
-  allowlist are defense in depth, not that OS boundary; the same boundary is
-  required before path-based recursive staging cleanup can be treated as safe
-  against an actively hostile same-user process.
-  The next pre-formal execution-evidence checkpoint tightens those remaining
-  claims without changing either formal switch.  Current-arm ranking now emits
-  an out-of-artifact sidecar containing one wall-clock and process-CPU
-  measurement per exact projection item/query pair.  Resource receipts replay
-  those rows and bind their order, hashes, call/text counts, storage semantics,
-  model identity, provider, artifact, and percentile summaries.  Four current
-  executions (`strong_raw`, P5 primary, P5 repeat, and Six-View) each emit an
-  execution receipt bound to the protocol, projection, canonical worker config,
-  method input, code/model before-and-after observations, provider, process,
-  artifact file, resource receipt, and supervisor.  P5 still requires two
-  distinct process IDs and byte-identical canonical ranking artifacts.
+MemBench is the second confirmation dataset. Its four formal source roles are
+`participation_reflective`, `participation_factual`,
+`observation_reflective`, and `observation_factual`. The leakage unit is the
+HMAC of `(source_role, tid)`; a repeated `tid` across profiles is pooled, while
+the same `tid` across source roles is not pooled. `target_step_id`, choices,
+ground truth, raw `tid`, profile, and
+source locator remain custody-only. More than ten gold targets retain their
+actual denominator.
 
-  Synthetic recovery evidence is now structurally incapable of masquerading as
-  a formal release.  It uses a separately signed rehearsal-release schema and a
-  separate open/audit path; the formal release validator has no synthetic opt-in.
-  Likewise, the synthetic isolation canary records only a plan-level rehearsal
-  (`live_evidence = false`), while its separate rehearsal attestation records
-  `formal_eligible = false`.  A later isolated-rehearsal runner now enforces the
-  fixed create/inspect/start/READY/canary/RELEASE/wait/cleanup sequence against
-  an injectable Docker backend.  Its pre-release gate binds the exact container,
-  pinned image/config identities, created and running inspect evidence, fixed
-  denial probe, absent early output, and launch config before an exclusive
-  RELEASE can be written.  This receipt is still explicitly non-formal.
-  The isolation plan itself freezes an image repository digest and config image
-  ID, non-root identity, read-only root filesystem, no network, no-new-privileges,
-  dropped capabilities, resource limits, role-specific command identity, and
-  least-privilege mounts, then cross-checks those claims against normalized raw
-  Docker inspect output.
+For every dataset, ranking receives only opaque item/group IDs, query text,
+candidate text, and pre-frozen candidate-safe metadata. Labels attach only
+after public artifact/READY/release validation. Prediction and label payloads
+have separate digests and join only through opaque custody crosswalks. Any
+candidate-visible answer, label, source locator, raw identifier, category, or
+gold-derived feature invalidates the run.
 
-  The next synthetic-only checkpoint now freezes a deterministic nine-worker
-  manifest: four current roles and five original builds have one closed role
-  mapping, common image/runtime limits, role-private config/output roots, and
-  sibling/private/staging mount denials.  Its host output observer requires an
-  empty directory before release and exactly one nonempty, non-symlink,
-  single-link `RELEASE` plus `packet.json` after exit, with repeated file and
-  directory identity checks.  This plans and validates the capability layout;
-  it still neither writes launch configs nor invokes Docker, and it cannot
-  defend against an actively malicious same-user host process.  Before a live
-  rehearsal, a separate exclusive writer/observer must still prove every role
-  config and writable palace/output directory was freshly materialized with
-  exactly the intended contents; the planner only validates directory identity
-  and topology.
+## Retrieval endpoints and gates
 
-  This checkpoint is not a ConvoMem result.  The public MiniLM model has passed
-  a direct native-adapter smoke check without changing its model-file tree, but
-  the formal current workers are not yet wired through the live isolated runner.
-  The pinned original public product now records exact item/query-bound wall and
-  process-CPU deltas around only the unchanged public search call, together with
-  the stdlib clock receipt.  Formal execution rejects injected clocks and states
-  explicitly that process CPU excludes descendants.  The current external
-  supervisor supplies sampled process-tree RSS and records any descendants it
-  observes, but its polling is explicitly non-exhaustive and cannot prove that a
-  short-lived descendant never existed.  It is therefore rehearsal evidence
-  only.  The current interim finalizer remains closed unless supplied with
-  OS-enforced complete process-group evidence and zero descendants, but the
-  selected formal design replaces that temporary restriction with the same
-  descendant-inclusive cgroup-v2 accounting for current and original workers.
-  A synthetic-tested meter now binds each query to cgroup identity and before/
-  after `cpu.stat` snapshots, so cumulative CPU includes exited children.  It
-  records query-boundary `memory.current` values and a container-lifetime
-  `memory.peak`, both explicitly as cgroup charged memory rather than RSS; exact
-  per-query peak memory is unavailable in the one-container/many-query topology.
-  Its formal factory remains disabled, and the meter is not yet wired into the
-  worker image or READY/packet identity chain.  That formal telemetry gate and
-  the pinned live original smoke remain open.
-  The local Docker daemon, fixed worker image/helpers, and real container denial
-  probe have also not yet passed a live run.
-  Therefore formal ConvoMem data remains unopened, unenumerated, and unhashed
-  until those live gates pass and a fresh review authorizes the one-shot run.
-- MemBench is the second retrieval confirmation dataset.  Split by `tid` because
-  a `tid` recurs across task files.  `target_step_id`, answers, choices, and
-  ground truth belong only to the label custodian.  Items with more than ten
-  evidence targets retain their real denominator.
-- LongMemEval-V2 has no public answer-bearing evidence annotations.  It is an
-  end-to-end QA/latency/LAFS external-validity dataset, not an official R@10
-  confirmation dataset.
-- LoCoMo-Plus reuses the burned LoCoMo corpus.  It is a secondary cognitive-cue
-  or story-memory diagnostic, not an independent confirmation dataset.
+Report question-macro and leakage-unit macro exact-evidence Recall@10; NDCG@10,
+MRR@10, evidence micro recall, and declared slices are secondary endpoints.
+Intervals use paired bootstrap at the dataset leakage unit. For ConvoMem,
+`changing_evidence + implicit_connection_evidence` is a declared derived hard
+positive slice, not an upstream official hard category. Its abstention endpoint
+is threshold-free confidence separability unless a separate source-disjoint
+calibration and decision rule are frozen.
 
-### Information-flow protocol
+Each untouched confirmation dataset must pass separately against the exact
+pinned original public product: overall P5-minus-original point improvement at
+least `0.01` and 95% paired-bootstrap lower bound greater than zero; hard-slice
+point nonnegative and lower bound at least `-0.01`; all integrity,
+authorization, physical-audit, and failure/retry guardrails. MemBench reports
+the four cross roles plus factual/reflective and participation/observation
+aggregates, and reports `0-10k` and `100k` profile slices as predeclared
+secondary results. Its primary point is P5 versus the five-original mean; each
+bootstrap draw samples five complete original builds with replacement and applies
+the same sampled build multiset to every row. It has no official
+adversarial or abstention endpoint, so both are N/A rather than fabricated
+gates.
 
-For every dataset, the candidate producer receives only opaque item/group IDs,
-query text, candidate text, and explicitly frozen candidate-safe source metadata
-needed by the retrieval adapter, such as ConvoMem speaker and opaque chronology.
-The label custodian receives the frozen ranking digest and then attaches exact
-evidence IDs.  Prediction and label payloads have separate digests and are joined
-only by an opaque crosswalk.  Any plaintext answer, evidence label, category,
-split label, source locator, raw conversation ID, or gold-derived feature
-observed by a candidate producer invalidates the run.
+No pooled statistic may rescue a dataset that fails. Static Six-View is a
+separate secondary arm. Original-product confidence or confidence-margin claims
+must not be invented where the original method has no comparable confidence.
 
-Splits are group-disjoint and digest-bound.  Confirmation is executed exactly
-once after the static P5 method commit, model files, corpus unit, TopK,
-tie-break, resource thresholds, and code/input digests are frozen.  No pooled
-statistic may rescue a dataset that fails separately.
+## AERP-5 public-product engineering amendment
 
-### Retrieval endpoints
+The burned AERP-5 v2 LoCoMo result remains non-blind engineering evidence. The
+original adapter repair namespaces physical IDs by conversation, asserts the
+full collection, cold-reopens before querying, and maps returned physical IDs
+back to local IDs. Five fresh cold-reopen original builds represent index-build
+variation; current P5 and Six-View use byte-identical repeats. Labels remain
+sealed until the label-free receipts, original physical audit, and release
+binding pass.
 
-Report question-macro and group/conversation-macro exact evidence Recall@10.
-Also report hard, adversarial or abstention, per-category, NDCG@10, and evidence
-micro recall as secondary endpoints.  Confidence intervals use paired bootstrap
-resampling at the dataset's leakage unit: conversation, persona, or `tid`.
-For ConvoMem, `changing_evidence + implicit_connection_evidence` is a declared
-derived hard-positive slice, not an upstream hard category; the dataset has no
-official adversarial retrieval endpoint.  Its abstention endpoint reports only
-threshold-free confidence separability for arms sharing the frozen normalized
-top-margin contract.  The original MemPalace public-product arm has no comparable
-confidence and is excluded from that secondary comparison with an explicit
-reason.
+Its historical result must not be relabelled as a confirmation result or used to
+choose a new method. The AERP-4 train/dev work is closed to tuning. The exact
+original public-product identity is the public lifecycle, not the original
+repository's direct benchmark candidate.
 
-The public, non-blind AERP-5 v2 product gate requires all of:
+## Resource and systems reporting
 
-- static P5 is compared through the current product seam against the exact
-  pinned original public-product seam;
-- paired conversation-bootstrap 95% confidence-interval lower bounds for both
-  question-macro and conversation-macro Recall@10 are greater than zero;
-- hard Categories 1/2, adversarial Category 5, and every category are reported
-  separately even when they are not part of the primary GO rule;
-- authorization, trace replay, exact-span, performance, and failure-injection
-  guardrails pass.
+Every report binds code head/tree/diff state, data and projection digests,
+model files and semantics, TopK, candidate depth, tie break, hardware, runtime,
+and output digests. When available, report ingest/index time, query latency,
+embedding calls/text counts, storage bytes, and memory under a matched contract.
+Unsupported measurements are unavailable, never guessed.
 
-### AERP-5 v2 original-product identity amendment
-
-The label-free failure receipt `d90b622e91b27511d69ca3d9fb77214907d7d3e1aa3774a103b3ff1a4a58b2cf`
-superseded an initial HNSW-only explanation.  The original LoCoMo adapter had
-written ten conversations' locally restarted `dialog_...` IDs into one Chroma
-collection, so later upserts overwrote earlier physical records.  The amended
-protocol namespaces physical IDs by conversation, asserts the full 5,882-record
-collection, cold-reopens it before querying, and maps every returned physical ID
-back to its local dialog ID before custody/scoring.  Labels remain sealed.
-
-The original public batch-upsert seam still has observed index-build variation
-after that repair.  It is therefore measured as five fresh cold-reopen batch
-replicates; each current arm remains two byte-identical repeats.  The primary
-original value is the per-query arithmetic mean over those five replicates, and
-P5-vs-original CIs use a deterministic hierarchical bootstrap over conversation
-clusters and original index-build replicates (seed 20260822; 5,000 resamples).
-Every original replicate and its overall, hard Categories 1/2, Category 5, and
-per-category variability are reported separately.  This is a public non-blind
-engineering amendment, never a confirmation claim.
-
-All three AERP-5 v2 arms use a matched lifecycle: ingest all ten conversations,
-close and cold-reopen their backend, then query all 1,982 items.  Current-arm
-latency ends on `current_product_rank` return, before benchmark trace/receipt
-construction; original-arm latency ends after the namespaced public-search
-adapter has validated and mapped the returned physical IDs.  Each original
-replicate also carries a coordinator-remeasured physical-ID, float32 embedding,
-SQLite HNSW-configuration, and four-file HNSW graph receipt before custody can
-unseal labels.
-
-Each untouched confirmation dataset independently requires all of:
-
-- versus the exact pinned original public product, overall point improvement is
-  at least 0.01 and the paired group-bootstrap 95% lower bound is greater than
-  zero; fixed Product Six-View remains a separately reported secondary arm;
-- hard-subset point change is nonnegative and its lower bound is at least -0.01;
-- adversarial/abstention change versus the strong raw control has lower bound at
-  least -0.01;
-- every safety/system guardrail passes.
-
-For ConvoMem specifically, the overall and derived hard-positive retrieval gates
-apply to the blinded message-level protocol above.  The abstention non-regression
-gate compares static P5 with the strong raw BM25+dense arm on paired
-persona-by-declared-context confidence separability; it does not compare against
-an invented confidence for the original public product.  Each context stratum
-also reports the declared target, actual conversation count, and actual message
-count rather than treating those quantities as interchangeable.
-
-### Resource-matched reporting
-
-Every arm binds exact repository HEAD/tree/diff state, dataset bytes, corpus and
-query digests, encoder files and semantics, TopK, candidate depth, tie-break,
-hardware, and runtime versions.  Report ingest/index time, query latency
-distribution, passage/query embedding calls and text counts, index/storage
-bytes, peak resident memory, and output digests.  Native-configuration and
-equal-budget tables are separate.  Unsupported measurements fail the formal
-resource gate rather than being guessed.
+Docker, cgroup-v2 accounting, and hostile same-user containment belong to an
+optional systems-security or strict-resource appendix. Host PID/RSS polling
+cannot prove short-lived-child absence; Docker Desktop PID is VM/daemon evidence
+on Windows. A future efficiency claim requires matched descendant-inclusive
+cgroup accounting for current and original workers. These restrictions do not
+block an efficacy-only Track A result with `resource_comparability=unavailable`.
 
 Graph or clustering retrieval remains blocked unless frozen cross-dataset error
-analysis identifies a candidate-recall gap that the current view pool cannot
-cover.  A fixed-fusion regression alone is not evidence for adding a graph.
+analysis shows a candidate-recall gap that the existing view pool cannot cover.
+A fixed-fusion regression alone is not that evidence.
 
 ## Track B: story generation and character memory isolation
 
-Track B starts only after a frozen Track A method exists.  It uses a fixed story
-generator, prompt, decoding configuration, context budget, and scenario seed.
-The treatment variable is the memory layer.
+Track B starts only after a frozen Track A method. It fixes the generator,
+prompt, decoding configuration, context budget, and scenario seed; the memory
+layer is the treatment. Required controlled scenario families are
+character-private secret, witnessed versus unwitnessed event, belief versus
+world truth, branch/retcon, long-horizon callback, knowledge update, and
+multi-character handoff.
 
-### Required scenario families
+Hard gates are zero forbidden-span/fact disclosure, authorization ancestry for
+every delivered span, campaign/branch/private/belief isolation, and complete
+deterministic replay. Quality endpoints include authorized-memory precision and
+recall, contradiction and retcon-leakage rates, callback success, plot/fact
+coverage, voice consistency, unsupported-memory assertions, and cost. Mechanical
+labels take precedence; open-ended quality uses blinded randomized pairwise
+judging with multiple judges, agreement reporting, and human audit.
 
-- character-private secret: one character may recall it and another must not;
-- witnessed versus unwitnessed event: knowledge follows scene participation and
-  explicit grants rather than global transcript access;
-- belief versus world truth: a character can act on a false belief without the
-  narrator treating it as fact;
-- branch and retcon: abandoned or retconned events cannot leak into the active
-  timeline;
-- long-horizon callback: an authorized detail must be used after distractors;
-- knowledge update: later evidence supersedes an earlier state without erasing
-  the historical fact that the character once believed it;
-- multi-character handoff: independently generated turns preserve distinct
-  knowledge states and voices.
+Compared with no-memory and original-MemPalace memory under the same generator,
+the frozen treatment must pass all hard gates, improve contradiction and
+authorized callback/plot success with paired lower bounds above zero, and show
+no material blinded-quality regression under a pre-frozen noninferiority margin.
 
-Controlled synthetic worlds provide exact authorization and timeline labels.
-Public cognitive/agentic datasets may add external validity, but cannot replace
-the controlled leakage tests.
+## Milestones
 
-### Story endpoints
-
-Hard gates:
-
-- forbidden-span or forbidden-fact disclosure rate is exactly zero;
-- every delivered verbatim span descends from an authorized event seed;
-- branch, campaign, character-private, belief-owner, and scope isolation pass;
-- trace completeness and deterministic replay are 100%.
-
-Quality endpoints:
-
-- authorized-memory precision and recall;
-- character-state contradiction rate;
-- active-timeline contradiction and retcon-leakage rate;
-- long-horizon callback success;
-- plot-task completion and required-fact coverage;
-- character distinctiveness/voice consistency under a blinded rubric;
-- unsupported-memory assertion rate;
-- latency, memory-context tokens, storage, and generation cost.
-
-Mechanical labels take precedence over model judges.  Open-ended quality uses
-blinded pairwise judging with randomized arm order, multiple judges, agreement
-reporting, and a human audit sample.  The judge never sees method names, traces,
-or gold policy metadata.
-
-### Story success gate
-
-Compared with both no-memory and original-MemPalace memory under the same story
-generator, the frozen AERP treatment must:
-
-- pass every hard isolation gate;
-- reduce character/timeline contradictions with a paired 95% lower bound above
-  zero for the improvement;
-- improve authorized callback or plot-task success with a paired 95% lower bound
-  above zero;
-- show no material degradation in blinded narrative quality, with a pre-frozen
-  noninferiority margin;
-- remain within the pre-frozen latency, token, memory, and storage budgets.
+Before data acquisition: Pro review freezes manifests, profile choices, source
+roles, metrics, bootstrap units, model files, code checkpoint, budgets, and
+authorization operators. During one-shot execution: preserve external artifacts
+and no-replace receipts, then do not tune. After both Track A datasets pass:
+freeze Track B and run it once. LongMemEval-V2 may then provide an external QA/
+latency/LAFS run without being relabelled as evidence R@10.
 
 ## Paper-ready definition
 
-The work is paper-ready only when the following receipts bind one immutable
-method checkpoint:
-
-1. an immutable static-P5 method freeze, strong-raw comparator, and label-blind
-   ranking receipts; any future operational abstention threshold must be frozen
-   separately from burned, source-separated engineering data;
-2. two separately passing retrieval confirmation datasets;
-3. a direct original-product comparison plus matched-encoder and equal-budget
-   comparisons;
-4. the blind-180 authorization suite, mixed-visibility product check, exact
-   trace replay, 30k-event performance gate, and durable failure/retry gates;
-5. the controlled story-generation isolation and quality experiment;
-6. one final external-validity run, such as LongMemEval-V2 official QA/latency/
-   LAFS, without relabelling it as evidence R@10;
-7. exact code, data, model, environment, resource, and output digests sufficient
-   for independent reproduction.
+Paper readiness requires one immutable method checkpoint, two separately
+passing untouched retrieval datasets, exact original-product and matched-budget
+comparisons, authorization/trace/failure-retry gates, the controlled Track B
+experiment, one external-validity QA/latency run, and reproducible code/data/
+model/environment/output receipts.
