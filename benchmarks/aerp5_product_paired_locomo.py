@@ -31,7 +31,7 @@ from mempalace_rpg import RawAnchoredP5Policy, RpgMemoryKernel, SixViewRanker
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORIGINAL_PIN = "72ccd2f3653ab902e419d15bb542c88045342b04"
+ORIGINAL_PIN = "87e6f38377b4bee0666374b05df6e14ffd154245"
 TOP_K = 10
 ORIGINAL_COLLECTION = "mempalace_drawers"
 REHEARSAL_SCOPE = "engineering_rehearsal_public_nonblind"

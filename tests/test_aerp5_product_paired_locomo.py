@@ -6,10 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks import aerp5_product_paired_locomo as runner
+from benchmarks import aerp8_membench as aerp8
 
 
 def _dialogs(count: int = 10):
     return [{"id": f"dialog-{index}", "text": f"text {index}"} for index in range(count)]
+
+
+def test_original_product_pin_matches_the_formal_primary_comparator() -> None:
+    assert runner.ORIGINAL_PIN == aerp8.ORIGINAL_COMMIT == "87e6f38377b4bee0666374b05df6e14ffd154245"
 
 
 class _Collection:
