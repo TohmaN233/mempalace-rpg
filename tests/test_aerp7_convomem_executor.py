@@ -78,6 +78,64 @@ def test_public_environment_is_an_explicit_allowlist(monkeypatch):
         executor.assert_public_command(["python", "custody.json"], env)
 
 
+def test_public_environment_validates_sqlite_tmpdir_before_propagation(tmp_path, monkeypatch):
+    monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+    assert "SQLITE_TMPDIR" not in executor._sanitized_env()
+    staging = tmp_path / "sqlite-staging"
+    staging.mkdir()
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging))
+    monkeypatch.setenv("TMPDIR", "must-not-propagate")
+    assert executor._sanitized_env()["SQLITE_TMPDIR"] == str(staging)
+    assert "TMPDIR" not in executor._sanitized_env()
+    monkeypatch.setenv("SQLITE_TMPDIR", "relative-staging")
+    with pytest.raises(CustodyError, match="sqlite_tmpdir"):
+        executor._sanitized_env()
+    monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path / "missing-staging"))
+    with pytest.raises(CustodyError, match="sqlite_tmpdir"):
+        executor._sanitized_env()
+
+
+def test_run_subprocess_propagates_sqlite_tmpdir_to_real_current_worker(tmp_path, monkeypatch):
+    """The isolated child receives only the validated SQLite staging capability."""
+    config, _unused_output = _coordinator_inputs(tmp_path, monkeypatch)
+    protocol = executor._load(Path(config["protocol_path"]))
+    worker_path = tmp_path / "worker-config.json"
+    worker_path.write_bytes(executor._bytes(executor.formal.canonical_candidate_worker_config(protocol)))
+    staging = tmp_path / "sqlite-staging"
+    staging.mkdir()
+    child_staging = tmp_path / "child-staging"
+    child_staging.mkdir()
+    (child_staging / "staging").mkdir()
+    output = child_staging / "current-worker.json"
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging))
+    child_config = {
+        "schema": executor.SCHEMA,
+        "synthetic_test_mode": True,
+        "protocol_path": config["protocol_path"],
+        "candidate_bundle": config["candidate_bundle"],
+        "worker_config": str(worker_path),
+        "output_path": str(output),
+        "staging_parent": str(child_staging),
+        "execution_role": "raw",
+    }
+    real_popen = executor.subprocess.Popen
+    captured: dict[str, dict[str, str]] = {}
+
+    def recording_popen(*args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(executor.subprocess, "Popen", recording_popen)
+    supervisor = executor._run_subprocess(
+        [sys.executable, "-m", "benchmarks.aerp7_convomem_executor", "--current-worker-stdin"],
+        config=child_config,
+        output=output,
+    )
+    assert captured["env"]["SQLITE_TMPDIR"] == str(staging.resolve())
+    assert set(captured["env"]) == set(executor._sanitized_env())
+    assert executor._load(output)["process_id"] == supervisor["pid"]
+
+
 def test_authorization_requires_live_hmac_expiry_and_single_consume(tmp_path, monkeypatch):
     receipt = {"head": "a" * 64, "tree": "b" * 64, "diff_digest": "c" * 64, "dirty_policy": "clean_required"}
     protocol = {"protocol_sha256": "d" * 64}; output = tmp_path / "out"; secret = b"x" * 32

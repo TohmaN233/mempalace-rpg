@@ -513,6 +513,18 @@ def _sanitized_env() -> dict[str, str]:
     for key in ("SystemRoot", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP"):
         value = os.environ.get(key)
         if value: retained[key] = value
+    sqlite_tmpdir = os.environ.get("SQLITE_TMPDIR")
+    if sqlite_tmpdir is not None:
+        if not sqlite_tmpdir or "\x00" in sqlite_tmpdir:
+            raise CustodyError("executor_sqlite_tmpdir_invalid")
+        try:
+            sqlite_staging = Path(sqlite_tmpdir)
+            resolved_sqlite_staging = sqlite_staging.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise CustodyError("executor_sqlite_tmpdir_invalid") from exc
+        if not sqlite_staging.is_absolute() or not resolved_sqlite_staging.is_dir():
+            raise CustodyError("executor_sqlite_tmpdir_invalid")
+        retained["SQLITE_TMPDIR"] = str(resolved_sqlite_staging)
     retained["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     retained["AERP7_EXECUTOR_PUBLIC_ROLE"] = "1"
     return retained
@@ -531,7 +543,7 @@ def assert_public_command(command: Sequence[str], env: Mapping[str, str], *, exp
         or command[3] not in _PUBLIC_ROLE_FLAGS
     ):
         raise CustodyError("executor_public_command_invalid")
-    allowed = {"SystemRoot", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "PYTHONPATH", "AERP7_EXECUTOR_PUBLIC_ROLE"}
+    allowed = {"SystemRoot", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "SQLITE_TMPDIR", "PYTHONPATH", "AERP7_EXECUTOR_PUBLIC_ROLE"}
     if set(env) - allowed or env.get("AERP7_EXECUTOR_PUBLIC_ROLE") != "1" or not env.get("PYTHONPATH"):
         raise CustodyError("executor_public_environment_invalid")
 
