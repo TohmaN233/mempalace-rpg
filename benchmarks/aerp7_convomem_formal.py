@@ -591,12 +591,13 @@ def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[st
                 summary = store.sequence_summary().get("measurements")
                 if summary != {"count": sequence["count"], "sha256": sequence.get("sha256")}:
                     raise CustodyError("formal_resource_measurement_reference_invalid")
-                query_rows = rank.CandidateProjectionCursor(reference["candidate_reference"]).iter_items()
-                measured_rows = store.iter_measurements(); ranked_rows = store.iter_rankings(); measurement_count = 0
-                for query, measured, ranked in zip(query_rows, measured_rows, ranked_rows, strict=True):
-                    if measured.get("item_id") != query.get("item_id") or ranked.get("item_id") != query.get("item_id") or measured.get("query_sha256") != rank._query_digest(query.get("query_text")) or ranked.get("query_sha256") != measured.get("query_sha256"):
-                        raise CustodyError("formal_resource_query_binding_invalid")
-                    measurement_count += 1
+                with tempfile.TemporaryDirectory(prefix=".aerp7-formal-original-items-", dir=Path(reference["candidate_reference"]["bundle_path"]).parent) as temporary:
+                    with rank.CandidateProjectionStore.open(reference["candidate_reference"], Path(temporary)) as candidates:
+                        query_rows = candidates.iter_items(); measured_rows = store.iter_measurements(); ranked_rows = store.iter_rankings(); measurement_count = 0
+                        for query, measured, ranked in zip(query_rows, measured_rows, ranked_rows, strict=True):
+                            if measured.get("item_id") != query.get("item_id") or ranked.get("item_id") != query.get("item_id") or measured.get("query_sha256") != rank._query_digest(query.get("query_text")) or ranked.get("query_sha256") != measured.get("query_sha256"):
+                                raise CustodyError("formal_resource_query_binding_invalid")
+                            measurement_count += 1
                 if measurement_count != reference["measurement_count"]:
                     raise CustodyError("formal_resource_measurement_reference_invalid")
                 # The source store is already a bounded SQLite table.  Query its

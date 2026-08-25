@@ -307,18 +307,22 @@ def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDr
                 summary = store.sequence_summary().get("measurements")
                 if not isinstance(summary, Mapping) or summary.get("count") != sequence["count"] or summary.get("sha256") != sequence.get("sha256"):
                     raise CustodyError("executor_original_resource_measurement_reference_invalid")
-                expected = rank.CandidateProjectionCursor(reference["candidate_reference"])
-                query_rows = expected.iter_items(); measured_rows = store.iter_measurements(); ranked_rows = store.iter_rankings()
-                count = 0
-                for query, measured, ranked in zip(query_rows, measured_rows, ranked_rows, strict=True):
-                    if (
-                        measured.get("item_id") != query.get("item_id")
-                        or ranked.get("item_id") != query.get("item_id")
-                        or measured.get("query_sha256") != rank._query_digest(query.get("query_text"))
-                        or ranked.get("query_sha256") != measured.get("query_sha256")
-                    ):
-                        raise CustodyError("executor_original_resource_measurement_reference_invalid")
-                    count += 1
+                # Original streaming queries use ``_stream_items``' item-id
+                # order, not the projection's selection/ordinal order.  Open a
+                # bounded candidate SQLite cursor to reproduce that order.
+                with tempfile.TemporaryDirectory(prefix=".aerp7-original-resource-items-", dir=Path(reference["candidate_reference"]["bundle_path"]).parent) as temporary:
+                    with rank.CandidateProjectionStore.open(reference["candidate_reference"], Path(temporary)) as candidates:
+                        query_rows = candidates.iter_items(); measured_rows = store.iter_measurements(); ranked_rows = store.iter_rankings()
+                        count = 0
+                        for query, measured, ranked in zip(query_rows, measured_rows, ranked_rows, strict=True):
+                            if (
+                                measured.get("item_id") != query.get("item_id")
+                                or ranked.get("item_id") != query.get("item_id")
+                                or measured.get("query_sha256") != rank._query_digest(query.get("query_text"))
+                                or ranked.get("query_sha256") != measured.get("query_sha256")
+                            ):
+                                raise CustodyError("executor_original_resource_measurement_reference_invalid")
+                            count += 1
                 if count != int(denominators["query_count"]):
                     raise CustodyError("executor_original_resource_measurement_reference_invalid")
                 def percentile(column: str, fraction: float) -> int:
