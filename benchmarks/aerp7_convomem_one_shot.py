@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import shutil
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -33,6 +34,14 @@ _CAPACITY_SUPERVISORS = frozenset({
     *(f"current-{role}" for role in _CAPACITY_CURRENT_ROLES),
     *(f"original-{number}" for number in range(5)),
 })
+FORMAL_STORAGE_ROOT_ENV = "AERP7_FORMAL_STORAGE_ROOT"
+_FORMAL_STORAGE_PATH_KEYS = (
+    "canonical_root", "premix_root", "candidate_output_dir", "custody_output_dir",
+    "staging_root", "output_dir", "protocol_path", "authorization_path",
+    "custodian_public_config_path", "final_output_path", "one_shot_receipt_path",
+    "infrastructure_failure_receipt_path", "progress_receipt_path",
+)
+_FORMAL_TEMP_ENV_NAMES = ("TMPDIR", "TEMP", "TMP")
 
 
 def _bytes(value: Any) -> bytes:
@@ -41,6 +50,119 @@ def _bytes(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_bytes(value)).hexdigest()
+
+
+def _formal_storage_root() -> tuple[Path, int]:
+    value = os.environ.get(FORMAL_STORAGE_ROOT_ENV)
+    if not isinstance(value, str) or not value:
+        raise CustodyError("aerp7_one_shot_storage_root_env_missing", env=FORMAL_STORAGE_ROOT_ENV)
+    raw = Path(value)
+    if not raw.is_absolute():
+        raise CustodyError("aerp7_one_shot_storage_root_env_not_absolute", env=FORMAL_STORAGE_ROOT_ENV)
+    try:
+        root = raw.resolve(strict=True)
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_storage_root_missing", env=FORMAL_STORAGE_ROOT_ENV) from exc
+    if not root.is_dir():
+        raise CustodyError("aerp7_one_shot_storage_root_not_directory", env=FORMAL_STORAGE_ROOT_ENV)
+    try:
+        device = root.stat().st_dev
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_storage_root_stat_failed", env=FORMAL_STORAGE_ROOT_ENV) from exc
+    return root, device
+
+
+def _resolve_formal_storage_path(*, key: str, value: Any, root: Path, root_device: int) -> Path:
+    if not isinstance(value, str) or not value:
+        raise CustodyError("aerp7_one_shot_storage_plan_path_invalid", path_key=key)
+    raw = Path(value)
+    if not raw.is_absolute():
+        raise CustodyError("aerp7_one_shot_storage_plan_path_not_absolute", path_key=key)
+    try:
+        resolved = raw.resolve(strict=False)
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_storage_plan_path_resolve_failed", path_key=key) from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise CustodyError("aerp7_one_shot_storage_path_outside_root", path_key=key) from exc
+
+    existing = raw
+    while not existing.exists() and not existing.is_symlink():
+        parent = existing.parent
+        if parent == existing:
+            raise CustodyError("aerp7_one_shot_storage_path_parent_missing", path_key=key)
+        existing = parent
+    try:
+        existing_resolved = existing.resolve(strict=True)
+        device = existing_resolved.stat().st_dev
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_storage_path_parent_unavailable", path_key=key) from exc
+    if device != root_device:
+        raise CustodyError("aerp7_one_shot_storage_path_cross_device", path_key=key)
+    return resolved
+
+
+def _resolve_formal_temp_dir(*, env_name: str, value: Any, root: Path, root_device: int) -> Path:
+    if not isinstance(value, str) or not value:
+        raise CustodyError("aerp7_one_shot_temp_env_missing", env=env_name)
+    raw = Path(value)
+    if not raw.is_absolute():
+        raise CustodyError("aerp7_one_shot_temp_env_not_absolute", env=env_name)
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_temp_env_missing_directory", env=env_name) from exc
+    if not resolved.is_dir():
+        raise CustodyError("aerp7_one_shot_temp_env_not_directory", env=env_name)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise CustodyError("aerp7_one_shot_temp_env_outside_root", env=env_name) from exc
+    try:
+        device = resolved.stat().st_dev
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_temp_env_stat_failed", env=env_name) from exc
+    if device != root_device:
+        raise CustodyError("aerp7_one_shot_temp_env_cross_device", env=env_name)
+    return resolved
+
+
+def _validate_formal_storage_residency(plan: Mapping[str, Any]) -> None:
+    """Reject any formal run whose writable or temporary paths can hit another disk."""
+    root, root_device = _formal_storage_root()
+    resolved = {
+        key: _resolve_formal_storage_path(key=key, value=plan[key], root=root, root_device=root_device)
+        for key in _FORMAL_STORAGE_PATH_KEYS
+    }
+    staging_root = resolved["staging_root"]
+    sqlite_value = os.environ.get("SQLITE_TMPDIR")
+    if not isinstance(sqlite_value, str) or not sqlite_value:
+        raise CustodyError("aerp7_one_shot_sqlite_tmpdir_missing", env="SQLITE_TMPDIR")
+    sqlite_path = Path(sqlite_value)
+    if not sqlite_path.is_absolute():
+        raise CustodyError("aerp7_one_shot_sqlite_tmpdir_not_absolute", env="SQLITE_TMPDIR")
+    try:
+        sqlite_root = sqlite_path.resolve(strict=True)
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_sqlite_tmpdir_missing_directory", env="SQLITE_TMPDIR") from exc
+    if sqlite_root != staging_root:
+        raise CustodyError("aerp7_one_shot_sqlite_tmpdir_mismatch", env="SQLITE_TMPDIR")
+    if not sqlite_root.is_dir() or sqlite_root.stat().st_dev != root_device:
+        raise CustodyError("aerp7_one_shot_sqlite_tmpdir_invalid", env="SQLITE_TMPDIR")
+
+    for env_name in _FORMAL_TEMP_ENV_NAMES:
+        _resolve_formal_temp_dir(env_name=env_name, value=os.environ.get(env_name), root=root, root_device=root_device)
+    try:
+        process_temp = Path(tempfile.gettempdir()).resolve(strict=True)
+    except OSError as exc:
+        raise CustodyError("aerp7_one_shot_tempfile_gettempdir_invalid") from exc
+    try:
+        process_temp.relative_to(root)
+    except ValueError as exc:
+        raise CustodyError("aerp7_one_shot_tempfile_gettempdir_outside_root") from exc
+    if not process_temp.is_dir() or process_temp.stat().st_dev != root_device:
+        raise CustodyError("aerp7_one_shot_tempfile_gettempdir_invalid")
 
 
 def _file_sha256(path: Path) -> str:
@@ -668,6 +790,7 @@ def _run_execution(*, plan: Mapping[str, Any], operator_capability: bytes, priva
 def run_one_shot(*, signed_plan: Mapping[str, Any], operator_capability: bytes, private_capabilities: Mapping[str, Any], model_receipt: Mapping[str, Any], repo_root: Path) -> dict[str, Any]:
     """Run all public and custody stages once; private capabilities use stdin only."""
     plan = authoring.validate_one_shot_plan(signed_plan, operator_capability=operator_capability); private = _private(private_capabilities)
+    _validate_formal_storage_residency(plan)
     require_formal_durability()
     if dict(model_receipt) != plan["model_receipt"]: raise CustodyError("aerp7_one_shot_model_preparse_binding_invalid")
     _require_new_formal_targets(plan=plan)

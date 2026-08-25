@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -10,6 +12,17 @@ from benchmarks import aerp_execution_checkpoint as checkpoint
 from benchmarks import aerp7_custodian_executor as custodian
 from benchmarks import aerp7_convomem_executor as executor
 from benchmarks.aerp7_convomem_confirmation import CustodyError
+
+
+@pytest.fixture(autouse=True)
+def _formal_storage_environment(monkeypatch, tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setenv(one.FORMAL_STORAGE_ROOT_ENV, str(tmp_path.resolve()))
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging.resolve()))
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(tmp_path.resolve()))
+    monkeypatch.setattr(tempfile, "tempdir", None)
 
 
 def _disk_calibration(model_receipt):
@@ -37,8 +50,63 @@ def _plan(tmp_path: Path, secret: bytes):
     row = {"schema": authoring.PLAN_SCHEMA, **{key: str((tmp_path / value).resolve()) for key, value in names.items()}, "custodian_nonce": "n" * 32, "public_authorization_nonce": "u" * 32, "custodian_expires_at_unix": 2_000_000_000}
     row.update({"source_manifest": authoring.CENSUS_SOURCE_MANIFEST, "census_semantics": authoring.CENSUS_SEMANTICS, "preparse_current_code_receipt": {"head": "1" * 64, "tree": "2" * 64, "diff_digest": "3" * 64, "dirty_policy": "clean_required"}, "model_receipt": {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": "a" * 64, "bytes": 1}]}})
     row["disk_preflight_calibration"] = _disk_calibration(row["model_receipt"])
-    Path(row["staging_root"]).mkdir()
+    Path(row["staging_root"]).mkdir(exist_ok=True)
+    os.environ["SQLITE_TMPDIR"] = str(Path(row["staging_root"]).resolve())
     return authoring.sign_one_shot_plan(row, operator_capability=secret)
+
+
+def _resign(plan, secret: bytes, **changes):
+    unsigned = {key: value for key, value in plan.items() if key not in {"plan_sha256", "plan_hmac"}}
+    unsigned.update(changes)
+    return authoring.sign_one_shot_plan(unsigned, operator_capability=secret)
+
+
+def test_formal_storage_residency_guard_accepts_same_root_and_exact_sqlite_staging(tmp_path):
+    plan = _plan(tmp_path, b"o" * 32)
+    assert one._validate_formal_storage_residency(plan) is None
+
+
+def test_formal_storage_residency_guard_rejects_root_path_before_any_write(tmp_path, monkeypatch):
+    secret = b"o" * 32
+    plan = _plan(tmp_path, secret)
+    outside = Path(tmp_path.anchor) / "aerp7-storage-escape"
+    plan = _resign(plan, secret, protocol_path=str(outside / "protocol.json"))
+    monkeypatch.setattr(one, "require_formal_durability", lambda: pytest.fail("guard must precede durability"))
+    monkeypatch.setattr(one, "_publish_progress", lambda **_kwargs: pytest.fail("guard must precede progress"))
+    with pytest.raises(CustodyError, match="storage_path_outside_root"):
+        one.run_one_shot(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=plan["model_receipt"], repo_root=tmp_path)
+    assert not Path(plan["protocol_path"]).exists()
+    assert not Path(plan["progress_receipt_path"]).exists()
+
+
+def test_formal_storage_residency_guard_rejects_missing_temp_env_before_any_write(tmp_path, monkeypatch):
+    secret = b"o" * 32
+    plan = _plan(tmp_path, secret)
+    monkeypatch.delenv("TMPDIR")
+    monkeypatch.setattr(one, "require_formal_durability", lambda: pytest.fail("guard must precede durability"))
+    with pytest.raises(CustodyError, match="temp_env_missing"):
+        one.run_one_shot(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=plan["model_receipt"], repo_root=tmp_path)
+    assert not Path(plan["progress_receipt_path"]).exists()
+
+
+def test_formal_storage_residency_guard_rejects_wrong_disk_temp_env(tmp_path, monkeypatch):
+    secret = b"o" * 32
+    plan = _plan(tmp_path, secret)
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside.mkdir()
+    monkeypatch.setenv("TMP", str(outside.resolve()))
+    with pytest.raises(CustodyError, match="temp_env_outside_root"):
+        one.run_one_shot(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=plan["model_receipt"], repo_root=tmp_path)
+    assert not Path(plan["progress_receipt_path"]).exists()
+
+
+def test_formal_storage_residency_guard_rejects_sqlite_tmpdir_mismatch(tmp_path, monkeypatch):
+    secret = b"o" * 32
+    plan = _plan(tmp_path, secret)
+    monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path.resolve()))
+    with pytest.raises(CustodyError, match="sqlite_tmpdir_mismatch"):
+        one.run_one_shot(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=plan["model_receipt"], repo_root=tmp_path)
+    assert not Path(plan["progress_receipt_path"]).exists()
 
 
 def _private():
