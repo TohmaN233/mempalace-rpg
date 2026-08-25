@@ -352,7 +352,11 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
         draft = original_product.run_original_public_replicate_streaming(candidate_reference=candidate_receipt["candidate_reference"], build_id=str(config["build_id"]), collection_identity=f"reference-only-{number}", palace_path=palace, observer=_FormalShapedOriginalObserver(query_count=candidate_receipt["query_count"], candidate_text_count=candidate_receipt["candidate_text_count"]), seams=seams, staging_parent=Path(config["replicate_staging_parent"]))
         # Replace the injected product's palace with exactly S resident bytes.
         # A batched-five-build implementation would exceed S on build 1.
-        shutil.rmtree(palace)
+        if palace.is_symlink():
+            raise AssertionError("injected palace must not be a symlink")
+        if palace.exists():
+            assert palace.is_dir()
+            shutil.rmtree(palace)
         palace.mkdir()
         (palace / "resident.bin").write_bytes(b"p" * injected_palace_bytes)
         palace_paths.append(palace)
