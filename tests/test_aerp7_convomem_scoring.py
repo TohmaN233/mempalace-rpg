@@ -1,9 +1,13 @@
 import copy
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import threading
+import time
 import tracemalloc
+from pathlib import Path
 
 import pytest
 
@@ -95,6 +99,71 @@ def test_scoring_db_default_path_has_no_capacity_stat_proxy(monkeypatch) -> None
     with score._ScoringDB() as db:
         db.connection.execute("SELECT 1").fetchone()
         db.connection.commit()
+
+
+def test_scoring_db_uses_validated_sqlite_staging_and_rejects_invalid_paths(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+    with score._ScoringDB() as db:
+        assert db.path.parent.name.startswith("aerp7-scoring-")
+    staging = tmp_path / "run-root" / "staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging))
+    with score._ScoringDB() as db:
+        assert db.path.parent.parent == staging.resolve()
+        assert Path(db.connection.execute("PRAGMA database_list").fetchone()[2]) == db.path
+        db.connection.execute("PRAGMA temp_store=FILE")
+        db.connection.execute("CREATE TEMP TABLE temp_probe(value INTEGER)")
+        db.connection.execute("INSERT INTO temp_probe VALUES (1)")
+        assert db.connection.execute("SELECT value FROM temp_probe").fetchone() == (1,)
+    assert not list(staging.glob("aerp7-scoring-*"))
+    monkeypatch.setenv("SQLITE_TMPDIR", "relative-staging")
+    with pytest.raises(CustodyError, match="scoring_sqlite_tmpdir_invalid"):
+        score._ScoringDB()
+    monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path / "missing-staging"))
+    with pytest.raises(CustodyError, match="scoring_sqlite_tmpdir_invalid"):
+        score._ScoringDB()
+    nul_environment = dict(os.environ)
+    nul_environment["SQLITE_TMPDIR"] = "staging\x00path"
+    monkeypatch.setattr(score.os, "environ", nul_environment)
+    with pytest.raises(CustodyError, match="scoring_sqlite_tmpdir_invalid"):
+        score._ScoringDB()
+
+
+def test_legacy_ledger_validation_uses_validated_sqlite_staging_and_cleans_up(tmp_path, monkeypatch) -> None:
+    staging = tmp_path / "run-root" / "staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging))
+    first = h("legacy-ledger-first")
+    second = h("legacy-ledger-second")
+    completed: dict[str, object] = {}
+
+    def entries():
+        yield {"item_id": first, "evidence_token": second, "status": "mapped"}
+        time.sleep(0.05)
+        yield {"item_id": second, "evidence_token": first, "status": "unmatched"}
+
+    def validate() -> None:
+        try:
+            completed["count"] = score._validate_ledger_entries(entries())
+        except BaseException as exc:
+            completed["error"] = exc
+
+    worker = threading.Thread(target=validate)
+    worker.start()
+    observed_ledger_spools: set[Path] = set()
+    deadline = time.monotonic() + 5.0
+    while worker.is_alive():
+        observed_ledger_spools.update(staging.glob("aerp7-ledger-validate-*"))
+        if time.monotonic() >= deadline:
+            pytest.fail("legacy_ledger_staging_observation_timeout")
+        time.sleep(0.001)
+    worker.join()
+    if "error" in completed:
+        raise completed["error"]
+    assert completed["count"] == 2
+    assert observed_ledger_spools
+    assert all(path.parent == staging.resolve() for path in observed_ledger_spools)
+    assert not list(staging.glob("aerp7-ledger-validate-*"))
 
 
 class _CursorProjectionStore(rank.CandidateProjectionStore):

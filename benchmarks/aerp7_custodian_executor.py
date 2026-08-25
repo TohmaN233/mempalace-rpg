@@ -1000,6 +1000,18 @@ def _sanitized_env() -> dict[str, str]:
         value = os.environ.get(key)
         if value:
             retained[key] = value
+    sqlite_tmpdir = os.environ.get("SQLITE_TMPDIR")
+    if sqlite_tmpdir is not None:
+        if not sqlite_tmpdir or "\x00" in sqlite_tmpdir:
+            raise CustodyError("custodian_sqlite_tmpdir_invalid")
+        try:
+            sqlite_staging = Path(sqlite_tmpdir)
+            resolved_sqlite_staging = sqlite_staging.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise CustodyError("custodian_sqlite_tmpdir_invalid") from exc
+        if not sqlite_staging.is_absolute() or not resolved_sqlite_staging.is_dir():
+            raise CustodyError("custodian_sqlite_tmpdir_invalid")
+        retained["SQLITE_TMPDIR"] = str(resolved_sqlite_staging)
     retained["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     retained["AERP7_CUSTODIAN_PUBLIC_ROLE"] = "1"
     return retained

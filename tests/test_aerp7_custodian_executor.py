@@ -12,6 +12,7 @@ import os
 import runpy
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -269,6 +270,91 @@ def test_real_synthetic_bundle_scores_in_a_distinct_subprocess_and_is_idempotent
     assert retry["exit_code"] == 0, retry["stderr"].decode("utf-8", "replace")
     assert output.read_bytes() == initial
     assert not list(output.parent.glob(".custodian-packet.json.tmp-*"))
+
+
+def test_custodian_environment_validates_sqlite_tmpdir_before_propagation(tmp_path, monkeypatch):
+    monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+    assert "SQLITE_TMPDIR" not in custodian._sanitized_env()
+    staging = tmp_path / "run-root" / "staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging))
+    monkeypatch.setenv("TMPDIR", "must-not-propagate")
+    env = custodian._sanitized_env()
+    assert env["SQLITE_TMPDIR"] == str(staging.resolve())
+    assert "TMPDIR" not in env
+    monkeypatch.setenv("SQLITE_TMPDIR", "relative-staging")
+    with pytest.raises(CustodyError, match="custodian_sqlite_tmpdir_invalid"):
+        custodian._sanitized_env()
+    monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path / "missing-staging"))
+    with pytest.raises(CustodyError, match="custodian_sqlite_tmpdir_invalid"):
+        custodian._sanitized_env()
+    nul_environment = dict(os.environ)
+    nul_environment["SQLITE_TMPDIR"] = "staging\x00path"
+    monkeypatch.setattr(custodian.os, "environ", nul_environment)
+    with pytest.raises(CustodyError, match="custodian_sqlite_tmpdir_invalid"):
+        custodian._sanitized_env()
+
+
+def test_custodian_real_subprocess_propagates_sqlite_staging_to_scoring(tmp_path, monkeypatch):
+    """The real custody-open/scoring child receives the exact staging directory."""
+    config, config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
+    staging = tmp_path / "run-root" / "staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging))
+    real_popen = custodian.subprocess.Popen
+    captured: dict[str, object] = {}
+
+    def recording_popen(*args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        process = real_popen(*args, **kwargs)
+        captured["process"] = process
+        return process
+
+    monkeypatch.setattr(custodian.subprocess, "Popen", recording_popen)
+    completed: dict[str, object] = {}
+
+    def launch() -> None:
+        try:
+            completed["result"] = custodian.launch_custodian(
+                public_config_path=config_path, private_payload=private,
+            )
+        except BaseException as exc:
+            completed["error"] = exc
+
+    worker = threading.Thread(target=launch)
+    worker.start()
+    observed_scoring_spools: set[Path] = set()
+    deadline = time.monotonic() + 60.0
+    while worker.is_alive():
+        observed_scoring_spools.update(staging.glob("aerp7-scoring-*"))
+        if time.monotonic() >= deadline:
+            process = captured.get("process")
+            if isinstance(process, real_popen):
+                process.kill()
+            worker.join(timeout=10.0)
+            if worker.is_alive():
+                pytest.fail("custodian_subprocess_poll_teardown_timeout")
+            pytest.fail("custodian_subprocess_poll_timeout")
+        time.sleep(0.001)
+    worker.join()
+    if "error" in completed:
+        raise completed["error"]
+    launched = completed["result"]
+    assert isinstance(launched, dict)
+    assert launched["exit_code"] == 0, launched["stderr"].decode("utf-8", "replace")
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["SQLITE_TMPDIR"] == str(staging.resolve())
+    assert set(environment) == set(custodian._sanitized_env())
+    assert Path(config["output_path"]).is_file()
+    # This is a real child-process observation: _ScoringDB's named temporary
+    # directory was visible under the exact Popen-propagated staging root while
+    # its full custody-open/scoring run was active.
+    assert observed_scoring_spools
+    assert all(path.parent == staging.resolve() for path in observed_scoring_spools)
+    # The child then cleaned its named spool rather than leaving an untracked
+    # SQLite database in the staging capability.
+    assert not list(staging.glob("aerp7-scoring-*"))
 
 
 def test_observerless_custodian_launcher_does_not_construct_capacity_supervisor(tmp_path, monkeypatch):

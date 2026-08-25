@@ -53,6 +53,29 @@ def normalize_v1(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
+def _sqlite_temp_parent() -> Path | None:
+    """Return the inherited, launcher-validated SQLite staging directory.
+
+    The custodian launcher treats this variable as the explicit SQLite staging
+    capability.  Revalidate here as well because the scorer can be invoked
+    directly in focused tests and must never silently fall back to a relative
+    or vanished directory.
+    """
+    sqlite_tmpdir = os.environ.get("SQLITE_TMPDIR")
+    if sqlite_tmpdir is None:
+        return None
+    if not sqlite_tmpdir or "\x00" in sqlite_tmpdir:
+        raise CustodyError("scoring_sqlite_tmpdir_invalid")
+    try:
+        path = Path(sqlite_tmpdir)
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CustodyError("scoring_sqlite_tmpdir_invalid") from exc
+    if not path.is_absolute() or not resolved.is_dir():
+        raise CustodyError("scoring_sqlite_tmpdir_invalid")
+    return resolved
+
+
 def _d(value: Any) -> str: return canonical_sha256(value)
 
 
@@ -312,7 +335,7 @@ class _ScoringDB:
     """Ephemeral disk spool for custody rows, confidence pairs and ledgers."""
 
     def __init__(self, *, observe_capacity: bool = False) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="aerp7-scoring-")
+        self._tmp = tempfile.TemporaryDirectory(prefix="aerp7-scoring-", dir=_sqlite_temp_parent())
         self.path = Path(self._tmp.name) / "score.sqlite3"
         self._observe_capacity = observe_capacity
         self._peak_footprint_bytes = 0
@@ -563,7 +586,7 @@ def _validate_ledger_entry(value: Any) -> dict[str, Any]:
 
 def _validate_ledger_entries(entries: Iterable[Any]) -> int:
     """Validate legacy rows through a disk-backed uniqueness index."""
-    temporary = tempfile.TemporaryDirectory(prefix="aerp7-ledger-validate-")
+    temporary = tempfile.TemporaryDirectory(prefix="aerp7-ledger-validate-", dir=_sqlite_temp_parent())
     connection = sqlite3.connect(Path(temporary.name) / "seen.sqlite3")
     try:
         connection.execute("CREATE TABLE seen(item_id TEXT NOT NULL, evidence_token TEXT NOT NULL, PRIMARY KEY(item_id, evidence_token))")
