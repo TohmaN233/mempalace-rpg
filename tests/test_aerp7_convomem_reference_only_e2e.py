@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import runpy
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -236,7 +237,8 @@ class _FormalShapedOriginalObserver:
         }
 
 
-def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_ext4(tmp_path, monkeypatch):
+@pytest.mark.parametrize("injected_failure", [None, "reference_fsync", "palace_cleanup"])
+def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_ext4(tmp_path, monkeypatch, injected_failure):
     """No post-worker object may contain inline projection, measurements, custody or ledger rows."""
     checkpoint = Path(os.environ.get("AERP7_REFERENCE_E2E_CHECKPOINT", "/root/aerp-linux/checkpoints/convomem-c3d9470-v380.json"))
     assert checkpoint.is_file(), "set AERP7_REFERENCE_E2E_CHECKPOINT to the live AERP-8 checkpoint"
@@ -280,10 +282,46 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
     monkeypatch.setattr(confirmation, "load_custody_for_scoring", forbidden)
 
     original_fixture = runpy.run_path(str(Path(__file__).with_name("test_aerp7_original_product.py")))
+    lifecycle_events = []
     real_audit = original_product.coordinator_reaudit_streaming_replicate
-    monkeypatch.setattr(original_product, "coordinator_reaudit_streaming_replicate", lambda **kwargs: real_audit(**kwargs, auditor=original_fixture["fake_auditor"]))
+
+    def audit_with_fixture(**kwargs):
+        completed = real_audit(**kwargs, auditor=original_fixture["fake_auditor"])
+        lifecycle_events.append(("reaudit", completed["build_id"]))
+        return completed
+
+    real_fsync_reference = executor._fsync_original_replicate_reference
+    real_persist_completion = executor._persist_original_coordinator_completion
+    real_remove_palace = executor._remove_reaudited_original_palace
+
+    def fsync_reference(**kwargs):
+        build_id = kwargs["replicate_reference"]["build_id"]
+        lifecycle_events.append(("reference_fsync", build_id))
+        if injected_failure == "reference_fsync":
+            raise CustodyError("injected_reference_fsync_failure")
+        return real_fsync_reference(**kwargs)
+
+    def persist_completion(**kwargs):
+        build_id = kwargs["replicate_reference"]["build_id"]
+        lifecycle_events.append(("completion_persist", build_id))
+        return real_persist_completion(**kwargs)
+
+    def remove_palace(**kwargs):
+        build_id = kwargs["completion"]["replicate_reference"]["build_id"]
+        lifecycle_events.append(("palace_remove", build_id))
+        if injected_failure == "palace_cleanup":
+            raise CustodyError("injected_palace_cleanup_failure")
+        return real_remove_palace(**kwargs)
+
+    monkeypatch.setattr(original_product, "coordinator_reaudit_streaming_replicate", audit_with_fixture)
+    monkeypatch.setattr(executor, "_fsync_original_replicate_reference", fsync_reference)
+    monkeypatch.setattr(executor, "_persist_original_coordinator_completion", persist_completion)
+    monkeypatch.setattr(executor, "_remove_reaudited_original_palace", remove_palace)
     artifacts_by_role = {}
     current_packets = {}
+    injected_palace_bytes = 4096
+    palace_paths = []
+    palace_boundary_bytes = []
     worker_pids = iter(range(30_001, 30_010))
 
     def current_packet(config, output_path, role, pid):
@@ -305,8 +343,22 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
 
     def original_packet(config, output_path, pid):
         number = int(str(config["build_id"]).rsplit("-", 1)[1])
-        palace = Path(config["palace_path"]); seams, _unused_palace, _state = original_fixture["seams"]()
+        palace = Path(config["palace_path"])
+        # A previous fresh build must have completed coordinator handoff and
+        # palace cleanup before this one is allowed to start.
+        assert not [path for path in palace_paths if path.exists() or path.is_symlink()]
+        lifecycle_events.append(("worker_start", str(config["build_id"])))
+        seams, _unused_palace, _state = original_fixture["seams"]()
         draft = original_product.run_original_public_replicate_streaming(candidate_reference=candidate_receipt["candidate_reference"], build_id=str(config["build_id"]), collection_identity=f"reference-only-{number}", palace_path=palace, observer=_FormalShapedOriginalObserver(query_count=candidate_receipt["query_count"], candidate_text_count=candidate_receipt["candidate_text_count"]), seams=seams, staging_parent=Path(config["replicate_staging_parent"]))
+        # Replace the injected product's palace with exactly S resident bytes.
+        # A batched-five-build implementation would exceed S on build 1.
+        shutil.rmtree(palace)
+        palace.mkdir()
+        (palace / "resident.bin").write_bytes(b"p" * injected_palace_bytes)
+        palace_paths.append(palace)
+        resident = sum(path.stat().st_size for path in palace.parent.glob("original-*-palace/*") if path.is_file())
+        palace_boundary_bytes.append(resident)
+        assert resident <= injected_palace_bytes
         draft_bytes = original_product.serialize_worker_draft(draft); draft_path = Path(config["draft_path"]); draft_path.write_bytes(draft_bytes)
         replicate = draft.replicate_without_coordinator_audit.as_reference()
         resource = executor._formal_original_resource(draft=draft, replicate=replicate, denominators={"query_count": candidate_receipt["query_count"], "candidate_text_count": candidate_receipt["candidate_text_count"]}, resource_comparability="unavailable")
@@ -324,6 +376,13 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
 
     monkeypatch.setattr(executor, "_run_subprocess", inject_worker)
     config = {"schema": executor.FORMAL_SCHEMA, "synthetic_test_mode": False, "protocol_path": str(protocol_path.resolve()), "candidate_bundle": str(candidate.resolve()), "output_dir": str(output.resolve()), "authorization_path": str(authorization_path.resolve()), "python_executable": protocol["execution_checkpoint"]["driver_code_receipt"]["python"], "original_root": protocol["execution_checkpoint"]["original_execution_policy"]["original_root"], "model_dir": protocol["execution_checkpoint"]["original_execution_policy"]["model_dir"], "original_python": protocol["execution_checkpoint"]["original_execution_policy"]["original_python"]}
+    if injected_failure is not None:
+        with pytest.raises(CustodyError, match=f"injected_{injected_failure}"):
+            executor.public_coordinator(config)
+        assert not output.exists()
+        assert not list(tmp_path.glob(".public.original-*"))
+        return
+
     freeze = executor.public_coordinator(config)
     assert freeze["candidate_store_cleanup"]["validated_artifact_count"] == 4
     assert set(current_packets) == {"raw", "p5_primary", "p5_repeat", "six"}
@@ -333,6 +392,21 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
     assert len([row for row in freeze["ranking_artifacts"] if row["arm_id"] != "original_public_product"]) == 3
     assert next(row for row in freeze["ranking_artifacts"] if row["arm_id"] == "original_public_product")["replicate_count"] == 5
     assert all("query_measurements" not in json.dumps(row, sort_keys=True) for row in freeze["ranking_artifacts"])
+    assert palace_boundary_bytes == [injected_palace_bytes] * 5
+    assert all(not path.exists() and not path.is_symlink() for path in palace_paths)
+    assert not list(output.glob("original-*-palace"))
+    assert lifecycle_events == [
+        (phase, f"formal-build-{number}")
+        for number in range(5)
+        for phase in ("worker_start", "reaudit", "reference_fsync", "completion_persist", "palace_remove")
+    ]
+    original_artifact = next(row for row in freeze["ranking_artifacts"] if row["arm_id"] == "original_public_product")
+    assert all(Path(reference["store_path"]).is_file() and Path(reference["ready_path"]).is_file() for reference in original_artifact["replicate_references"])
+    for number in range(5):
+        completion = executor._load(output / f"original-{number}-coordinator.json")
+        assert completion["schema"] == executor.ORIGINAL_COMPLETION_SCHEMA
+        assert completion["replicate_reference"]["state"] == "coordinator_complete"
+        assert completion["resource_receipt"]["index_sha256"] == completion["replicate_reference"]["index_sha256"]
 
     # Continue through the actual public validator and separate custody scorer.
     freeze_path = output / "public-freeze.json"

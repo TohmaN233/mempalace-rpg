@@ -47,6 +47,7 @@ CURRENT_PACKET_SCHEMA = "aerp7-convomem-current-worker-packet-v1"
 FORMAL_CURRENT_PACKET_SCHEMA = "aerp7-convomem-formal-current-worker-packet-v1"
 ORIGINAL_PACKET_SCHEMA = "aerp7-convomem-original-worker-packet-v1"
 FORMAL_ORIGINAL_PACKET_SCHEMA = "aerp7-convomem-formal-original-worker-packet-v1"
+ORIGINAL_COMPLETION_SCHEMA = "aerp7-convomem-original-coordinator-completion-v1"
 FREEZE_PACKET_SCHEMA = "aerp7-convomem-public-freeze-packet-v1"
 FORMAL_FREEZE_PACKET_SCHEMA = "aerp7-convomem-formal-public-freeze-packet-v1"
 _PUBLIC_ROLE_FLAGS = frozenset({"--current-worker-stdin", "--original-worker-stdin"})
@@ -1128,6 +1129,128 @@ def coordinator_reaudit_original_worker_packet(*, packet: Mapping[str, Any], dra
     return replicate, resource
 
 
+def _persist_original_coordinator_completion(*, path: Path, worker_packet: Mapping[str, Any],
+                                             replicate_reference: Mapping[str, Any],
+                                             resource_receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Durably hand a reaudited original replicate to the next build boundary.
+
+    The worker packet is immutable evidence of the isolated build.  Once the
+    coordinator has independently reaudited it, this separate packet is the
+    boundary object consumed by all later coordinator work.  In particular it
+    contains no palace path, so deleting that transient Chroma directory cannot
+    invalidate a later artifact, scoring, or freeze operation.
+    """
+    packet = dict(worker_packet)
+    reference = dict(replicate_reference)
+    resource = dict(resource_receipt)
+    try:
+        checked_reference = original_product.validate_original_replicate_reference(reference)
+    except original_product.OriginalProductError as exc:
+        raise CustodyError("executor_original_completion_reference_invalid") from exc
+    if checked_reference["state"] != "coordinator_complete":
+        raise CustodyError("executor_original_completion_reference_incomplete")
+    if resource.get("build_id") != checked_reference["build_id"] or resource.get("index_sha256") != checked_reference["index_sha256"]:
+        raise CustodyError("executor_original_completion_resource_crossbinding_invalid")
+    if resource.get("resource_sha256") != formal.resource_digest(resource):
+        raise CustodyError("executor_original_completion_resource_invalid")
+    worker_packet_sha256 = packet.get("packet_sha256")
+    if worker_packet_sha256 != _digest({key: item for key, item in packet.items() if key != "packet_sha256"}):
+        raise CustodyError("executor_original_completion_worker_packet_invalid")
+    completion = {
+        "schema": ORIGINAL_COMPLETION_SCHEMA,
+        "worker_packet_sha256": worker_packet_sha256,
+        "replicate_reference": checked_reference,
+        "resource_receipt": resource,
+        "completion_sha256": "",
+    }
+    completion["completion_sha256"] = _digest({key: item for key, item in completion.items() if key != "completion_sha256"})
+    _write_new(path, completion)
+    loaded = _load(path)
+    required = {"schema", "worker_packet_sha256", "replicate_reference", "resource_receipt", "completion_sha256"}
+    if (
+        set(loaded) != required
+        or loaded.get("schema") != ORIGINAL_COMPLETION_SCHEMA
+        or loaded.get("completion_sha256") != _digest({key: item for key, item in loaded.items() if key != "completion_sha256"})
+        or loaded != completion
+    ):
+        raise CustodyError("executor_original_completion_persistence_invalid")
+    return loaded
+
+
+def _fsync_original_replicate_reference(*, replicate_reference: Mapping[str, Any]) -> dict[str, Any]:
+    """Make a completed original SQLite/READY pair durable before palace removal."""
+    try:
+        checked = original_product.validate_original_replicate_reference(replicate_reference)
+    except original_product.OriginalProductError as exc:
+        raise CustodyError("executor_original_completion_reference_invalid") from exc
+    if checked["state"] != "coordinator_complete":
+        raise CustodyError("executor_original_completion_reference_incomplete")
+    paths = [Path(checked[key]) for key in ("store_path", "ready_path")]
+    parent = paths[0].parent
+    if any(path.is_symlink() or not path.is_file() or path.parent != parent for path in paths):
+        raise CustodyError("executor_original_completion_durability_target_invalid")
+    for path in paths:
+        try:
+            descriptor = os.open(str(path), os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise CustodyError("executor_original_completion_reference_fsync_failed") from exc
+    _sync_parent(parent)
+    return checked
+
+
+def _remove_reaudited_original_palace(*, palace_path: Path, completion: Mapping[str, Any]) -> None:
+    """Delete exactly one transient palace after its durable coordinator handoff.
+
+    The replicate SQLite/READY pair must be outside this directory and already
+    validate as coordinator-complete.  The parent fsync is the lifecycle
+    boundary: only after it returns may the next fresh Chroma build begin.
+    """
+    if not isinstance(completion, Mapping):
+        raise CustodyError("executor_original_palace_cleanup_completion_invalid")
+    row = dict(completion)
+    required = {"schema", "worker_packet_sha256", "replicate_reference", "resource_receipt", "completion_sha256"}
+    if (
+        set(row) != required
+        or row.get("schema") != ORIGINAL_COMPLETION_SCHEMA
+        or row.get("completion_sha256") != _digest({key: item for key, item in row.items() if key != "completion_sha256"})
+    ):
+        raise CustodyError("executor_original_palace_cleanup_completion_invalid")
+    reference = row["replicate_reference"]
+    try:
+        checked = original_product.validate_original_replicate_reference(reference)
+    except original_product.OriginalProductError as exc:
+        raise CustodyError("executor_original_palace_cleanup_reference_invalid") from exc
+    if checked["state"] != "coordinator_complete":
+        raise CustodyError("executor_original_palace_cleanup_reference_incomplete")
+    resource = row["resource_receipt"]
+    if (
+        not isinstance(resource, Mapping)
+        or resource.get("build_id") != checked["build_id"]
+        or resource.get("index_sha256") != checked["index_sha256"]
+        or resource.get("resource_sha256") != formal.resource_digest(resource)
+    ):
+        raise CustodyError("executor_original_palace_cleanup_completion_invalid")
+    if palace_path.is_symlink() or not palace_path.is_dir():
+        raise CustodyError("executor_original_palace_cleanup_target_invalid")
+    palace = palace_path.resolve()
+    for key in ("store_path", "ready_path"):
+        durable = Path(checked[key]).resolve()
+        try:
+            durable.relative_to(palace)
+        except ValueError:
+            continue
+        raise CustodyError("executor_original_palace_cleanup_would_remove_durable_reference")
+    parent = palace.parent
+    shutil.rmtree(palace)
+    if palace_path.exists() or palace_path.is_symlink():
+        raise CustodyError("executor_original_palace_cleanup_failed")
+    _sync_parent(parent)
+
+
 def _load_stdin() -> dict[str, Any]:
     try:
         value = json.loads(sys.stdin.buffer.read())
@@ -1222,7 +1345,7 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
         if current_packet.get("schema") != expected_current_packet_schema:
             raise CustodyError("executor_current_packet_schema_invalid")
         current_packets.append(current_packet)
-    original_packets = []; original_jobs: list[tuple[Path, Path]] = []
+    original_packets = []; original_replicates: list[Mapping[str, Any]] = []
     original_policy = protocol["execution_checkpoint"]["original_execution_policy"] if not synthetic else None
     if not synthetic and (
         str(Path(str(config["original_root"])).resolve()) != original_policy["original_root"]
@@ -1246,7 +1369,6 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
                 "original_python": str(Path(str(config["original_python"])).resolve()),
                 "replicate_staging_parent": str(original_support.resolve()),
             }
-            original_jobs.append((draft_path, palace_path))
         supervisors[f"original-{number}"] = _run_subprocess(
             [str(Path(str(original_policy["original_python"])).resolve()) if not synthetic else executable, "-m", "benchmarks.aerp7_convomem_executor", "--original-worker-stdin"],
             config=child, output=path,
@@ -1261,7 +1383,39 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             "original_execution_policy_sha256": protocol["execution_checkpoint"]["original_execution_policy_sha256"],
         }:
             raise CustodyError("executor_original_worker_execution_identity_invalid")
-        original_packets.append(original_packet)
+        if synthetic:
+            original_packets.append(original_packet)
+            original_replicates.append(original_packet["replicate"])
+            continue
+        # A fresh official Chroma build is deliberately a one-at-a-time
+        # lifecycle.  Complete the coordinator audit and durable reference
+        # handoff before removing this build's transient palace; the next worker
+        # is not launched until the removal's parent-directory fsync returns.
+        replicate, resource = coordinator_reaudit_original_worker_packet(
+            packet=original_packet, draft_path=draft_path, palace_path=palace_path,
+            projection=None,
+        )
+        finalized_resource = finalize_original_resource(
+            resource=resource, supervisor=supervisors[f"original-{number}"],
+            worker_pid=original_packet["process_id"],
+        )
+        # The store/READY pair is the durable handoff.  Its files and support
+        # directory must reach the filesystem before a completion packet is
+        # allowed to authorize removal of this build's Chroma palace.
+        replicate = _fsync_original_replicate_reference(replicate_reference=replicate)
+        completion = _persist_original_coordinator_completion(
+            path=staging / f"original-{number}-coordinator.json",
+            worker_packet=original_packet, replicate_reference=replicate,
+            resource_receipt=finalized_resource,
+        )
+        _remove_reaudited_original_palace(palace_path=palace_path, completion=completion)
+        original_replicates.append(dict(completion["replicate_reference"]))
+        rebound = {
+            **original_packet,
+            "resource_receipt": dict(completion["resource_receipt"]),
+        }
+        rebound["packet_sha256"] = _digest({key: item for key, item in rebound.items() if key != "packet_sha256"})
+        original_packets.append(rebound)
     # The legacy full projection is a synthetic-rehearsal oracle only.  A
     # formal coordinator hands around the READY-bound public reference; its
     # endpoint validators open their own bounded cursor/store when rows are
@@ -1273,32 +1427,8 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
         )
         if synthetic else None
     )
-    if synthetic:
-        original_replicates = [row["replicate"] for row in original_packets]
-    else:
-        if len(original_jobs) != 5:
-            raise CustodyError("executor_original_worker_coverage_invalid")
-        reaudited = [
-            coordinator_reaudit_original_worker_packet(
-                packet=packet, draft_path=draft_path, palace_path=palace_path,
-                projection=projection if synthetic else None,
-            )
-            for packet, (draft_path, palace_path) in zip(original_packets, original_jobs, strict=True)
-        ]
-        original_replicates = [row[0] for row in reaudited]
-        rebound_packets = []
-        for number, (packet, (_replicate, resource)) in enumerate(zip(original_packets, reaudited, strict=True)):
-            rebound = {
-                **packet,
-                "resource_receipt": finalize_original_resource(
-                    resource=resource,
-                    supervisor=supervisors[f"original-{number}"],
-                    worker_pid=packet["process_id"],
-                ),
-            }
-            rebound["packet_sha256"] = _digest({key: item for key, item in rebound.items() if key != "packet_sha256"})
-            rebound_packets.append(rebound)
-        original_packets = rebound_packets
+    if len(original_replicates) != 5:
+        raise CustodyError("executor_original_worker_coverage_invalid")
     if synthetic:
         sealed = {"replicates": original_replicates, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": protocol["original_code_receipt"], "original_code_after": protocol["original_code_receipt"]}
         sealed["worker_sha256"] = formal._digest(sealed)
@@ -1316,6 +1446,7 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
                 protocol=protocol,
             ),
         }
+        _sync_parent(original_support)
     current_by_role = {row["execution_role"]: row for row in current_packets}
     if set(current_by_role) != {"raw", "p5_primary", "p5_repeat", "six"}: raise CustodyError("executor_current_role_coverage_invalid")
     primary_artifact = current_by_role["p5_primary"]["artifact"]; repeat_artifact = current_by_role["p5_repeat"]["artifact"]

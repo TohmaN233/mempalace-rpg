@@ -224,6 +224,21 @@ def test_original_coordinator_routes_stream_draft_to_persistent_reference_withou
     assert completed["candidate_reference"] == reference
     assert resource["index_sha256"] == completed["index_sha256"]
     assert resource["resource_sha256"] == executor.formal.resource_digest(resource)
+    # The formal coordinator rejects non-POSIX hosts before it can select this
+    # lifecycle.  Windows does not provide Python a portable file fsync handle,
+    # so the exact durability/delete boundary is exercised by the POSIX E2E.
+    if os.name != "nt":
+        durable = executor._fsync_original_replicate_reference(replicate_reference=completed)
+        completion = executor._persist_original_coordinator_completion(
+            path=tmp_path / "stream-completion.json",
+            worker_packet=packet,
+            replicate_reference=durable,
+            resource_receipt=resource,
+        )
+        executor._remove_reaudited_original_palace(palace_path=palace_path, completion=completion)
+        assert not palace_path.exists()
+        assert Path(completion["replicate_reference"]["store_path"]).is_file()
+        assert Path(completion["replicate_reference"]["ready_path"]).is_file()
 
 
 def test_executor_publishes_five_persistent_original_refs_without_embedded_payload(tmp_path, monkeypatch):
