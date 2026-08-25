@@ -181,6 +181,9 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
     canonical, premix = _source_roots(tmp_path)
     candidate, custody, staging = tmp_path / "candidate", tmp_path / "custody", tmp_path / "source-staging"
     staging.mkdir()
+    # Match the isolated source-builder launch contract exactly: SQLite temp
+    # state must stay below the owned staging root on Linux/ext4.
+    monkeypatch.setenv("SQLITE_TMPDIR", str(staging.resolve()))
     built = confirmation.build_prelabel_bundle(
         canonical_root=canonical, premix_root=premix, candidate_output_dir=candidate,
         custody_output_dir=custody, staging_root=staging, secret=binding_secret,
