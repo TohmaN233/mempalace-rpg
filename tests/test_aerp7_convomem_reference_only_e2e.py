@@ -189,6 +189,41 @@ class _Encoder:
         return [float(len(text) + 1), 1.0]
 
 
+class _FormalShapedOriginalObserver:
+    """Worker-local resource receipt whose RSS sentinel awaits the supervisor."""
+
+    def __init__(self, *, query_count: int, candidate_text_count: int) -> None:
+        self._query_count = query_count
+        self._candidate_text_count = candidate_text_count
+        self._phases = []
+
+    def checkpoint(self, phase):
+        expected = ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]
+        assert len(self._phases) < len(expected)
+        assert phase == expected[len(self._phases)]
+        self._phases.append(phase)
+
+    def receipt(self):
+        assert self._phases == ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]
+        return {
+            # The child cannot claim a process-tree peak.  The injected
+            # external supervisor supplies its positive observation later.
+            "peak_rss_bytes": 0,
+            "storage_bytes": 1,
+            "passage_embedding": {
+                "calls": 1,
+                "texts": self._candidate_text_count,
+                "measurement": original_product.PUBLIC_UPSERT_MEASUREMENT,
+            },
+            "query_embedding": {
+                "calls": self._query_count,
+                "texts": self._query_count,
+                "measurement": original_product.PUBLIC_SEARCH_MEASUREMENT,
+            },
+            "provider": {"model": "minilm", "device": "cpu", "providers": ["CPUExecutionProvider"]},
+        }
+
+
 def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_ext4(tmp_path, monkeypatch):
     """No post-worker object may contain inline projection, measurements, custody or ledger rows."""
     checkpoint = Path(os.environ.get("AERP7_REFERENCE_E2E_CHECKPOINT", "/root/aerp-linux/checkpoints/convomem-c3d9470-v380.json"))
@@ -259,7 +294,7 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
     def original_packet(config, output_path, pid):
         number = int(str(config["build_id"]).rsplit("-", 1)[1])
         palace = Path(config["palace_path"]); seams, _unused_palace, _state = original_fixture["seams"]()
-        draft = original_product.run_original_public_replicate_streaming(candidate_reference=candidate_receipt["candidate_reference"], build_id=str(config["build_id"]), collection_identity=f"reference-only-{number}", palace_path=palace, observer=original_fixture["Observer"](), seams=seams, staging_parent=Path(config["replicate_staging_parent"]))
+        draft = original_product.run_original_public_replicate_streaming(candidate_reference=candidate_receipt["candidate_reference"], build_id=str(config["build_id"]), collection_identity=f"reference-only-{number}", palace_path=palace, observer=_FormalShapedOriginalObserver(query_count=candidate_receipt["query_count"], candidate_text_count=candidate_receipt["candidate_text_count"]), seams=seams, staging_parent=Path(config["replicate_staging_parent"]))
         draft_bytes = original_product.serialize_worker_draft(draft); draft_path = Path(config["draft_path"]); draft_path.write_bytes(draft_bytes)
         replicate = draft.replicate_without_coordinator_audit.as_reference()
         resource = executor._formal_original_resource(draft=draft, replicate=replicate, denominators={"query_count": candidate_receipt["query_count"], "candidate_text_count": candidate_receipt["candidate_text_count"]}, resource_comparability="unavailable")
