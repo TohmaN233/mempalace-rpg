@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tracemalloc
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -554,6 +555,190 @@ def test_many_cases_streaming_proxy_keeps_no_staged_json_after_indexing(tmp_path
             connection.close()
     finally:
         index.close()
+
+
+def test_full_census_payload_materialization_has_bounded_resident_memory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A many-corpus census must not retain every decoded payload before publish."""
+    count = 128
+    message_json = {
+        f"case-{number}": json.dumps([{
+            "conversation_id": f"conversation-{number}", "conversation_ordinal": 0,
+            "message_ordinal": 0, "raw_message_ordinal": 0, "corpus_ordinal": 0,
+            "speaker": "speaker", "text": "x" * 65_536,
+            "source_locator": {"path": "cases.json", "case_ordinal": number, "conversation_id": f"conversation-{number}", "conversation_ordinal": 0, "message_ordinal": 0},
+        }])
+        for number in range(count)
+    }
+
+    class Cursor:
+        def __init__(self, row: dict[str, str]) -> None:
+            self.row = row
+
+        def fetchone(self) -> dict[str, str]:
+            return self.row
+
+    class Connection:
+        row_factory: object | None = None
+
+        def execute(self, query: str, parameters: tuple[object, ...]) -> Cursor:
+            if query.startswith("SELECT answer"):
+                number = int(parameters[2])
+                return Cursor({"answer": "answer", "category": "category", "conversations": json.dumps([f"conversation-{number}"]), "labels": "[]", "directory": json.dumps({"group": "group", "tier": "tier", "record_category": "category"})})
+            if query.startswith("SELECT messages"):
+                return Cursor({"messages": message_json[str(parameters[0])]})
+            raise AssertionError(query)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(custody, "_index_connection", lambda _database: Connection())
+    selected = [
+        ({"key_sha": f"key-{number}", "locator": "labels.json", "ordinal": number, "persona": "persona", "persona_id": "persona-id", "question": f"question-{number}", "directory": {"group": "group"}}, {"case_sha": f"case-{number}", "locator": {"path": "cases.json", "case_ordinal": number}, "context_size": 1.0})
+        for number in range(count)
+    ]
+
+    tracemalloc.start()
+    try:
+        materialized = sum(1 for _ in custody._iter_selected_payloads_sql(tmp_path / "index.sqlite3", selected, SECRET, "r" * 64))
+        current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert materialized == count
+    # The current implementation returns all decoded corpus text, public rows,
+    # and custody rows together.  This must become bounded by the streaming
+    # publication unit, not scale with the number of selected corpora.
+    assert current < 2 * 1024 * 1024 and peak < 4 * 1024 * 1024, (
+        f"census_materialization_resident_bytes={current} "
+        f"census_materialization_peak_bytes={peak}"
+    )
+
+
+def test_full_census_builder_streams_materialization_and_publication_memory(tmp_path: Path) -> None:
+    """The real census build must not retain its full public payload in RAM."""
+    count = 64
+    canonical, premix = tmp_path / "labels", tmp_path / "premix"
+    evidence_items = []
+    cases = []
+    for number in range(count):
+        conversation = f"conversation-{number}"
+        evidence = {
+            "personId": "persona", "question": f"question-{number}",
+            "answer": f"answer-{number}", "category": "category",
+            "conversations": [{"id": conversation}], "message_evidences": [],
+        }
+        evidence_items.append(evidence)
+        cases.append({
+            "contextSize": 1, "evidenceItems": [{key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}],
+            "conversations": [{"id": conversation, "messages": [{"speaker": "speaker", "text": "x" * 65_536}]}],
+        })
+    _write(canonical / "core_benchmark" / "evidence_questions" / "group" / "tier" / "items.json", {"evidence_items": evidence_items})
+    _write(premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json", cases)
+
+    tracemalloc.start()
+    try:
+        _publish(canonical=canonical, premix=premix, output=tmp_path / "candidate", staging=_staging(tmp_path), config=custody.SelectionConfig.census_v1())
+        current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    projection = custody.load_candidate_projection(tmp_path / "candidate")
+    sealed = custody.load_sealed_custody(tmp_path / "candidate", _custody_bundle(tmp_path / "candidate"), binding_secret=SECRET)
+    assert len(projection["items"]) == count
+    assert (tmp_path / "candidate" / "projection.json").read_bytes() == custody._bytes(projection)
+    assert (_custody_bundle(tmp_path / "candidate") / "sealed-custody.json").read_bytes() == custody._bytes(sealed)
+    assert current < 2 * 1024 * 1024 and peak < 6 * 1024 * 1024, (
+        f"census_builder_resident_bytes={current} census_builder_peak_bytes={peak}"
+    )
+
+
+def test_census_selection_reference_does_not_retain_selected_pairs_at_200k(tmp_path: Path) -> None:
+    """The actual selector retains SQL rows, not a Python pair list.
+
+    Tracing begins only after the synthetic 100k/200k index is fully built, so
+    setup allocations cannot hide selected-pair retention.
+    """
+    empty = custody.canonical_sha256([])
+    ledger = {
+        "reasons": {
+            name: {"count": 0, "keys_sha256": empty}
+            for name in (
+                "multi_persona_cases", "canonical_zero_logical_matches",
+                "ambiguous_canonical_keys", "unmatched_premix_keys",
+                "multiple_logical_matches_or_variants", "missing_requested_context_sizes",
+            )
+        },
+        "ledger_sha256": "x" * 64,
+    }
+
+    def select_peak(count: int) -> tuple[int, object, dict[str, object]]:
+        database = tmp_path / ("selected-" + str(count) + ".sqlite3")
+        connection = __import__("sqlite3").connect(database)
+        try:
+            connection.executescript("""
+                CREATE TABLE canonical_items(key_sha TEXT, locator TEXT, ordinal INTEGER, persona TEXT, question TEXT, directory TEXT);
+                CREATE TABLE premix_cases(case_sha TEXT PRIMARY KEY, locator TEXT, context_size REAL, messages TEXT);
+                CREATE TABLE premix_keys(key_sha TEXT, case_sha TEXT);
+            """)
+            directory = json.dumps({"group": "group", "tier": "tier", "record_category": "category"})
+            connection.execute("INSERT INTO premix_cases VALUES(?,?,?,?)", ("case", json.dumps({"path": "cases.json", "case_ordinal": 0}), 1.0, "[]"))
+            connection.executemany(
+                "INSERT INTO canonical_items VALUES(?,?,?,?,?,?)",
+                (("key-" + str(number), "items.json", number, "persona", "question-" + str(number), directory) for number in range(count)),
+            )
+            connection.executemany(
+                "INSERT INTO premix_keys VALUES(?,?)",
+                (("key-" + str(number), "case") for number in range(count)),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        tracemalloc.start()
+        try:
+            selected, receipt = custody._selection_rows_sql(
+                database, SECRET, "r" * 64, custody.SelectionConfig.census_v1(), (1.0,), ledger,
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        return peak, selected, receipt
+
+    peak_100k, selected_100k, receipt_100k = select_peak(100_000)
+    peak_200k, selected_200k, receipt_200k = select_peak(200_000)
+    assert isinstance(selected_100k, custody.CensusSelectionReference)
+    assert isinstance(selected_200k, custody.CensusSelectionReference)
+    assert selected_100k.item_count == 100_000 and selected_200k.item_count == 200_000
+    assert receipt_100k["selected_item_context_count"] == 100_000
+    assert receipt_200k["selected_item_context_count"] == 200_000
+    assert peak_200k <= peak_100k + 4 * 1024 * 1024, (
+        f"census_selected_pairs_peak_100k={peak_100k} census_selected_pairs_peak_200k={peak_200k}"
+    )
+
+
+def test_custody_reference_opens_ephemeral_streaming_store_without_full_bundle(tmp_path: Path) -> None:
+    """Custody ingress is READY-bound and cursor based, never a returned bundle."""
+    candidate = _build(tmp_path)
+    projection = custody.load_candidate_projection(candidate)
+    reference = custody.custody_reference(
+        candidate_bundle=candidate,
+        custody_bundle=_custody_bundle(candidate),
+        candidate_reference={
+            "schema": custody.CANDIDATE_PROJECTION_REFERENCE_SCHEMA,
+            "bundle_path": str(candidate.resolve()), "projection_path": "projection.json", "ready_path": "READY.json",
+            "generation_id": json.loads((candidate / "READY.json").read_text())["generation_id"],
+            "projection_raw_sha256": hashlib.sha256((candidate / "projection.json").read_bytes()).hexdigest(),
+            "projection_canonical_sha256": custody.canonical_sha256(projection), "dataset": projection["dataset"],
+            "query_count": len(projection["items"]), "candidate_text_count": sum(len(row["candidates"]) for row in projection["corpora"]),
+        },
+    )
+    assert reference["schema"] == custody.CUSTODY_REFERENCE_SCHEMA
+    with custody.CustodyStore.open(reference, staging_parent=_staging(tmp_path), binding_secret=SECRET) as store:
+        receipt = store.receipt()
+        rows = list(store.iter_scoring_items())
+        assert receipt["item_count"] == len(projection["items"])
+        assert receipt["candidate_store_bytes"] > 0 and receipt["custody_store_bytes"] > 0
+        assert [row["item_id"] for row in rows] == sorted(item["item_id"] for item in projection["items"])
+        assert all(set(row) == {"item_id", "directory_group", "evidence_conversation_ids", "evidence_spans"} for row in rows)
 
 
 def test_duplicate_outer_row_normalization_preserves_raw_locator_ordinals_and_is_deterministic(tmp_path: Path) -> None:

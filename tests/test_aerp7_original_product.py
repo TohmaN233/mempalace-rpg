@@ -1,13 +1,16 @@
 import copy
 import hashlib
 import json
+import os
 import sys
+import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from benchmarks import aerp7_convomem_rank as rank
+from benchmarks import aerp7_convomem_confirmation as confirmation
 from benchmarks import aerp7_convomem_executor as executor
 from benchmarks import aerp7_original_product as original
 
@@ -35,6 +38,323 @@ def projection():
         candidates = [{"message_id": h(f"{corpus_number}-m-{index}"), "opaque_conversation_id": conversation, "conversation_order": 0, "message_order": index, "corpus_order": index, "speaker": "user" if index % 2 else "assistant", "text": f"corpus {corpus_number} text {index}"} for index in range(11)]
         corpora.append({"corpus_id": corpus_id, "declared_context_size": 2, "actual_conversation_count": 1, "actual_message_count": len(candidates), "candidates": candidates})
     return {"schema": "aerp7-convomem-candidate-projection-v3", "dataset": {name: h(name) for name in ("canonical_sha256", "premix_sha256", "revision_sha256", "source_inventory_sha256")}, "selection_receipt": selection, "corpora": corpora, "items": [{"item_id": h(f"item-{number}"), "persona_id": h("persona"), "query_text": f"query {number}", "corpus_id": corpus["corpus_id"]} for number, corpus in enumerate(corpora)]}
+
+
+def candidate_reference_bundle(tmp_path, *, query_count=None):
+    bundle = tmp_path / "candidate"
+    bundle.mkdir()
+    value = projection()
+    projection_raw = confirmation._bytes(value)
+    projection_path = bundle / "projection.json"
+    projection_path.write_bytes(projection_raw)
+    ready = {
+        "schema": confirmation.CANDIDATE_READY_SCHEMA,
+        "generation_id": h("generation-1"),
+        "projection": {
+            "raw_sha256": hashlib.sha256(projection_raw).hexdigest(),
+            "canonical_sha256": confirmation.canonical_sha256(value),
+        },
+        "durability": confirmation._durability_receipt(),
+    }
+    if query_count is not None:
+        corpus_ids = [corpus["corpus_id"] for corpus in value["corpora"]]
+        value["items"] = [{"item_id": h(f"item-{number}"), "persona_id": h("persona"), "query_text": f"query {number}", "corpus_id": corpus_ids[number % len(corpus_ids)]} for number in range(query_count)]
+        projection_raw = confirmation._bytes(value)
+        projection_path.write_bytes(projection_raw)
+        ready["projection"]["raw_sha256"] = hashlib.sha256(projection_raw).hexdigest()
+        ready["projection"]["canonical_sha256"] = confirmation.canonical_sha256(value)
+    (bundle / "READY.json").write_bytes(confirmation._bytes(ready))
+    return original.candidate_projection_reference(
+        bundle_path=bundle,
+        generation_id=h("generation-1"),
+        projection_raw_sha256=ready["projection"]["raw_sha256"],
+        projection_canonical_sha256=ready["projection"]["canonical_sha256"],
+        dataset=value["dataset"],
+        query_count=len(value["items"]),
+        candidate_text_count=22,
+    )
+
+
+def test_candidate_reference_streams_one_corpus_and_item_without_projection_materialization(tmp_path, monkeypatch):
+    reference = candidate_reference_bundle(tmp_path)
+    projection_path = Path(reference["bundle_path"]) / reference["projection_path"]
+    real_read_bytes = Path.read_bytes
+
+    def no_projection_materialization(path):
+        if path == projection_path:
+            raise AssertionError("stream worker materialized projection bytes")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", no_projection_materialization)
+    cursor = original.CandidateProjectionCursor(reference)
+    corpora = list(cursor.corpora())
+    assert [row["corpus_id"] for row in corpora] == sorted(row["corpus_id"] for row in corpora)
+    items = list(cursor.items(corpus_ids={row["corpus_id"] for row in corpora}))
+    assert [row["item_id"] for row in items] == sorted(row["item_id"] for row in items)
+    assert sum(len(row["candidates"]) for row in corpora) == reference["candidate_text_count"]
+
+
+def test_candidate_reference_fails_closed_on_raw_or_ready_drift(tmp_path):
+    reference = candidate_reference_bundle(tmp_path)
+    projection_path = Path(reference["bundle_path"]) / reference["projection_path"]
+    projection_path.write_bytes(projection_path.read_bytes() + b" ")
+    with pytest.raises(original.OriginalProductError, match="raw digest drift"):
+        original.validate_candidate_projection_reference(reference)
+
+
+def test_stream_worker_packet_contains_reference_but_never_projection(tmp_path):
+    reference = candidate_reference_bundle(tmp_path)
+    query_rows = [
+        {"item_id": h(f"item-{number}"), "query_sha256": h(f"query-{number}"), "wall_ns": 1, "cpu_ns": 1}
+        for number in range(2)
+    ]
+    telemetry = {
+        "formal_eligible": False,
+        "live_receipt": {},
+        "ledger": [{"event": "upsert", "count": 22}, {"event": "search", "count": 1}],
+        "resources": {
+            "query_measurements": query_rows,
+            "clock_receipt": original._clock_receipt(),
+            "process_cpu_scope": "worker_process_only_excludes_descendants",
+            "descendant_observation": "external_supervisor_zero_required",
+        },
+    }
+    draft = original.OriginalProductWorkerDraft(
+        projection=None,
+        candidate_reference=reference,
+        namespace={
+            "schema": original.STREAM_NAMESPACE_SCHEMA,
+            "candidate_reference": reference,
+            "candidate_reference_sha256": original._digest(reference),
+            "corpus_count": 2,
+            "candidate_text_count": 22,
+            "query_count": 2,
+        },
+        replicate_without_coordinator_audit={"stream": True},
+        worker_physical_receipt={"physical": "receipt"},
+        telemetry=telemetry,
+    )
+    packet = json.loads(original.serialize_worker_draft(draft))
+    assert packet["schema"] == original.STREAM_DRAFT_SCHEMA
+    assert "projection" not in packet
+    loaded = original.load_worker_draft(original.serialize_worker_draft(draft))
+    assert loaded.projection is None and loaded.candidate_reference == reference
+
+
+def test_stream_worker_preserves_latest_original_product_order_and_ties(tmp_path):
+    reference = candidate_reference_bundle(tmp_path)
+    streamed_seams, streamed_palace, streamed_state = seams()
+    streamed = original.run_original_public_replicate_streaming(
+        candidate_reference=reference,
+        build_id="stream-build",
+        collection_identity="stream-collection",
+        palace_path=tmp_path / "stream-palace",
+        observer=Observer(),
+        seams=streamed_seams,
+        staging_parent=tmp_path,
+    )
+    legacy_seams, legacy_palace, legacy_state = seams()
+    legacy = original.run_original_public_replicate(
+        projection=projection(),
+        build_id="legacy-build",
+        collection_identity="legacy-collection",
+        palace_path=tmp_path / "legacy-palace",
+        observer=Observer(),
+        seams=legacy_seams,
+    )
+    assert streamed.projection is None
+    assert streamed.candidate_reference == reference
+    assert streamed.replicate_without_coordinator_audit["rankings"] == legacy.replicate_without_coordinator_audit["rankings"]
+    assert streamed.replicate_without_coordinator_audit["trace_receipt"] == legacy.replicate_without_coordinator_audit["trace_receipt"]
+    assert streamed_state["reset"] and legacy_state["reset"]
+
+
+def test_stream_coordinator_reaudits_reference_and_rejects_generation_drift(tmp_path):
+    reference = candidate_reference_bundle(tmp_path)
+    injected, _palace, _state = seams()
+    draft = original.run_original_public_replicate_streaming(
+        candidate_reference=reference,
+        build_id="stream-coordinator-build",
+        collection_identity="stream-coordinator-collection",
+        palace_path=tmp_path / "stream-coordinator-palace",
+        observer=Observer(),
+        seams=injected,
+        staging_parent=tmp_path,
+    )
+    completed = original.coordinator_reaudit_streaming_replicate(
+        draft=draft,
+        palace_path=tmp_path / "stream-coordinator-palace",
+        auditor=fake_auditor,
+    )
+    assert completed["index_receipt"]["coordinator_physical_receipt"] == draft.worker_physical_receipt
+    projection_path = Path(reference["bundle_path"]) / reference["projection_path"]
+    projection_path.write_bytes(projection_path.read_bytes() + b" ")
+    with pytest.raises(original.OriginalProductError, match="raw digest drift"):
+        original.coordinator_reaudit_streaming_replicate(
+            draft=draft,
+            palace_path=tmp_path / "stream-coordinator-palace",
+            auditor=lambda **_kwargs: pytest.fail("auditor ran after reference drift"),
+        )
+
+
+def test_stream_reference_and_five_build_artifact_never_embed_sequences(tmp_path):
+    reference = candidate_reference_bundle(tmp_path)
+    completed = []
+    for number in range(5):
+        injected, _palace, _state = seams()
+        draft = original.run_original_public_replicate_streaming(
+            candidate_reference=reference,
+            build_id=f"stream-artifact-build-{number}",
+            collection_identity=f"stream-artifact-collection-{number}",
+            palace_path=tmp_path / f"stream-artifact-palace-{number}",
+            observer=Observer(), seams=injected, staging_parent=tmp_path,
+        )
+        packet = json.loads(original.serialize_worker_draft(draft))
+        replicate_ref = packet["replicate_without_coordinator_audit"]
+        assert replicate_ref["schema"] == original.ORIGINAL_REPLICATE_REFERENCE_SCHEMA
+        assert "rankings" not in replicate_ref and "trace_receipt" not in replicate_ref
+        completed_reference = original.coordinator_reaudit_streaming_replicate(
+            draft=draft, palace_path=tmp_path / f"stream-artifact-palace-{number}", auditor=fake_auditor,
+        )
+        assert original.coordinator_reaudit_streaming_replicate(
+            draft=draft, palace_path=tmp_path / f"stream-artifact-palace-{number}", auditor=fake_auditor,
+        ).as_reference() == completed_reference.as_reference()
+        completed.append(completed_reference.as_reference())
+    artifact = original.wrap_original_public_rankings_streaming(
+        candidate_reference=reference, replicate_references=completed,
+        model_receipt={"model": "test"}, code_receipt={"commit": h("code")},
+        artifact_path=tmp_path / "original-artifact.json", ready_path=tmp_path / "original-artifact.READY.json",
+    )
+    assert artifact["replicate_count"] == 5
+    assert "rankings" not in json.loads((tmp_path / "original-artifact.json").read_text())
+    assert original.load_original_public_artifact_reference(tmp_path / "original-artifact.READY.json") == artifact
+
+
+def test_stream_memory_does_not_grow_with_persisted_output_rows(tmp_path):
+    reference = candidate_reference_bundle(tmp_path, query_count=250)
+    injected, _palace, _state = seams()
+    tracemalloc.start()
+    before = tracemalloc.take_snapshot()
+    draft = original.run_original_public_replicate_streaming(
+        candidate_reference=reference,
+        build_id="stream-memory-build",
+        collection_identity="stream-memory-collection",
+        palace_path=tmp_path / "stream-memory-palace",
+        observer=Observer(), seams=injected, staging_parent=tmp_path,
+    )
+    after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+    # The seam has 250 queries; the assertion guards against retaining the
+    # full logical arrays in the returned draft while still allowing normal
+    # SQLite/JSON parser allocations.
+    assert draft.replicate_without_coordinator_audit.as_reference()["schema"] == original.ORIGINAL_REPLICATE_REFERENCE_SCHEMA
+    assert sum(stat.size_diff for stat in after.compare_to(before, "filename") if "aerp7_original_product.py" in str(stat.traceback)) < 2_000_000
+
+
+def test_stream_reference_exposes_ready_bound_cursors_and_resource_summary(tmp_path):
+    reference = candidate_reference_bundle(tmp_path)
+    injected, _palace, _state = seams()
+    draft = original.run_original_public_replicate_streaming(
+        candidate_reference=reference,
+        build_id="stream-cursor-build",
+        collection_identity="stream-cursor-collection",
+        palace_path=tmp_path / "stream-cursor-palace",
+        observer=Observer(),
+        seams=injected,
+        staging_parent=tmp_path,
+    )
+    replicate = draft.replicate_without_coordinator_audit
+    ranking_cursor = replicate.ranking_cursor()
+    measurement_cursor = replicate.measurement_cursor()
+    assert not isinstance(ranking_cursor, list)
+    assert len(ranking_cursor) == reference["query_count"]
+    assert ranking_cursor[0]["item_id"] == sorted(item["item_id"] for item in projection()["items"])[0]
+    assert ranking_cursor.sha256() == original._digest_sequence(iter(ranking_cursor))
+    assert len(measurement_cursor) == reference["query_count"]
+    summary = replicate.sequence_summary()
+    assert summary["rankings"]["count"] == reference["query_count"]
+    assert summary["measurements"]["count"] == reference["query_count"]
+    assert summary["rankings"]["sha256"] == replicate.ranking_cursor().sha256()
+    resource_summary = replicate.resource_summary()
+    assert resource_summary["resources"]["peak_rss_bytes"] == 123
+    assert resource_summary["resources"]["query_embedding"]["calls"] == reference["query_count"]
+    candidate_index = resource_summary["resources"]["candidate_index"]
+    assert candidate_index["peak_bytes"] >= candidate_index["final_bytes"] > 0
+    assert candidate_index["projection_bytes"] == (Path(reference["bundle_path"]) / reference["projection_path"]).stat().st_size
+    assert candidate_index["peak_to_projection_ratio"] >= 0
+    assert not list(tmp_path.rglob("candidate-index.sqlite*"))
+
+
+@pytest.mark.skipif(os.environ.get("AERP7_RUN_LARGE_MEMORY_REGRESSION") != "1", reason="set AERP7_RUN_LARGE_MEMORY_REGRESSION=1 for 100k/200k seam run")
+@pytest.mark.parametrize("query_count", (100_000, 200_000))
+def test_stream_actual_public_seam_memory_scales_from_100k_to_200k(tmp_path, query_count):
+    """The real public upsert/search seam must not retain full query output."""
+    bundle_root = tmp_path / f"bundle-{query_count}"
+    bundle_root.mkdir()
+    reference = candidate_reference_bundle(bundle_root, query_count=query_count)
+    palace, state = Palace(), {"reset": False}
+    searcher = BoundedSearcher(palace, state)
+    seams = original.OriginalProductSeams(
+        palace=palace,
+        searcher=searcher,
+        reset_backends=lambda _path: state.update(reset=True) or {"verified_system_released": True, "closed_backend_client_count": 1},
+        auditor=fake_auditor,
+    )
+    tracemalloc.start()
+    before = tracemalloc.take_snapshot()
+    draft = original.run_original_public_replicate_streaming(
+        candidate_reference=reference,
+        build_id=f"stream-large-{query_count}",
+        collection_identity=f"stream-large-collection-{query_count}",
+        palace_path=tmp_path / f"palace-{query_count}",
+        observer=Observer(),
+        seams=seams,
+        staging_parent=tmp_path,
+    )
+    after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+    module_growth = sum(stat.size_diff for stat in after.compare_to(before, "filename") if "aerp7_original_product.py" in str(stat.traceback))
+    assert draft.replicate_without_coordinator_audit.as_reference()["schema"] == original.ORIGINAL_REPLICATE_REFERENCE_SCHEMA
+    assert searcher.call_count == query_count
+    assert module_growth < 8_000_000
+    assert not list(tmp_path.rglob("candidate-index.sqlite*"))
+
+
+def test_stream_coordinator_retry_repairs_ready_after_atomic_replace_failure(tmp_path, monkeypatch):
+    reference = candidate_reference_bundle(tmp_path)
+    injected, _palace, _state = seams()
+    palace_path = tmp_path / "stream-retry-palace"
+    draft = original.run_original_public_replicate_streaming(
+        candidate_reference=reference,
+        build_id="stream-retry-build",
+        collection_identity="stream-retry-collection",
+        palace_path=palace_path,
+        observer=Observer(),
+        seams=injected,
+        staging_parent=tmp_path,
+    )
+    real_replace = original.os.replace
+    injected_failure = False
+
+    def fail_ready_replace(source, destination):
+        nonlocal injected_failure
+        if str(destination).endswith(".READY.json") and not injected_failure:
+            injected_failure = True
+            raise OSError("injected READY publication failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(original.os, "replace", fail_ready_replace)
+    with pytest.raises(original.OriginalProductError, match="READY publication failed"):
+        original.coordinator_reaudit_streaming_replicate(
+            draft=draft, palace_path=palace_path, auditor=fake_auditor,
+        )
+    assert injected_failure is True
+    monkeypatch.setattr(original.os, "replace", real_replace)
+    repaired = original.coordinator_reaudit_streaming_replicate(
+        draft=draft, palace_path=palace_path, auditor=fake_auditor,
+    )
+    assert repaired.as_reference()["state"] == "coordinator_complete"
+    assert original.load_original_replicate_reference(repaired.as_reference()["ready_path"]) == repaired.as_reference()
 
 
 class Collection:
@@ -158,6 +478,127 @@ def test_direct_dynamic_audit_receipts_the_one_allowed_length_bin_normalization(
     }
 
 
+def test_chroma_audit_requires_finite_pages_and_preserves_v38_embedding_digest(monkeypatch, tmp_path):
+    monkeypatch.setattr(original, "ORIGINAL_CHROMA_AUDIT_BATCH_SIZE", 2)
+    physical = ["physical-z", "physical-a", "physical-m"]
+    vectors = [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]
+
+    class BoundedCollection:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, **kwargs):
+            # This fake deliberately rejects the old unbounded call shape.
+            assert kwargs["limit"] == 2
+            assert kwargs["limit"] is not None
+            assert kwargs["offset"] >= 0
+            assert kwargs["include"] == ["embeddings"]
+            self.calls.append(dict(kwargs))
+            start = kwargs["offset"]
+            stop = min(start + kwargs["limit"], len(physical))
+            return {"ids": physical[start:stop], "embeddings": vectors[start:stop]}
+
+    collection = BoundedCollection()
+    actual = original._stream_chroma_embedding_receipt(
+        collection=collection, expected_ids=sorted(physical), temporary_parent=tmp_path,
+    )
+    expected_vector_sha, expected_count, expected_dimension = original.v2._float32_embedding_digest(physical, vectors)
+    assert actual == (
+        expected_vector_sha,
+        expected_count,
+        expected_dimension,
+        original._digest(sorted(physical)),
+    )
+    assert [call["offset"] for call in collection.calls] == [0, 2]
+    assert all(call["limit"] == original.ORIGINAL_CHROMA_AUDIT_BATCH_SIZE for call in collection.calls)
+    assert not list(tmp_path.glob(".aerp7-chroma-audit-*"))
+
+
+@pytest.mark.skipif(os.environ.get("AERP7_RUN_LARGE_MEMORY_REGRESSION") != "1", reason="set AERP7_RUN_LARGE_MEMORY_REGRESSION=1 for 100k/200k direct Chroma seam run")
+@pytest.mark.parametrize("physical_count", (100_000, 200_000))
+def test_direct_dynamic_audit_actual_paginated_seam_memory_scales(monkeypatch, tmp_path, physical_count):
+    """The direct audit must not retain all Chroma IDs or 384d vectors."""
+    graph_rows = [
+        {"path": f"segment/{name}", "bytes": number, "sha256": chr(97 + number) * 64}
+        for number, name in enumerate(original.rank.ORIGINAL_GRAPH_NAMES)
+    ]
+
+    def storage(length_sha256):
+        immutable = [
+            graph_rows[0], graph_rows[1],
+            {"path": graph_rows[2]["path"], "bytes": graph_rows[2]["bytes"], "sha256": length_sha256},
+            graph_rows[3],
+        ]
+        return {
+            "immutable_snapshot": immutable,
+            "immutable_sha256": original._digest(immutable),
+            "files": [
+                {"name": row["path"].rsplit("/", 1)[1], "bytes": row["bytes"], "sha256": row["sha256"]}
+                for row in immutable
+            ],
+        }
+
+    monkeypatch.setattr(original.v2, "_audit_storage_digest", lambda _path: next(storage_receipts))
+    monkeypatch.setattr(original.v2, "_sqlite_hnsw_configuration", lambda _path: original.rank.ORIGINAL_HNSW_CONFIG)
+    monkeypatch.setattr(original.v2, "_sqlite_semantic_snapshot", lambda _path: {"semantic_sha256": "s" * 64})
+    monkeypatch.setattr(original.v2, "_validated_acquire_write_delta", lambda _before, _after: original.rank.ORIGINAL_OPERATIONAL_DELTA)
+    storage_receipts = iter([storage("a" * 64), storage("b" * 64)])
+
+    class ExpectedIDs:
+        def __len__(self):
+            return physical_count
+
+        def __iter__(self):
+            for number in range(physical_count):
+                yield f"physical-{number:08d}"
+
+    class StreamingCollection:
+        def __init__(self):
+            self.calls = []
+            self.zero = [0.0] * 384
+
+        def get(self, **kwargs):
+            assert kwargs["include"] == ["embeddings"]
+            assert kwargs["limit"] == original.ORIGINAL_CHROMA_AUDIT_BATCH_SIZE
+            assert isinstance(kwargs["limit"], int) and kwargs["limit"] > 0
+            start = kwargs["offset"]
+            self.calls.append((start, kwargs["limit"]))
+            if start >= physical_count:
+                return {"ids": [], "embeddings": []}
+            stop = min(start + kwargs["limit"], physical_count)
+            ids = [f"physical-{number:08d}" for number in range(start, stop)]
+            return {"ids": ids, "embeddings": [self.zero] * len(ids)}
+
+    collection = StreamingCollection()
+
+    class Client:
+        def get_collection(self, _name):
+            return collection
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "chromadb", SimpleNamespace(PersistentClient=lambda **_kwargs: Client()))
+    tracemalloc.start()
+    before = tracemalloc.take_snapshot()
+    receipt = original._direct_dynamic_audit(
+        palace_path=tmp_path / "palace", expected_ids=ExpectedIDs(),
+    )
+    after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+    module_growth = sum(
+        stat.size_diff
+        for stat in after.compare_to(before, "filename")
+        if "aerp7_original_product.py" in str(stat.traceback)
+    )
+    assert receipt["physical_count"] == physical_count
+    assert receipt["embedding"]["count"] == physical_count
+    assert receipt["embedding"]["dimension"] == 384
+    assert collection.calls and all(limit == original.ORIGINAL_CHROMA_AUDIT_BATCH_SIZE for _offset, limit in collection.calls)
+    assert module_growth < 16_000_000
+    assert not list(tmp_path.glob(".aerp7-chroma-audit-*"))
+
+
 @pytest.mark.parametrize(
     "after",
     [
@@ -227,6 +668,18 @@ class Searcher:
         assert self.state["reset"], "queries must occur only after cold reopen barrier"
         assert max_distance == 0.0 and candidate_strategy == "vector" and collection_name == "mempalace_drawers"
         self.calls.append((palace_path, query, room, n_results))
+        return {"results": [{"source_path": record["id"]} for record in self.palace.records.values() if record["metadata"]["room"] == room][:n_results]}
+
+
+class BoundedSearcher:
+    """The same public search seam without retaining a full query log."""
+
+    def __init__(self, palace, state): self.palace, self.state, self.call_count = palace, state, 0
+
+    def search_memories(self, query, palace_path, *, room, n_results, max_distance, candidate_strategy, collection_name):
+        assert self.state["reset"]
+        assert max_distance == 0.0 and candidate_strategy == "vector" and collection_name == "mempalace_drawers"
+        self.call_count += 1
         return {"results": [{"source_path": record["id"]} for record in self.palace.records.values() if record["metadata"]["room"] == room][:n_results]}
 
 

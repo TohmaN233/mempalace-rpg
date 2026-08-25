@@ -39,6 +39,15 @@ def _candidate_receipt(candidate: Path, projection):
         "projection_canonical_sha256": canonical_sha256(projection),
         "query_count": len(projection["items"]),
         "candidate_text_count": sum(len(corpus["candidates"]) for corpus in projection["corpora"]),
+        "candidate_reference": {
+            "schema": confirmation.CANDIDATE_PROJECTION_REFERENCE_SCHEMA,
+            "bundle_path": str(candidate.resolve()), "projection_path": "projection.json",
+            "ready_path": "READY.json", "generation_id": ready["generation_id"],
+            "projection_raw_sha256": hashlib.sha256(projection_raw).hexdigest(),
+            "projection_canonical_sha256": canonical_sha256(projection),
+            "dataset": dict(projection["dataset"]), "query_count": len(projection["items"]),
+            "candidate_text_count": sum(len(corpus["candidates"]) for corpus in projection["corpora"]),
+        },
     }
 
 

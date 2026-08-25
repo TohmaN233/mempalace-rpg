@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,78 @@ from benchmarks import aerp7_convomem_confirmation as confirmation
 from benchmarks import aerp_execution_checkpoint as checkpoint
 from benchmarks import aerp7_convomem_rank as rank
 from benchmarks.aerp7_convomem_confirmation import CustodyError
+
+
+def _disk_calibration(model_receipt):
+    current = {key: 100 for key in ("strong_raw", "static_p5_primary", "static_p5_repeat", "six_view_secondary")}
+    originals = {f"replicate_{index:02d}": 100 for index in range(1, 6)}
+    row = {
+        "schema": authoring.formal.PRIVATE_DISK_CALIBRATION_SCHEMA, "calibration_id": "unit-calibration",
+        "source_manifest_sha256": authoring._digest(authoring.CENSUS_SOURCE_MANIFEST),
+        "model_receipt_sha256": authoring._digest(model_receipt),
+        "candidate_resident_bytes": 100, "custody_resident_bytes": 100, "custody_sqlite_store_bytes": 100,
+        "shared_current_store_bytes": 100, "current_ranking_measurement_bytes": current,
+        "original_replicate_store_bytes": originals, "original_candidate_index_peak_bytes": 100,
+        "original_chroma_peak_bytes": 100, "original_chroma_peak_policy": "sequential_one_build_peak_v1",
+        "scoring_ephemeral_store_bytes": 100, "scoring_report_bytes": 100, "safety_margin_bytes": 100,
+    }
+    row["total_required_additional_bytes"] = sum((
+        row["candidate_resident_bytes"], row["custody_resident_bytes"], row["custody_sqlite_store_bytes"],
+        row["shared_current_store_bytes"], row["original_candidate_index_peak_bytes"], row["original_chroma_peak_bytes"],
+        row["scoring_ephemeral_store_bytes"], row["scoring_report_bytes"], row["safety_margin_bytes"],
+        *current.values(), *originals.values(),
+    ))
+    row["calibration_sha256"] = authoring.formal.private_disk_calibration_digest(row)
+    return row
+
+
+def _private_preflight(calibration, *, custody_reference_sha256="a" * 64, candidate_input=10, custody_input=11,
+                       item_count=2, evidence_count=3):
+    row = {
+        "schema": authoring.formal.PRIVATE_DISK_PREFLIGHT_SCHEMA, "plan_sha256": "b" * 64,
+        "calibration": calibration, "custody_reference_sha256": custody_reference_sha256, "generation_id": "generation",
+        "candidate_input_bytes": candidate_input, "custody_input_bytes": custody_input,
+        "custody_logical_item_count": item_count, "custody_evidence_span_count": evidence_count,
+        "custody_sqlite_store_bytes": calibration["custody_sqlite_store_bytes"],
+        "custody_peak_disk_input_and_store_bytes": candidate_input + custody_input + calibration["custody_sqlite_store_bytes"],
+    }
+    row["preflight_sha256"] = authoring.formal.private_disk_preflight_digest(row)
+    row["preflight_hmac"] = "d" * 64
+    return row
+
+
+def test_private_disk_preflight_requires_calibrated_chroma_and_exact_component_arithmetic():
+    model = {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": "a" * 64, "bytes": 1}]}
+    calibration = _disk_calibration(model)
+    row = _private_preflight(calibration)
+    assert authoring.formal.validate_private_disk_preflight(row)["calibration"]["original_chroma_peak_bytes"] == 100
+    missing = dict(calibration); missing["original_chroma_peak_bytes"] = 0
+    missing["calibration_sha256"] = authoring.formal.private_disk_calibration_digest(missing)
+    with pytest.raises(CustodyError, match="original_chroma_missing"):
+        authoring.formal.validate_private_disk_calibration(missing)
+    tampered = dict(calibration); tampered["total_required_additional_bytes"] += 1
+    tampered["calibration_sha256"] = authoring.formal.private_disk_calibration_digest(tampered)
+    with pytest.raises(CustodyError, match="arithmetic"):
+        authoring.formal.validate_private_disk_calibration(tampered)
+
+
+def test_private_disk_preflight_rechecks_reference_and_fails_on_insufficient_free_space(tmp_path, monkeypatch):
+    model = {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": "a" * 64, "bytes": 1}]}
+    calibration = _disk_calibration(model)
+    candidate_root, custody_root, staging = tmp_path / "candidate", tmp_path / "custody", tmp_path / "staging"
+    candidate_root.mkdir(); custody_root.mkdir(); staging.mkdir()
+    (candidate_root / "projection.json").write_bytes(b"candidate")
+    (custody_root / "sealed-custody.json").write_bytes(b"custody")
+    candidate = {"bundle_path": str(candidate_root)}
+    reference = {"generation_id": "generation", "item_count": 2, "evidence_span_count": 3}
+    row = _private_preflight(calibration, custody_reference_sha256=authoring.formal._digest(reference), candidate_input=9, custody_input=7)
+    monkeypatch.setattr(authoring.formal.confirmation, "custody_reference", lambda **_kwargs: reference)
+    monkeypatch.setattr(authoring.formal.shutil, "disk_usage", lambda _path: SimpleNamespace(free=calibration["total_required_additional_bytes"] - 1))
+    with pytest.raises(CustodyError, match="insufficient_free_bytes"):
+        authoring.formal.enforce_private_disk_preflight(
+            preflight=row, candidate_bundle_root=candidate_root, custody_bundle_root=custody_root,
+            candidate_reference=candidate, staging_root=staging,
+        )
 
 
 def test_signed_one_shot_plan_is_exact_and_rejects_path_or_hmac_drift(tmp_path: Path) -> None:
@@ -41,10 +114,12 @@ def test_signed_one_shot_plan_is_exact_and_rejects_path_or_hmac_drift(tmp_path: 
         "preparse_current_code_receipt": {"head": "a" * 40, "tree": "b" * 40, "diff_digest": "c" * 64, "dirty_policy": "clean_required"},
         "model_receipt": {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": hashlib.sha256(b"w").hexdigest(), "bytes": 1}]},
     }
+    fields["disk_preflight_calibration"] = _disk_calibration(fields["model_receipt"])
     plan = authoring.sign_one_shot_plan(fields, operator_capability=secret)
     signed = authoring.validate_one_shot_plan(plan, operator_capability=secret)
     assert signed["plan_sha256"] == plan["plan_sha256"]
     assert signed["census_semantics"]["selection_algorithm"] == confirmation.CENSUS_SELECTION_ALGORITHM
+    assert signed["census_semantics"]["candidate_projection_transport"] == authoring.formal.CANDIDATE_TRANSPORT
     plan["output_dir"] = str((tmp_path / "other").resolve())
     with pytest.raises(CustodyError, match="plan_digest"):
         authoring.validate_one_shot_plan(plan, operator_capability=secret)
@@ -68,6 +143,7 @@ def test_signed_one_shot_plan_allows_only_a_shared_canonical_and_premix_source_r
         "preparse_current_code_receipt": {"head": "a" * 64, "tree": "b" * 64, "diff_digest": "c" * 64, "dirty_policy": "clean_required"},
         "model_receipt": {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": hashlib.sha256(b"w").hexdigest(), "bytes": 1}]},
     }
+    fields["disk_preflight_calibration"] = _disk_calibration(fields["model_receipt"])
     plan = authoring.sign_one_shot_plan(fields, operator_capability=secret)
     assert authoring.validate_one_shot_plan(plan, operator_capability=secret)["canonical_root"] == source_root
     collision = dict(fields); collision["output_dir"] = source_root

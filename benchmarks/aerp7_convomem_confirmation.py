@@ -20,13 +20,16 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 SCHEMA = "aerp7-convomem-candidate-projection-v3"
 CUSTODY_SCHEMA = "aerp7-convomem-sealed-custody-v3"
 CANDIDATE_READY_SCHEMA = "aerp7-convomem-candidate-ready-v3"
 CUSTODY_READY_SCHEMA = "aerp7-convomem-custody-ready-v3"
+CANDIDATE_PROJECTION_REFERENCE_SCHEMA = "aerp7-convomem-candidate-projection-reference-v1"
+CENSUS_SELECTION_REFERENCE_SCHEMA = "aerp7-convomem-census-selection-reference-v1"
+CUSTODY_REFERENCE_SCHEMA = "aerp7-convomem-custody-reference-v1"
 SELECTION_ALGORITHM = "hmac-sha256-revision-bound-persona-group-tier-context-v1"
 CENSUS_SELECTION_ALGORITHM = "aerp7-convomem-census-observed-pairs-v2"
 CENSUS_CROSSWALK_SEMANTICS = "all_embedded_evidence_key_to_case_pairs_v1"
@@ -124,6 +127,19 @@ class StreamingIndex:
             directory.rmdir()
         except OSError as exc:
             raise CustodyError("streaming_index_cleanup_rmdir_failed") from exc
+
+
+@dataclass(frozen=True)
+class CensusSelectionReference:
+    """Small handle for the frozen SQL-selected census pairs.
+
+    The selected-pairs relation remains in the owned staging database.  Callers
+    stream it in ordinal order and never receive a census-sized Python list.
+    """
+
+    database: Path
+    item_count: int
+    schema: str = CENSUS_SELECTION_REFERENCE_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -1369,7 +1385,7 @@ def _bad_key_set(database: Path) -> set[str]:
         connection.close()
 
 
-def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: SelectionConfig, desired_contexts: Sequence[float], ledger: Mapping[str, Any]) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], dict[str, Any]]:
+def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: SelectionConfig, desired_contexts: Sequence[float], ledger: Mapping[str, Any]) -> tuple[Sequence[tuple[dict[str, Any], dict[str, Any]]] | CensusSelectionReference, dict[str, Any]]:
     """Choose only SQL-indexed, globally eligible rows; raw labels/messages stay unread."""
     config.validate()
     connection = _index_connection(database)
@@ -1400,9 +1416,6 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
             if canonical_sha256(missing) != ledger["reasons"]["missing_requested_context_sizes"]["keys_sha256"]:
                 raise CustodyError("quarantine_ledger_drift")
             connection.executemany("INSERT OR IGNORE INTO forbidden_keys VALUES(?)", ((key,) for key in missing))
-        rows = connection.execute(
-            "SELECT c.key_sha, c.locator, c.ordinal, c.persona, c.question, c.directory FROM canonical_items c WHERE NOT EXISTS (SELECT 1 FROM forbidden_keys f WHERE f.key_sha=c.key_sha)",
-        ).fetchall()
         if config.is_census_v1:
             nonzero = {reason: int(data["count"]) for reason, data in ledger["reasons"].items() if int(data["count"]) != 0}
             if nonzero:
@@ -1413,36 +1426,47 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
             forbidden_count = connection.execute("SELECT count(*) FROM forbidden_keys").fetchone()[0]
             if forbidden_count:
                 raise CrosswalkError("census_candidate_custody_crosswalk_invalid", forbidden_key_count=forbidden_count)
-            # Every canonical query is a member of the estimand.  Do not turn
-            # incomplete personas, duplicate keys, or absent context variants
-            # into silent exclusions.  The SQL index remains the only source
-            # read after staged ingestion; labels never enter this branch.
-            selected: list[tuple[dict[str, Any], dict[str, Any]]] = []
-            selected_personas: list[str] = []
-            variants: list[str] = []
-            seen_personas: set[str] = set()
-            contexts_by_key: dict[str, set[float]] = {}
-            cases_by_key_context: dict[tuple[str, float], set[str]] = {}
-            personas_by_case: dict[str, set[str]] = {}
-            for row in sorted(rows, key=lambda item: (item["persona"], json.loads(item["directory"])["group"], item["locator"], item["ordinal"])):
-                persona_id = _opaque(secret, revision, "persona", row["persona"])
-                if persona_id not in seen_personas:
-                    selected_personas.append(persona_id); seen_personas.add(persona_id)
-                cases = connection.execute(
-                    "SELECT pc.case_sha, pc.locator, pc.context_size FROM premix_keys p JOIN premix_cases pc ON pc.case_sha=p.case_sha WHERE p.key_sha=? ORDER BY pc.context_size, pc.case_sha",
-                    (row["key_sha"],),
-                ).fetchall()
-                for case in cases:
-                    context_size = float(case["context_size"])
-                    contexts_by_key.setdefault(row["key_sha"], set()).add(context_size)
-                    cases_by_key_context.setdefault((row["key_sha"], context_size), set()).add(case["case_sha"])
-                    personas_by_case.setdefault(case["case_sha"], set()).add(persona_id)
-                canonical = {"key_sha": row["key_sha"], "locator": row["locator"], "ordinal": row["ordinal"], "persona": row["persona"], "persona_id": persona_id, "question": row["question"], "directory": json.loads(row["directory"])}
-                for case in cases:
-                    selected.append((canonical, {"case_sha": case["case_sha"], "locator": json.loads(case["locator"]), "context_size": float(case["context_size"])}))
-                    variants.append(case["case_sha"])
-            if not selected:
+            # Every canonical query is a member of the estimand.  The frozen
+            # relation holds only rowids; canonical/case payloads are decoded
+            # later, one pair at a time, by the materializer cursor.
+            connection.executescript("""
+                CREATE TABLE selected_pairs(
+                    ordinal INTEGER PRIMARY KEY,
+                    canonical_rowid INTEGER NOT NULL,
+                    case_rowid INTEGER NOT NULL,
+                    UNIQUE(canonical_rowid, case_rowid)
+                );
+                CREATE INDEX selected_pairs_canonical ON selected_pairs(canonical_rowid);
+                CREATE INDEX selected_pairs_case ON selected_pairs(case_rowid);
+            """)
+            connection.execute("""
+                INSERT INTO selected_pairs(ordinal, canonical_rowid, case_rowid)
+                WITH pairs AS (
+                    SELECT DISTINCT c.rowid AS canonical_rowid, pc.rowid AS case_rowid,
+                        c.persona AS persona, json_extract(c.directory, '$.group') AS directory_group,
+                        c.locator AS locator, c.ordinal AS canonical_ordinal,
+                        pc.context_size AS context_size, pc.case_sha AS case_sha
+                    FROM canonical_items c
+                    JOIN premix_keys p ON p.key_sha=c.key_sha
+                    JOIN premix_cases pc ON pc.case_sha=p.case_sha
+                    WHERE NOT EXISTS (SELECT 1 FROM forbidden_keys f WHERE f.key_sha=c.key_sha)
+                )
+                SELECT row_number() OVER (ORDER BY persona, directory_group, locator, canonical_ordinal, context_size, case_sha), canonical_rowid, case_rowid
+                FROM pairs
+            """)
+            selected_count = connection.execute("SELECT count(*) FROM selected_pairs").fetchone()[0]
+            if selected_count <= 0:
                 raise CustodyError("census_selection_empty")
+            connection.execute("CREATE TEMP TABLE selected_personas(persona_id TEXT PRIMARY KEY)")
+            for persona_row in connection.execute("SELECT DISTINCT c.persona FROM selected_pairs s JOIN canonical_items c ON c.rowid=s.canonical_rowid"):
+                connection.execute("INSERT INTO selected_personas VALUES(?)", (_opaque(secret, revision, "persona", persona_row[0]),))
+            def array_sha(query: str, mapper: Callable[[sqlite3.Row], Any] = lambda row: row[0]) -> str:
+                return _stream_array_sha256((_bytes(mapper(row)) for row in connection.execute(query)))
+            personas_sha = array_sha("SELECT persona_id FROM selected_personas ORDER BY persona_id")
+            variants_sha = array_sha("SELECT pc.case_sha FROM selected_pairs s JOIN premix_cases pc ON pc.rowid=s.case_rowid ORDER BY s.ordinal")
+            persona_count = connection.execute("SELECT count(*) FROM selected_personas").fetchone()[0]
+            query_count = connection.execute("SELECT count(*) FROM canonical_items").fetchone()[0]
+            indexed_contexts = [float(row[0]) for row in connection.execute("SELECT DISTINCT context_size FROM premix_cases ORDER BY context_size")]
             all_tiers = [row[0] for row in connection.execute("SELECT DISTINCT json_extract(directory, '$.tier') FROM canonical_items ORDER BY 1")]
             receipt = {
                 "algorithm": CENSUS_SELECTION_ALGORITHM,
@@ -1454,24 +1478,24 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
                 # The public validator recomputes this from opaque IDs; the
                 # selector's raw-persona traversal must not leak into or alter
                 # the census seal.
-                "selected_persona_ids_sha256": canonical_sha256(sorted(selected_personas)),
-                "holdout_persona_set_sha256": canonical_sha256(sorted(selected_personas)),
+                "selected_persona_ids_sha256": personas_sha,
+                "holdout_persona_set_sha256": personas_sha,
                 "group_values_sha256": canonical_sha256(groups),
                 "tier_values_sha256": canonical_sha256(all_tiers),
-                "context_values_sha256": canonical_sha256(_indexed_context_values(database)),
+                "context_values_sha256": canonical_sha256(indexed_contexts),
                 "desired_context_values_sha256": canonical_sha256(list(desired_contexts)),
-                "variant_selection_sha256": canonical_sha256(variants),
-                "selected_item_context_count": len(selected),
-                "candidate_visible_query_count": len(rows),
-                "candidate_visible_persona_count": len(selected_personas),
+                "variant_selection_sha256": variants_sha,
+                "selected_item_context_count": selected_count,
+                "candidate_visible_query_count": query_count,
+                "candidate_visible_persona_count": persona_count,
                 "candidate_visible_context_count": len(desired_contexts),
-                "denominators_sha256": canonical_sha256({"query_count": len(selected), "candidate_visible_query_count": len(rows), "persona_count": len(selected_personas), "context_count": len(desired_contexts)}),
+                "denominators_sha256": canonical_sha256({"query_count": selected_count, "candidate_visible_query_count": query_count, "persona_count": persona_count, "context_count": len(desired_contexts)}),
                 "item_supplement_count": 0,
                 "observed_crosswalk": {
                     "semantics": CENSUS_CROSSWALK_SEMANTICS,
-                    "multi_persona_corpus_count": sum(len(personas) > 1 for personas in personas_by_case.values()),
-                    "sparse_query_context_count": sum(contexts != {float(value) for value in desired_contexts} for contexts in contexts_by_key.values()),
-                    "multi_case_query_context_count": sum(len(cases) > 1 for cases in cases_by_key_context.values()),
+                    "multi_persona_corpus_count": connection.execute("SELECT count(*) FROM (SELECT s.case_rowid FROM selected_pairs s JOIN canonical_items c ON c.rowid=s.canonical_rowid GROUP BY s.case_rowid HAVING count(DISTINCT c.persona)>1)").fetchone()[0],
+                    "sparse_query_context_count": connection.execute("SELECT count(*) FROM (SELECT s.canonical_rowid FROM selected_pairs s JOIN premix_cases pc ON pc.rowid=s.case_rowid GROUP BY s.canonical_rowid HAVING count(DISTINCT pc.context_size) != ?)", (len(desired_contexts),)).fetchone()[0],
+                    "multi_case_query_context_count": connection.execute("SELECT count(*) FROM (SELECT s.canonical_rowid, pc.context_size FROM selected_pairs s JOIN premix_cases pc ON pc.rowid=s.case_rowid GROUP BY s.canonical_rowid, pc.context_size HAVING count(DISTINCT s.case_rowid)>1)").fetchone()[0],
                 },
                 "exclusion_counts": {
                     "multi_persona_cases": ledger["reasons"]["multi_persona_cases"]["count"],
@@ -1484,7 +1508,11 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
                 "quarantine_reason_digests": {reason: ledger["reasons"][reason]["keys_sha256"] for reason in ledger["reasons"]},
                 "quarantine_ledger_sha256": ledger["ledger_sha256"],
             }
-            return selected, receipt
+            connection.commit()
+            return CensusSelectionReference(database=database, item_count=selected_count), receipt
+        rows = connection.execute(
+            "SELECT c.key_sha, c.locator, c.ordinal, c.persona, c.question, c.directory FROM canonical_items c WHERE NOT EXISTS (SELECT 1 FROM forbidden_keys f WHERE f.key_sha=c.key_sha)",
+        ).fetchall()
         by_persona: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
             by_persona.setdefault(row["persona"], []).append(row)
@@ -1549,59 +1577,247 @@ def _selection_rows_sql(database: Path, secret: bytes, revision: str, config: Se
         connection.close()
 
 
-def _selected_payloads_sql(database: Path, selected: Sequence[tuple[dict[str, Any], dict[str, Any]]], secret: bytes, revision: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Read labels, locators and messages only for previously selected SQL rows."""
+def _iter_selected_payloads_sql(database: Path, selected: Sequence[tuple[dict[str, Any], dict[str, Any]]] | CensusSelectionReference, secret: bytes, revision: str) -> Iterator[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """Yield one decoded selected payload at a time; callers choose retention."""
     connection = _index_connection(database)
     connection.row_factory = sqlite3.Row
     try:
-        corpora: dict[str, dict[str, Any]] = {}
-        projection_items: list[dict[str, Any]] = []; custody_items: list[dict[str, Any]] = []
+        if isinstance(selected, CensusSelectionReference):
+            if selected.database != database:
+                raise CustodyError("census_selection_reference_database_drift")
+            selected_rows: Iterator[Any] = iter(connection.execute("""
+                SELECT c.key_sha, c.locator, c.ordinal, c.persona, c.question, c.directory,
+                    c.answer, c.category, c.conversations, c.labels,
+                    pc.case_sha, pc.locator AS case_locator, pc.context_size, pc.messages
+                FROM selected_pairs s
+                JOIN canonical_items c ON c.rowid=s.canonical_rowid
+                JOIN premix_cases pc ON pc.rowid=s.case_rowid
+                ORDER BY s.ordinal
+            """))
+            for selected_row in selected_rows:
+                item = {"key_sha": selected_row["key_sha"], "locator": selected_row["locator"], "ordinal": selected_row["ordinal"], "persona": selected_row["persona"], "persona_id": _opaque(secret, revision, "persona", selected_row["persona"]), "question": selected_row["question"], "directory": json.loads(selected_row["directory"])}
+                case = {"case_sha": selected_row["case_sha"], "locator": json.loads(selected_row["case_locator"]), "context_size": float(selected_row["context_size"])}
+                canonical_row = selected_row
+                case_row = selected_row
+                yield from _selected_payload_row(item, case, canonical_row, case_row, secret, revision)
+            return
         for item, case in selected:
             canonical_row = connection.execute("SELECT answer, category, conversations, labels, directory FROM canonical_items WHERE key_sha=? AND locator=? AND ordinal=?", (item["key_sha"], item["locator"], item["ordinal"])).fetchone()
             case_row = connection.execute("SELECT messages FROM premix_cases WHERE case_sha=?", (case["case_sha"],)).fetchone()
             if canonical_row is None or case_row is None:
                 raise CustodyError("selected_index_row_missing")
-            locator = {"path": item["locator"], "ordinal": item["ordinal"]}
-            canonical_id = _opaque(secret, revision, "canonical-item", locator)
-            messages = json.loads(case_row["messages"])
-            corpus_id = _opaque(secret, revision, "corpus", case["locator"])
-            candidates = []
-            for message in messages:
-                message_id = _opaque(secret, revision, "message", {"conversation_id": message["conversation_id"], "message_ordinal": message["raw_message_ordinal"]})
-                candidates.append({
-                    "message_id": message_id,
-                    "opaque_conversation_id": _opaque(secret, revision, "conversation", message["conversation_id"]),
-                    "conversation_order": message["conversation_ordinal"],
-                    "message_order": message["message_ordinal"],
-                    "corpus_order": message["corpus_ordinal"],
-                    "speaker": message["speaker"],
-                    "text": message["text"],
-                })
-            declared_context_size = case["context_size"]
-            if isinstance(declared_context_size, bool) or not isinstance(declared_context_size, (int, float)) or not float(declared_context_size).is_integer() or int(declared_context_size) <= 0:
-                raise CustodyError("premix_context_size_invalid")
-            corpora.setdefault(corpus_id, {"corpus_id": corpus_id, "declared_context_size": int(declared_context_size), "actual_conversation_count": len({message["conversation_id"] for message in messages}), "actual_message_count": len(messages), "candidates": candidates})
-            context_id = _opaque(secret, revision, "item-context", {"canonical_item_id": canonical_id, "corpus_id": corpus_id})
-            directory = json.loads(canonical_row["directory"])
-            projection_items.append({
-                "item_id": context_id, "persona_id": item["persona_id"],
-                "query_text": item["question"], "corpus_id": corpus_id,
-                "selection_logical_item_id": _opaque(secret, revision, "selection-logical-item", locator),
-                "selection_logical_binding_witness": _opaque(secret, revision, "selection-logical-binding-witness", locator),
-                "selection_group_id": _opaque(secret, revision, "selection-group", item["directory"]["group"]),
-                "selection_tier_id": _opaque(secret, revision, "selection-tier", directory["tier"]),
-                "selection_variant_id": _opaque(secret, revision, "selection-variant", case["case_sha"]),
-            })
-            if len(candidates) != len(messages):
-                raise CustodyError("selected_message_count_invalid")
-            evidence_conversation_ids = [_opaque(secret, revision, "conversation", conversation_id) for conversation_id in json.loads(canonical_row["conversations"])]
-            candidate_conversation_ids = {candidate["opaque_conversation_id"] for candidate in candidates}
-            if not set(evidence_conversation_ids) <= candidate_conversation_ids:
-                raise CustodyError("evidence_conversation_not_in_corpus")
-            custody_items.append({"item_id": context_id, "canonical_item_id": canonical_id, "persona_id": item["persona_id"], "persona_source_id": item["persona"], "corpus_id": corpus_id, "source_locator": {"canonical": locator, "case": case["locator"]}, "directory": directory, "labels": {"answer": canonical_row["answer"], "message_evidences": json.loads(canonical_row["labels"])}, "evidence_conversation_ids": evidence_conversation_ids, "messages": [{"message_id": candidate["message_id"], "source_locator": message["source_locator"]} for candidate, message in zip(candidates, messages)]})
-        return [corpora[key] for key in sorted(corpora)], projection_items, custody_items
+            yield from _selected_payload_row(item, case, canonical_row, case_row, secret, revision)
     finally:
         connection.close()
+
+
+def _selected_payload_row(item: Mapping[str, Any], case: Mapping[str, Any], canonical_row: Mapping[str, Any], case_row: Mapping[str, Any], secret: bytes, revision: str) -> Iterator[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """Build one selected pair; shared by legacy and persistent cursors."""
+    locator = {"path": item["locator"], "ordinal": item["ordinal"]}
+    canonical_id = _opaque(secret, revision, "canonical-item", locator)
+    messages = json.loads(case_row["messages"])
+    corpus_id = _opaque(secret, revision, "corpus", case["locator"])
+    candidates = []
+    for message in messages:
+        message_id = _opaque(secret, revision, "message", {"conversation_id": message["conversation_id"], "message_ordinal": message["raw_message_ordinal"]})
+        candidates.append({"message_id": message_id, "opaque_conversation_id": _opaque(secret, revision, "conversation", message["conversation_id"]), "conversation_order": message["conversation_ordinal"], "message_order": message["message_ordinal"], "corpus_order": message["corpus_ordinal"], "speaker": message["speaker"], "text": message["text"]})
+    declared_context_size = case["context_size"]
+    if isinstance(declared_context_size, bool) or not isinstance(declared_context_size, (int, float)) or not float(declared_context_size).is_integer() or int(declared_context_size) <= 0:
+        raise CustodyError("premix_context_size_invalid")
+    corpus = {"corpus_id": corpus_id, "declared_context_size": int(declared_context_size), "actual_conversation_count": len({message["conversation_id"] for message in messages}), "actual_message_count": len(messages), "candidates": candidates}
+    context_id = _opaque(secret, revision, "item-context", {"canonical_item_id": canonical_id, "corpus_id": corpus_id})
+    directory = json.loads(canonical_row["directory"])
+    projection_item = {"item_id": context_id, "persona_id": item["persona_id"], "query_text": item["question"], "corpus_id": corpus_id, "selection_logical_item_id": _opaque(secret, revision, "selection-logical-item", locator), "selection_logical_binding_witness": _opaque(secret, revision, "selection-logical-binding-witness", locator), "selection_group_id": _opaque(secret, revision, "selection-group", item["directory"]["group"]), "selection_tier_id": _opaque(secret, revision, "selection-tier", directory["tier"]), "selection_variant_id": _opaque(secret, revision, "selection-variant", case["case_sha"])}
+    if len(candidates) != len(messages):
+        raise CustodyError("selected_message_count_invalid")
+    evidence_conversation_ids = [_opaque(secret, revision, "conversation", conversation_id) for conversation_id in json.loads(canonical_row["conversations"])]
+    candidate_conversation_ids = {candidate["opaque_conversation_id"] for candidate in candidates}
+    if not set(evidence_conversation_ids) <= candidate_conversation_ids:
+        raise CustodyError("evidence_conversation_not_in_corpus")
+    custody_item = {"item_id": context_id, "canonical_item_id": canonical_id, "persona_id": item["persona_id"], "persona_source_id": item["persona"], "corpus_id": corpus_id, "source_locator": {"canonical": locator, "case": case["locator"]}, "directory": directory, "labels": {"answer": canonical_row["answer"], "message_evidences": json.loads(canonical_row["labels"])}, "evidence_conversation_ids": evidence_conversation_ids, "messages": [{"message_id": candidate["message_id"], "source_locator": message["source_locator"]} for candidate, message in zip(candidates, messages)]}
+    yield corpus, projection_item, custody_item
+
+
+def _selected_payloads_sql(database: Path, selected: Sequence[tuple[dict[str, Any], dict[str, Any]]], secret: bytes, revision: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compatibility materializer for small callers; formal publishing streams."""
+    corpora: dict[str, dict[str, Any]] = {}
+    projection_items: list[dict[str, Any]] = []; custody_items: list[dict[str, Any]] = []
+    for corpus, projection_item, custody_item in _iter_selected_payloads_sql(database, selected, secret, revision):
+        corpora.setdefault(corpus["corpus_id"], corpus)
+        projection_items.append(projection_item); custody_items.append(custody_item)
+    return [corpora[key] for key in sorted(corpora)], projection_items, custody_items
+
+
+def _stream_array_sha256(rows: Iterator[bytes]) -> str:
+    """Digest a canonical JSON array without retaining its rows."""
+    digest = hashlib.sha256(); digest.update(b"["); first = True
+    for row in rows:
+        if not first: digest.update(b",")
+        digest.update(row); first = False
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def _persist_census_payloads_sql(database: Path, selected: Sequence[tuple[dict[str, Any], dict[str, Any]]] | CensusSelectionReference, secret: bytes, revision: str) -> int:
+    """Spool exact public rows in SQLite; no selected payload survives a turn."""
+    connection = _index_connection(database)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.executescript("""
+            CREATE TABLE materialized_corpora(corpus_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE materialized_projection_items(ordinal INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE materialized_custody_items(ordinal INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+        """)
+        count = 0
+        for ordinal, (corpus, projection_item, custody_item) in enumerate(_iter_selected_payloads_sql(database, selected, secret, revision)):
+            custody_item["binding_commitment"] = _custody_item_commitment(secret, revision, custody_item, projection_item, corpus)
+            connection.execute("INSERT OR IGNORE INTO materialized_corpora VALUES(?,?)", (corpus["corpus_id"], _bytes(corpus).decode("utf-8")))
+            connection.execute("INSERT INTO materialized_projection_items VALUES(?,?)", (ordinal, _bytes(projection_item).decode("utf-8")))
+            connection.execute("INSERT INTO materialized_custody_items VALUES(?,?)", (ordinal, _bytes(custody_item).decode("utf-8")))
+            count += 1
+        connection.commit()
+        if count == 0:
+            raise CustodyError("census_selection_empty")
+        return count
+    finally:
+        connection.close()
+
+
+def _stream_sql_rows(write: Callable[[bytes], Any], connection: sqlite3.Connection, query: str) -> None:
+    write(b"["); first = True
+    for row in connection.execute(query):
+        if not first: write(b",")
+        write(row[0].encode("utf-8")); first = False
+    write(b"]")
+
+
+def _stream_census_projection(write: Callable[[bytes], Any], database: Path, dataset: Mapping[str, Any], receipt: Mapping[str, Any]) -> None:
+    connection = _index_connection(database)
+    try:
+        write(b'{"corpora":'); _stream_sql_rows(write, connection, "SELECT payload FROM materialized_corpora ORDER BY corpus_id")
+        write(b',"dataset":'); write(_bytes(dataset))
+        write(b',"items":'); _stream_sql_rows(write, connection, "SELECT payload FROM materialized_projection_items ORDER BY ordinal")
+        write(b',"schema":'); write(_bytes(SCHEMA))
+        write(b',"selection_receipt":'); write(_bytes(receipt)); write(b"}")
+    finally:
+        connection.close()
+
+
+def _stream_census_custody_without_binding(write: Callable[[bytes], Any], database: Path, dataset: Mapping[str, Any], receipt: Mapping[str, Any], projection_sha256: str, count: int) -> None:
+    mapping_status = {"status": "not_attempted", "scoring_permitted": False, "reason": "aerp7_prelabel_slice_has_no_span_mapping", "unresolved_item_context_count": count}
+    connection = _index_connection(database)
+    try:
+        write(b'{"dataset":'); write(_bytes(dataset))
+        write(b',"items":'); _stream_sql_rows(write, connection, "SELECT payload FROM materialized_custody_items ORDER BY ordinal")
+        write(b',"mapping_status":'); write(_bytes(mapping_status))
+        write(b',"projection_sha256":'); write(_bytes(projection_sha256))
+        write(b',"schema":'); write(_bytes(CUSTODY_SCHEMA))
+        write(b',"selection_receipt":'); write(_bytes(receipt)); write(b"}")
+    finally:
+        connection.close()
+
+
+def _stream_census_custody(write: Callable[[bytes], Any], database: Path, dataset: Mapping[str, Any], receipt: Mapping[str, Any], projection_sha256: str, count: int, commitment: str) -> None:
+    binding = {"algorithm": BOUND_CUSTODY_ALGORITHM, "revision_sha256": dataset["revision_sha256"], "commitment": commitment}
+    mapping_status = {"status": "not_attempted", "scoring_permitted": False, "reason": "aerp7_prelabel_slice_has_no_span_mapping", "unresolved_item_context_count": count}
+    connection = _index_connection(database)
+    try:
+        write(b'{"binding":'); write(_bytes(binding))
+        write(b',"dataset":'); write(_bytes(dataset))
+        write(b',"items":'); _stream_sql_rows(write, connection, "SELECT payload FROM materialized_custody_items ORDER BY ordinal")
+        write(b',"mapping_status":'); write(_bytes(mapping_status))
+        write(b',"projection_sha256":'); write(_bytes(projection_sha256))
+        write(b',"schema":'); write(_bytes(CUSTODY_SCHEMA))
+        write(b',"selection_receipt":'); write(_bytes(receipt)); write(b"}")
+    finally:
+        connection.close()
+
+
+def _stream_to_file(path: Path, emit: Callable[[Callable[[bytes], Any]], None]) -> str:
+    digest = hashlib.sha256()
+    with path.open("xb") as stream:
+        def write(value: bytes) -> None:
+            stream.write(value); digest.update(value)
+        emit(write); stream.flush(); os.fsync(stream.fileno())
+    return digest.hexdigest()
+
+
+def _census_payload_sha256(emit: Callable[[Callable[[bytes], Any]], None]) -> str:
+    digest = hashlib.sha256(); emit(digest.update); return digest.hexdigest()
+
+
+def _spooled_census_receipt(database: Path, receipt: dict[str, Any], revision: str) -> dict[str, Any]:
+    """Bind census denominators directly to persisted candidate-safe rows."""
+    connection = _index_connection(database)
+    try:
+        def array_sha(query: str, mapper: Callable[[sqlite3.Row], Any], parameters: tuple[Any, ...] = ()) -> str:
+            return _stream_array_sha256((_bytes(mapper(row)) for row in connection.execute(query, parameters)))
+        corpus_ids = array_sha("SELECT corpus_id FROM materialized_corpora ORDER BY corpus_id", lambda row: row[0])
+        item_ids = array_sha("SELECT json_extract(payload, '$.item_id') FROM materialized_projection_items ORDER BY json_extract(payload, '$.item_id')", lambda row: row[0])
+        personas = array_sha("SELECT DISTINCT json_extract(payload, '$.persona_id') FROM materialized_projection_items ORDER BY 1", lambda row: row[0])
+        groups = array_sha("SELECT DISTINCT json_extract(payload, '$.selection_group_id') FROM materialized_projection_items ORDER BY 1", lambda row: row[0])
+        tiers = array_sha("SELECT DISTINCT json_extract(payload, '$.selection_tier_id') FROM materialized_projection_items ORDER BY 1", lambda row: row[0])
+        variants = array_sha("SELECT json_extract(payload, '$.selection_variant_id') FROM materialized_projection_items ORDER BY 1", lambda row: row[0])
+        pairs = array_sha("SELECT payload FROM materialized_projection_items ORDER BY json_extract(payload, '$.selection_logical_item_id'), json_extract(payload, '$.selection_variant_id'), json_extract(payload, '$.item_id'), json_extract(payload, '$.corpus_id')", lambda row: {key: json.loads(row[0])[key] for key in ("selection_logical_item_id", "selection_logical_binding_witness", "selection_variant_id", "item_id", "corpus_id")})
+        contexts = [int(row[0]) for row in connection.execute("SELECT DISTINCT json_extract(payload, '$.declared_context_size') FROM materialized_corpora ORDER BY 1")]
+        per_context = []
+        for rank, context in enumerate(contexts):
+            item_query = "SELECT json_extract(p.payload, '$.item_id') FROM materialized_projection_items p JOIN materialized_corpora c ON json_extract(p.payload, '$.corpus_id')=c.corpus_id WHERE json_extract(c.payload, '$.declared_context_size')=? ORDER BY 1"
+            count = connection.execute("SELECT count(*) FROM (" + item_query + ")", (context,)).fetchone()[0]
+            per_context.append({"context_rank": rank, "declared_context_size": context, "item_count": count, "item_ids_sha256": array_sha(item_query, lambda row: row[0], (context,))})
+        item_count = connection.execute("SELECT count(*) FROM materialized_projection_items").fetchone()[0]
+        query_count = connection.execute("SELECT count(DISTINCT json_extract(payload, '$.selection_logical_item_id')) FROM materialized_projection_items").fetchone()[0]
+        persona_count = connection.execute("SELECT count(DISTINCT json_extract(payload, '$.persona_id')) FROM materialized_projection_items").fetchone()[0]
+        group_count = connection.execute("SELECT count(DISTINCT json_extract(payload, '$.selection_group_id')) FROM materialized_projection_items").fetchone()[0]
+        corpus_count = connection.execute("SELECT count(*) FROM materialized_corpora").fetchone()[0]
+        observed = {
+            "semantics": CENSUS_CROSSWALK_SEMANTICS,
+            "multi_persona_corpus_count": connection.execute("SELECT count(*) FROM (SELECT json_extract(payload, '$.corpus_id') FROM materialized_projection_items GROUP BY 1 HAVING count(DISTINCT json_extract(payload, '$.persona_id')) > 1)").fetchone()[0],
+            "sparse_query_context_count": connection.execute("SELECT count(*) FROM (SELECT json_extract(p.payload, '$.selection_logical_item_id') FROM materialized_projection_items p JOIN materialized_corpora c ON json_extract(p.payload, '$.corpus_id')=c.corpus_id GROUP BY 1 HAVING count(DISTINCT json_extract(c.payload, '$.declared_context_size')) != ?)", (len(contexts),)).fetchone()[0],
+            "multi_case_query_context_count": connection.execute("SELECT count(*) FROM (SELECT json_extract(p.payload, '$.selection_logical_item_id'), json_extract(p.payload, '$.corpus_id') FROM materialized_projection_items p JOIN materialized_corpora c ON json_extract(p.payload, '$.corpus_id')=c.corpus_id GROUP BY json_extract(p.payload, '$.selection_logical_item_id'), json_extract(c.payload, '$.declared_context_size') HAVING count(DISTINCT json_extract(p.payload, '$.corpus_id')) > 1)").fetchone()[0],
+        }
+    finally:
+        connection.close()
+    empty = canonical_sha256([])
+    reasons = {reason: {"count": 0, "keys_sha256": empty} for reason in ("ambiguous_canonical_keys", "unmatched_premix_keys", "canonical_zero_logical_matches", "multiple_logical_matches_or_variants", "missing_requested_context_sizes", "multi_persona_cases")}
+    ledger = {"schema": "aerp7-convomem-quarantine-ledger-v3", "dataset_revision_sha256": revision, "desired_context_values_sha256": canonical_sha256([float(context) for context in contexts]), "matching_semantics": CENSUS_CROSSWALK_SEMANTICS, "reasons": reasons}
+    receipt.update({
+        "selected_persona_ids_sha256": personas, "holdout_persona_set_sha256": personas,
+        "group_values_sha256": groups, "tier_values_sha256": tiers,
+        "context_values_sha256": canonical_sha256(contexts), "desired_context_values_sha256": canonical_sha256(contexts),
+        "variant_selection_sha256": variants, "selected_item_context_count": item_count,
+        "candidate_visible_query_count": query_count, "candidate_visible_persona_count": persona_count,
+        "candidate_visible_context_count": len(contexts), "candidate_visible_corpus_count": corpus_count,
+        "group_count": group_count, "selected_item_ids_sha256": item_ids, "per_context_denominators": per_context,
+        "logical_variant_pairs_sha256": pairs, "corpus_ids_sha256": corpus_ids, "observed_crosswalk": observed,
+        "quarantine_reason_digests": {reason: empty for reason in reasons},
+        "quarantine_ledger_sha256": canonical_sha256(ledger),
+    })
+    receipt["denominators_sha256"] = canonical_sha256({"query_count": receipt["selected_item_context_count"], "candidate_visible_query_count": query_count, "persona_count": persona_count, "context_count": len(contexts), "corpus_count": corpus_count, "group_count": group_count, "logical_variant_pairs_sha256": pairs, "corpus_ids_sha256": corpus_ids, "per_context_denominators": per_context})
+    return receipt
+
+
+def _spool_census_publications(staging_root: Path, database: Path, dataset: Mapping[str, Any], receipt: Mapping[str, Any], secret: bytes, count: int) -> tuple[Path, str, Path, str]:
+    candidate_fd, candidate_name = tempfile.mkstemp(prefix=".aerp7-census-projection-", suffix=".json", dir=staging_root)
+    os.close(candidate_fd); candidate_path = Path(candidate_name); candidate_path.unlink()
+    try:
+        projection_sha256 = _stream_to_file(candidate_path, lambda write: _stream_census_projection(write, database, dataset, receipt))
+        binding = hmac.new(secret, digestmod=hashlib.sha256)
+        binding.update(b'{"domain":'); binding.update(_bytes("custody-binding")); binding.update(b',"identity":{"projection":')
+        _stream_census_projection(binding.update, database, dataset, receipt)
+        binding.update(b',"sealed_custody":')
+        _stream_census_custody_without_binding(binding.update, database, dataset, receipt, projection_sha256, count)
+        binding.update(b'},"revision":'); binding.update(_bytes(dataset["revision_sha256"])); binding.update(b"}")
+        commitment = binding.hexdigest()
+        custody_fd, custody_name = tempfile.mkstemp(prefix=".aerp7-census-custody-", suffix=".json", dir=staging_root)
+        os.close(custody_fd); custody_path = Path(custody_name); custody_path.unlink()
+        try:
+            custody_sha256 = _stream_to_file(custody_path, lambda write: _stream_census_custody(write, database, dataset, receipt, projection_sha256, count, commitment))
+        except Exception:
+            custody_path.unlink(missing_ok=True); raise
+        return candidate_path, projection_sha256, custody_path, custody_sha256
+    except Exception:
+        candidate_path.unlink(missing_ok=True); raise
 
 
 def _pinned_sources(root: Path, code: str) -> tuple[list[dict[str, Any]], str]:
@@ -1694,6 +1910,189 @@ def load_candidate_projection(bundle: Path) -> dict[str, Any]:
     """Candidate-facing reader; it never accepts or exposes binding material."""
     projection, _ready, _projection_raw = _candidate_snapshot(bundle)
     return projection
+
+
+_CUSTODY_REFERENCE_KEYS = frozenset({"schema", "bundle_path", "candidate_reference", "custody_path", "ready_path", "generation_id", "custody_raw_sha256", "custody_canonical_sha256", "dataset", "item_count", "evidence_span_count", "ready_sha256"})
+
+
+def _stream_file_digest(path: Path, code: str) -> tuple[str, int]:
+    try:
+        before = os.lstat(path)
+        if path.is_symlink() or not stat.S_ISREG(before.st_mode): raise CustodyError(code)
+        digest = hashlib.sha256(); size = 0
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk); size += len(chunk)
+        after = os.lstat(path)
+    except OSError as exc:
+        raise CustodyError(code) from exc
+    if path.is_symlink() or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or before.st_size != after.st_size:
+        raise CustodyError(code)
+    return digest.hexdigest(), size
+
+
+def _stream_custody_commitment(secret: bytes, revision: str, candidate_path: Path, custody_path: Path) -> str:
+    """Recreate the keyed custody binding without decoding either large JSON body."""
+    try:
+        with custody_path.open("rb") as stream:
+            prefix = stream.read(1024 * 1024)
+    except OSError as exc:
+        raise CustodyError("custody_stream_binding_invalid") from exc
+    marker = b'{"binding":'
+    if not prefix.startswith(marker):
+        raise CustodyError("custody_stream_binding_invalid")
+    depth = 0; quoted = False; escaped = False; end = None
+    for offset, byte in enumerate(prefix[len(marker):], start=len(marker)):
+        if quoted:
+            if escaped: escaped = False
+            elif byte == 92: escaped = True
+            elif byte == 34: quoted = False
+            continue
+        if byte == 34: quoted = True
+        elif byte in (123, 91): depth += 1
+        elif byte in (125, 93):
+            depth -= 1
+            if depth == 0:
+                end = offset + 1; break
+    if end is None or end >= len(prefix) or prefix[end:end + 1] != b",":
+        raise CustodyError("custody_stream_binding_invalid")
+    binding = hmac.new(_binding_secret(secret), digestmod=hashlib.sha256)
+    binding.update(b'{"domain":'); binding.update(_bytes("custody-binding")); binding.update(b',"identity":{"projection":')
+    try:
+        with candidate_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""): binding.update(chunk)
+        binding.update(b',"sealed_custody":{')
+        with custody_path.open("rb") as stream:
+            stream.seek(end + 1)
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""): binding.update(chunk)
+    except OSError as exc:
+        raise CustodyError("custody_stream_binding_invalid") from exc
+    binding.update(b'},"revision":'); binding.update(_bytes(revision)); binding.update(b"}")
+    return binding.hexdigest()
+
+
+def _candidate_reference_local(value: Any) -> dict[str, Any]:
+    row = dict(_object(value, "custody_reference_candidate_invalid"))
+    keys = {"schema", "bundle_path", "projection_path", "ready_path", "generation_id", "projection_raw_sha256", "projection_canonical_sha256", "dataset", "query_count", "candidate_text_count"}
+    if set(row) != keys or row["schema"] != CANDIDATE_PROJECTION_REFERENCE_SCHEMA or row["projection_path"] != "projection.json" or row["ready_path"] != "READY.json" or not isinstance(row["bundle_path"], str) or not Path(row["bundle_path"]).is_absolute():
+        raise CustodyError("custody_reference_candidate_invalid")
+    for key in ("generation_id", "projection_raw_sha256", "projection_canonical_sha256"):
+        _token(row[key], "custody_reference_candidate_invalid")
+    dataset = _object(row["dataset"], "custody_reference_candidate_invalid")
+    if set(dataset) != {"canonical_sha256", "premix_sha256", "revision_sha256", "source_inventory_sha256"}:
+        raise CustodyError("custody_reference_candidate_invalid")
+    for value in dataset.values(): _token(value, "custody_reference_candidate_invalid")
+    if any(isinstance(row[key], bool) or not isinstance(row[key], int) or row[key] <= 0 for key in ("query_count", "candidate_text_count")):
+        raise CustodyError("custody_reference_candidate_invalid")
+    return row
+
+
+def custody_reference(*, candidate_bundle: Path, custody_bundle: Path, candidate_reference: Mapping[str, Any]) -> dict[str, Any]:
+    """Create a small READY-bound custody capability; it contains no labels."""
+    candidate = _candidate_reference_local(candidate_reference)
+    candidate_root, custody_root = candidate_bundle.resolve(strict=True), custody_bundle.resolve(strict=True)
+    if candidate_root != Path(candidate["bundle_path"]).resolve(strict=True) or candidate_root.is_symlink() or custody_root.is_symlink():
+        raise CustodyError("custody_reference_path_invalid")
+    candidate_ready = _candidate_ready(_decode(_snapshot(candidate_root / "READY.json", "custody_reference_candidate_invalid")[0], "custody_reference_candidate_invalid"))
+    if candidate_ready["generation_id"] != candidate["generation_id"] or candidate_ready["projection"] != {"raw_sha256": candidate["projection_raw_sha256"], "canonical_sha256": candidate["projection_canonical_sha256"]}:
+        raise CustodyError("custody_reference_candidate_binding_invalid")
+    candidate_sha, _candidate_size = _stream_file_digest(candidate_root / "projection.json", "custody_reference_candidate_invalid")
+    if candidate_sha != candidate["projection_raw_sha256"] or candidate_sha != candidate["projection_canonical_sha256"]:
+        raise CustodyError("custody_reference_candidate_binding_invalid")
+    ready_raw, _identity, ready_sha = _snapshot(custody_root / "READY.json", "custody_reference_ready_invalid")
+    ready = _custody_ready(_decode(ready_raw, "custody_reference_ready_invalid"))
+    custody_path = custody_root / "sealed-custody.json"
+    custody_sha, _bytes_count = _stream_file_digest(custody_path, "custody_reference_custody_invalid")
+    if ready["generation_id"] != candidate["generation_id"] or ready["candidate_projection"] != candidate_ready["projection"] or ready["custody"]["raw_sha256"] != custody_sha or ready["custody"]["canonical_sha256"] != custody_sha:
+        raise CustodyError("custody_reference_ready_binding_invalid")
+    # The top-level metadata is intentionally small; item rows are never decoded
+    # here and are admitted only by CustodyStore's streaming ingress.
+    ijson = _ijson()
+    try:
+        with custody_path.open("rb") as stream:
+            schema = next(ijson.items(stream, "schema", use_float=True))
+        with custody_path.open("rb") as stream:
+            dataset = next(ijson.items(stream, "dataset", use_float=True))
+        with custody_path.open("rb") as stream:
+            count = sum(1 for _ in ijson.items(stream, "items.item", use_float=True))
+        with custody_path.open("rb") as stream:
+            spans = sum(len(_object(item.get("labels"), "custody_reference_item_invalid").get("message_evidences", [])) for item in ijson.items(stream, "items.item", use_float=True))
+    except (OSError, ValueError, StopIteration) as exc:
+        raise CustodyError("custody_reference_custody_invalid") from exc
+    if schema != CUSTODY_SCHEMA or dataset != candidate["dataset"] or count != candidate["query_count"]:
+        raise CustodyError("custody_reference_custody_binding_invalid")
+    return {"schema": CUSTODY_REFERENCE_SCHEMA, "bundle_path": str(custody_root), "candidate_reference": candidate, "custody_path": str(custody_path), "ready_path": str(custody_root / "READY.json"), "generation_id": candidate["generation_id"], "custody_raw_sha256": custody_sha, "custody_canonical_sha256": custody_sha, "dataset": dict(candidate["dataset"]), "item_count": count, "evidence_span_count": spans, "ready_sha256": ready_sha}
+
+
+class CustodyStore:
+    """Ephemeral SQLite ingress for a verified candidate/custody generation."""
+
+    def __init__(self, reference: Mapping[str, Any], directory: Path, connection: sqlite3.Connection, receipt: Mapping[str, Any]) -> None:
+        self.reference, self.directory, self.connection, self._receipt = dict(reference), directory, connection, dict(receipt)
+
+    @classmethod
+    def open(cls, reference: Mapping[str, Any], *, staging_parent: Path, binding_secret: bytes) -> "CustodyStore":
+        ref = custody_reference(candidate_bundle=Path(_candidate_reference_local(_object(reference, "custody_reference_invalid").get("candidate_reference"))["bundle_path"]), custody_bundle=Path(_object(reference, "custody_reference_invalid").get("bundle_path", "")), candidate_reference=_object(reference, "custody_reference_invalid").get("candidate_reference"))
+        if dict(reference) != ref:
+            raise CustodyError("custody_reference_drift")
+        directory = Path(tempfile.mkdtemp(prefix="aerp7-custody-store-", dir=staging_parent)); database = directory / "custody.sqlite3"
+        connection = sqlite3.connect(database); connection.row_factory = sqlite3.Row
+        try:
+            connection.executescript("CREATE TABLE corpora(corpus_id TEXT PRIMARY KEY,payload TEXT NOT NULL); CREATE TABLE projection_items(item_id TEXT PRIMARY KEY,payload TEXT NOT NULL); CREATE TABLE custody_items(item_id TEXT PRIMARY KEY,payload TEXT NOT NULL);")
+            ijson = _ijson(); candidate_path = Path(ref["candidate_reference"]["bundle_path"]) / "projection.json"
+            candidate_bytes = custody_bytes = evidence_span_count = 0
+            try:
+                with Path(ref["custody_path"]).open("rb") as stream:
+                    binding = next(ijson.items(stream, "binding", use_float=True))
+            except (OSError, ValueError, StopIteration) as exc:
+                raise CustodyError("custody_store_binding_invalid") from exc
+            if not isinstance(binding, Mapping) or not hmac.compare_digest(str(binding.get("commitment", "")), _stream_custody_commitment(binding_secret, ref["dataset"]["revision_sha256"], candidate_path, Path(ref["custody_path"]))):
+                raise CustodyError("custody_store_binding_invalid")
+            with candidate_path.open("rb") as stream:
+                for row in ijson.items(stream, "corpora.item", use_float=True):
+                    payload = _bytes(row).decode("utf-8"); connection.execute("INSERT INTO corpora VALUES(?,?)", (row["corpus_id"], payload)); candidate_bytes += len(payload.encode("utf-8"))
+            with candidate_path.open("rb") as stream:
+                for row in ijson.items(stream, "items.item", use_float=True):
+                    payload = _bytes(row).decode("utf-8"); connection.execute("INSERT INTO projection_items VALUES(?,?)", (row["item_id"], payload)); candidate_bytes += len(payload.encode("utf-8"))
+            with Path(ref["custody_path"]).open("rb") as stream:
+                for row in ijson.items(stream, "items.item", use_float=True):
+                    item_id = _token(row.get("item_id"), "custody_store_item_invalid"); payload = _bytes(row).decode("utf-8")
+                    candidate_item = connection.execute("SELECT payload FROM projection_items WHERE item_id=?", (item_id,)).fetchone()
+                    if candidate_item is None: raise CustodyError("custody_store_projection_binding_invalid")
+                    candidate_item_value = json.loads(candidate_item[0]); corpus = connection.execute("SELECT payload FROM corpora WHERE corpus_id=?", (candidate_item_value["corpus_id"],)).fetchone()
+                    sealed_without_commitment = {key: value for key, value in row.items() if key != "binding_commitment"}
+                    if corpus is None or row.get("corpus_id") != candidate_item_value["corpus_id"] or row.get("binding_commitment") != _custody_item_commitment(binding_secret, ref["dataset"]["revision_sha256"], sealed_without_commitment, candidate_item_value, json.loads(corpus[0])):
+                        raise CustodyError("custody_store_item_binding_invalid")
+                    connection.execute("INSERT INTO custody_items VALUES(?,?)", (item_id, payload)); custody_bytes += len(payload.encode("utf-8"))
+                    evidence_span_count += len(_object(row.get("labels"), "custody_store_item_invalid").get("message_evidences", []))
+            item_count = connection.execute("SELECT count(*) FROM custody_items").fetchone()[0]
+            if item_count != ref["item_count"] or evidence_span_count != ref["evidence_span_count"] or connection.execute("SELECT count(*) FROM projection_items").fetchone()[0] != item_count:
+                raise CustodyError("custody_store_item_count_invalid")
+            connection.commit()
+            sqlite_store_bytes = sum(path.stat().st_size for path in (database, database.with_name(database.name + "-wal"), database.with_name(database.name + "-shm")) if path.exists())
+            candidate_input_bytes = candidate_path.stat().st_size; custody_input_bytes = Path(ref["custody_path"]).stat().st_size
+            return cls(ref, directory, connection, {"schema": "aerp7-convomem-custody-store-receipt-v1", "item_count": item_count, "candidate_input_bytes": candidate_input_bytes, "custody_input_bytes": custody_input_bytes, "candidate_store_bytes": candidate_bytes, "custody_store_bytes": custody_bytes, "sqlite_store_bytes": sqlite_store_bytes, "peak_disk_input_and_store_bytes": candidate_input_bytes + custody_input_bytes + sqlite_store_bytes})
+        except Exception:
+            connection.close(); shutil.rmtree(directory, ignore_errors=True); raise
+
+    def receipt(self) -> dict[str, Any]: return dict(self._receipt)
+
+    def iter_scoring_items(self) -> Iterator[dict[str, Any]]:
+        for row in self.connection.execute("SELECT c.payload,p.payload FROM custody_items c JOIN projection_items p ON p.item_id=c.item_id ORDER BY c.item_id"):
+            custody_item, projection_item = json.loads(row[0]), json.loads(row[1]); directory = _object(custody_item["directory"], "custody_store_directory_invalid"); group = _text(directory.get("group"), "custody_store_directory_invalid")
+            spans = [{"speaker": _text(item["speaker"], "custody_store_evidence_invalid"), "text": _text(item["text"], "custody_store_evidence_invalid")} for item in _list(_object(custody_item["labels"], "custody_store_evidence_invalid").get("message_evidences"), "custody_store_evidence_invalid")]
+            if group == "abstention_evidence":
+                if spans: raise CustodyError("abstention_evidence_labels_invalid")
+                conversations: list[str] = []
+            else: conversations = list(custody_item["evidence_conversation_ids"])
+            if custody_item["corpus_id"] != projection_item["corpus_id"]: raise CustodyError("custody_store_projection_binding_invalid")
+            yield {"item_id": custody_item["item_id"], "directory_group": group, "evidence_conversation_ids": conversations, "evidence_spans": spans}
+
+    def close(self) -> None:
+        self.connection.close(); shutil.rmtree(self.directory)
+
+    def __enter__(self) -> "CustodyStore": return self
+    def __exit__(self, *_args: Any) -> None: self.close()
 
 
 def load_sealed_custody(candidate_bundle: Path, custody_bundle: Path, *, binding_secret: bytes) -> dict[str, Any]:
@@ -2041,6 +2440,58 @@ def _publish_single(output: Path, *, payload_name: str, payload: dict[str, Any],
         raise
 
 
+def _copy_streamed_payload(source: Path, target: Path) -> str:
+    digest = hashlib.sha256()
+    with source.open("rb") as incoming, target.open("xb") as outgoing:
+        while block := incoming.read(1024 * 1024):
+            outgoing.write(block); digest.update(block)
+        outgoing.flush(); os.fsync(outgoing.fileno())
+    return digest.hexdigest()
+
+
+def _publish_streamed_single(output: Path, *, payload_name: str, source: Path, ready: dict[str, Any], payload_binding: Mapping[str, Any]) -> dict[str, Any]:
+    """Publish a prevalidated canonical stream with the normal READY protocol."""
+    target, parent, parent_identity = _output(output)
+    if _directory_identity(parent, "output_parent_identity_drift") != parent_identity:
+        raise CustodyError("output_parent_identity_drift")
+    try:
+        os.mkdir(target)
+    except FileExistsError as exc:
+        raise CustodyError("output_already_exists") from exc
+    except OSError as exc:
+        raise CustodyError("output_claim_failed") from exc
+    identity = _directory_identity(target, "publication_target_identity_drift")
+    created: dict[Path, tuple[int, int]] = {}
+    try:
+        _fsync_directory(parent, code="publication_target_directory_entry_fsync_failed")
+        _fsync_directory(parent, code="publication_parent_fsync_failed")
+        publishing = target / ".aerp7-publishing"
+        _write(publishing, {"schema": "aerp7-convomem-publishing-marker-v1"})
+        created[publishing] = _snapshot(publishing, "publication_file_invalid", retain=False)[1]
+        payload_path = target / payload_name
+        if _copy_streamed_payload(source, payload_path) != payload_binding["raw_sha256"]:
+            raise CustodyError("publication_payload_binding_invalid")
+        metadata = os.lstat(payload_path); created[payload_path] = (metadata.st_dev, metadata.st_ino)
+        if metadata.st_nlink != 1: raise CustodyError("publication_file_alias_invalid")
+        _fsync_directory(target, code="publication_payload_directory_fsync_failed")
+        temporary = target / ".READY.json.tmp"
+        _write(temporary, ready); created[temporary] = _snapshot(temporary, "publication_file_invalid", retain=False)[1]
+        ready_path = target / "READY.json"; os.link(temporary, ready_path); created[ready_path] = created[temporary]
+        _fsync_directory(target, code="publication_ready_directory_fsync_failed")
+        os.unlink(temporary); created.pop(temporary)
+        _fsync_directory(target, code="publication_ready_cleanup_directory_fsync_failed")
+        created[ready_path] = _snapshot(ready_path, "publication_file_invalid", retain=False)[1]
+        if len(set(created.values())) != 3 or not _same_directory(target, identity) or _directory_identity(parent, "output_parent_identity_drift") != parent_identity:
+            raise CustodyError("publication_file_alias_invalid")
+        os.unlink(publishing); created.pop(publishing)
+        return ready
+    except Exception as exc:
+        if not _cleanup_owned_target(target, identity, created, failure_tombstone=True, parent_identity=parent_identity):
+            raise CustodyError("publication_cleanup_identity_drift") from exc
+        _fsync_directory(parent, code="publication_cleanup_parent_fsync_failed")
+        raise
+
+
 def _candidate_ready_value(projection: Mapping[str, Any], generation_id: str) -> dict[str, Any]:
     return {"schema": CANDIDATE_READY_SCHEMA, "generation_id": generation_id, "projection": {"raw_sha256": hashlib.sha256(_bytes(projection)).hexdigest(), "canonical_sha256": canonical_sha256(projection)}, "durability": _durability_receipt()}
 
@@ -2123,29 +2574,33 @@ def build_prelabel_bundle(*, canonical_root: Path, premix_root: Path, candidate_
             index.revision,
         )
         chosen, receipt = _selection_rows_sql(index.database, secret, index.revision, selection, desired_contexts, ledger)
-        corpora, projection_items, custody_items = _selected_payloads_sql(index.database, chosen, secret, index.revision)
         if selection.is_census_v1:
-            corpora_by_id = {row["corpus_id"]: row for row in corpora}
-            per_context: dict[int, list[str]] = {}
-            for item in projection_items:
-                per_context.setdefault(corpora_by_id[item["corpus_id"]]["declared_context_size"], []).append(item["item_id"])
-            rows = [
-                {"context_rank": rank, "declared_context_size": context, "item_count": len(sorted(ids)), "item_ids_sha256": canonical_sha256(sorted(ids))}
-                for rank, (context, ids) in enumerate(sorted(per_context.items()))
-            ]
-            receipt["group_count"] = len({item["selection_group_id"] for item in projection_items})
-            receipt["group_values_sha256"] = canonical_sha256(sorted({item["selection_group_id"] for item in projection_items}))
-            receipt["tier_values_sha256"] = canonical_sha256(sorted({item["selection_tier_id"] for item in projection_items}))
-            receipt["variant_selection_sha256"] = canonical_sha256(sorted(item["selection_variant_id"] for item in projection_items))
-            receipt["context_values_sha256"] = canonical_sha256([row["declared_context_size"] for row in rows])
-            receipt["desired_context_values_sha256"] = canonical_sha256([row["declared_context_size"] for row in rows])
-            receipt["selected_item_ids_sha256"] = canonical_sha256(sorted(item["item_id"] for item in projection_items))
-            receipt["per_context_denominators"] = rows
-            corpus_ids = sorted(corpus["corpus_id"] for corpus in corpora)
-            receipt["candidate_visible_corpus_count"] = len(corpus_ids)
-            receipt["logical_variant_pairs_sha256"] = canonical_sha256(_census_logical_variant_pair_rows(projection_items))
-            receipt["corpus_ids_sha256"] = canonical_sha256(corpus_ids)
-            receipt["denominators_sha256"] = canonical_sha256({"query_count": len(projection_items), "candidate_visible_query_count": receipt["candidate_visible_query_count"], "persona_count": receipt["candidate_visible_persona_count"], "context_count": receipt["candidate_visible_context_count"], "corpus_count": receipt["candidate_visible_corpus_count"], "group_count": receipt["group_count"], "logical_variant_pairs_sha256": receipt["logical_variant_pairs_sha256"], "corpus_ids_sha256": receipt["corpus_ids_sha256"], "per_context_denominators": rows})
+            count = _persist_census_payloads_sql(index.database, chosen, secret, index.revision)
+            receipt = _spooled_census_receipt(index.database, receipt, index.revision)
+            connection = _index_connection(index.database)
+            try:
+                candidate_text_count = connection.execute("SELECT COALESCE(SUM(json_array_length(payload, '$.candidates')), 0) FROM materialized_corpora").fetchone()[0]
+            finally:
+                connection.close()
+            if not isinstance(candidate_text_count, int) or candidate_text_count <= 0:
+                raise CustodyError("census_candidate_text_count_invalid")
+            _raw, index.database_identity, index.database_sha256 = _snapshot(index.database, "sqlite_index_postmaterialization_drift", retain=False)
+            index.owned_files[index.database] = index.database_identity
+            _verify_index_bytes(index, "sqlite_index_postmaterialization_drift")
+            dataset = {"canonical_sha256": index.canonical_digest, "premix_sha256": index.premix_digest, "revision_sha256": index.revision, "source_inventory_sha256": index.staging_receipt["source_inventory_sha256"]}
+            candidate_source, projection_sha256, custody_source, custody_sha256 = _spool_census_publications(staging_root, index.database, dataset, receipt, secret, count)
+            try:
+                _verify_streaming_sources(canonical_dir, premix_dir, index)
+                index.close(failure_cleanup=True); index_live = False
+                generation_id = _opaque(secret, index.revision, "published-generation", receipt)
+                candidate_ready = _candidate_ready({"schema": CANDIDATE_READY_SCHEMA, "generation_id": generation_id, "projection": {"raw_sha256": projection_sha256, "canonical_sha256": projection_sha256}, "durability": _durability_receipt()})
+                custody_ready = _custody_ready({"schema": CUSTODY_READY_SCHEMA, "generation_id": generation_id, "candidate_projection": dict(candidate_ready["projection"]), "custody": {"raw_sha256": custody_sha256, "canonical_sha256": custody_sha256}, "durability": _durability_receipt()})
+                published_custody_ready = _publish_streamed_single(custody_output_dir, payload_name="sealed-custody.json", source=custody_source, ready=custody_ready, payload_binding=custody_ready["custody"])
+                published_candidate_ready = _publish_streamed_single(candidate_output_dir, payload_name="projection.json", source=candidate_source, ready=candidate_ready, payload_binding=candidate_ready["projection"])
+            finally:
+                candidate_source.unlink(missing_ok=True); custody_source.unlink(missing_ok=True)
+            return {"candidate_output_dir": str(candidate_output_dir), "custody_output_dir": str(custody_output_dir), "dataset": dataset, "query_count": receipt["selected_item_context_count"], "candidate_text_count": candidate_text_count, "projection_sha256": projection_sha256, "projection_raw_sha256": published_candidate_ready["projection"]["raw_sha256"], "projection_canonical_sha256": published_candidate_ready["projection"]["canonical_sha256"], "custody_raw_sha256": published_custody_ready["custody"]["raw_sha256"], "custody_canonical_sha256": published_custody_ready["custody"]["canonical_sha256"], "generation_id": generation_id, "durability": published_candidate_ready["durability"], "staging_preflight": index.staging_receipt, "selection_receipt": receipt}
+        corpora, projection_items, custody_items = _selected_payloads_sql(index.database, chosen, secret, index.revision)
         _verify_index_bytes(index, "sqlite_index_postmaterialization_drift")
         dataset = {"canonical_sha256": index.canonical_digest, "premix_sha256": index.premix_digest, "revision_sha256": index.revision, "source_inventory_sha256": index.staging_receipt["source_inventory_sha256"]}
         projection = {"schema": SCHEMA, "dataset": dataset, "selection_receipt": receipt, "corpora": corpora, "items": projection_items}
@@ -2185,7 +2640,7 @@ def build_prelabel_bundle(*, canonical_root: Path, premix_root: Path, candidate_
                 raise CustodyError("build_primary_and_index_cleanup_failed", primary_error=primary_receipt, cleanup_error=cleanup_receipt) from primary_error
         raise
     else:
-        return {"candidate_output_dir": str(candidate_output_dir), "custody_output_dir": str(custody_output_dir), "projection_sha256": custody["projection_sha256"], "projection_raw_sha256": published_candidate_ready["projection"]["raw_sha256"], "projection_canonical_sha256": published_candidate_ready["projection"]["canonical_sha256"], "custody_raw_sha256": custody_ready["custody"]["raw_sha256"], "custody_canonical_sha256": custody_ready["custody"]["canonical_sha256"], "generation_id": generation_id, "durability": published_candidate_ready["durability"], "staging_preflight": index.staging_receipt, "selection_receipt": receipt}
+        return {"candidate_output_dir": str(candidate_output_dir), "custody_output_dir": str(custody_output_dir), "dataset": dataset, "query_count": len(projection_items), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in corpora), "projection_sha256": custody["projection_sha256"], "projection_raw_sha256": published_candidate_ready["projection"]["raw_sha256"], "projection_canonical_sha256": published_candidate_ready["projection"]["canonical_sha256"], "custody_raw_sha256": custody_ready["custody"]["raw_sha256"], "custody_canonical_sha256": custody_ready["custody"]["canonical_sha256"], "generation_id": generation_id, "durability": published_candidate_ready["durability"], "staging_preflight": index.staging_receipt, "selection_receipt": receipt}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -60,7 +60,7 @@ ORIGINAL_CONFIG_KEYS = frozenset({"schema", "synthetic_test_mode", "protocol_pat
 FORMAL_ORIGINAL_CONFIG_KEYS = frozenset({
     "schema", "synthetic_test_mode", "protocol_path", "candidate_bundle",
     "output_path", "draft_path", "build_id", "original_root", "model_dir",
-    "palace_path", "original_python",
+    "palace_path", "original_python", "replicate_staging_parent",
 })
 
 
@@ -125,13 +125,20 @@ def _percentiles(values: Sequence[int]) -> dict[str, int]:
     return {"count": len(rows), "p50": at(.50), "p95": at(.95), "p99": at(.99), "max": rows[-1]}
 
 
-def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], query_measurements: Sequence[Mapping[str, Any]], build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1, allow_unfinalized_peak: bool = False, passage_embedding: Mapping[str, Any] | None = None, query_embedding: Mapping[str, Any] | None = None, measurement_mode: str = "synthetic_rehearsal", resource_comparability: str = "strict", storage_bytes: int = 0, storage_scope: str | None = None) -> dict[str, Any]:
+def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, int], query_measurements: Sequence[Mapping[str, Any]] | Mapping[str, Any], build_id: str | None = None, index_sha256: str | None = None, role: str | None = None, peak_rss_bytes: int = 1, allow_unfinalized_peak: bool = False, passage_embedding: Mapping[str, Any] | None = None, query_embedding: Mapping[str, Any] | None = None, measurement_mode: str = "synthetic_rehearsal", resource_comparability: str = "strict", storage_bytes: int = 0, storage_scope: str | None = None) -> dict[str, Any]:
     execution_role = role or ("fresh_build" if arm_id == "original_public_product" else "primary")
     accounting = {"primary": "primary_excludes_repeat", "repeat": "repeat_measured_separately"}[execution_role] if arm_id == "static_p5" else "not_applicable"
-    measurements = [dict(item) for item in query_measurements]
-    walls = [item.get("wall_ns") for item in measurements]; cpus = [item.get("cpu_ns") for item in measurements]
-    if len(measurements) != int(denominators["query_count"]) or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in [*walls, *cpus]):
-        raise RuntimeError("executor raw query measurements invalid")
+    if isinstance(query_measurements, Mapping):
+        measurements = dict(query_measurements)
+        if measurements.get("schema") != rank.MEASUREMENT_REFERENCE_SCHEMA or measurements.get("count") != int(denominators["query_count"]):
+            raise RuntimeError("executor persisted query measurements invalid")
+        latency = {"wall": dict(measurements["wall_summary"]), "cpu": dict(measurements["cpu_summary"])}
+    else:
+        measurements = [dict(item) for item in query_measurements]
+        walls = [item.get("wall_ns") for item in measurements]; cpus = [item.get("cpu_ns") for item in measurements]
+        if len(measurements) != int(denominators["query_count"]) or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in [*walls, *cpus]):
+            raise RuntimeError("executor raw query measurements invalid")
+        latency = {"wall": _percentiles(walls), "cpu": _percentiles(cpus)}
     current_arm = arm_id != "original_public_product"
     passage = dict(passage_embedding or {"calls": 0, "texts": 0})
     query = dict(query_embedding or {"calls": 0, "texts": 0})
@@ -155,7 +162,7 @@ def _resource(*, arm_id: str, artifact_sha256: str, denominators: Mapping[str, i
         "ingest_seconds": 0.0,
         "index_seconds": 0.0,
         "query_measurements": measurements,
-        "query_latency_ns": {"wall": _percentiles(walls), "cpu": _percentiles(cpus)},
+        "query_latency_ns": latency,
         "passage_embedding": passage,
         "query_embedding": query,
         "storage_scope": storage_scope or ("no_persistent_index" if current_arm else "palace_directory_after_cold_reopen"),
@@ -278,10 +285,116 @@ def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDr
     telemetry = draft.telemetry.get("resources")
     if not isinstance(telemetry, Mapping):
         raise CustodyError("executor_original_resource_invalid")
+    # Stream drafts carry the query timing sequence inside their durable
+    # replicate store.  Preserve that reference in the public receipt rather
+    # than rebuilding rankings/measurements as Python lists at the handoff.
+    if (
+        isinstance(replicate, Mapping)
+        and replicate.get("schema") == original_product.ORIGINAL_REPLICATE_REFERENCE_SCHEMA
+        and isinstance(telemetry.get("query_measurements"), Mapping)
+    ):
+        try:
+            reference = original_product.validate_original_replicate_reference(replicate)
+            sequence = dict(telemetry["query_measurements"])
+            if (
+                sequence.get("schema") != original_product.ORIGINAL_STREAM_TELEMETRY_SCHEMA
+                or sequence.get("table") != "measurements"
+                or sequence.get("replicate_reference_sha256") != _digest(reference)
+                or sequence.get("count") != int(denominators["query_count"])
+            ):
+                raise CustodyError("executor_original_resource_measurement_reference_invalid")
+            with original_product.OriginalReplicateStore.open(reference) as store:
+                summary = store.sequence_summary().get("measurements")
+                if not isinstance(summary, Mapping) or summary.get("count") != sequence["count"] or summary.get("sha256") != sequence.get("sha256"):
+                    raise CustodyError("executor_original_resource_measurement_reference_invalid")
+                expected = rank.CandidateProjectionCursor(reference["candidate_reference"])
+                query_rows = expected.iter_items(); measured_rows = store.iter_measurements(); ranked_rows = store.iter_rankings()
+                count = 0
+                for query, measured, ranked in zip(query_rows, measured_rows, ranked_rows, strict=True):
+                    if (
+                        measured.get("item_id") != query.get("item_id")
+                        or ranked.get("item_id") != query.get("item_id")
+                        or measured.get("query_sha256") != rank._query_digest(query.get("query_text"))
+                        or ranked.get("query_sha256") != measured.get("query_sha256")
+                    ):
+                        raise CustodyError("executor_original_resource_measurement_reference_invalid")
+                    count += 1
+                if count != int(denominators["query_count"]):
+                    raise CustodyError("executor_original_resource_measurement_reference_invalid")
+                def percentile(column: str, fraction: float) -> int:
+                    offset = min(count - 1, int((count - 1) * fraction))
+                    row = store.connection.execute(
+                        "SELECT CAST(json_extract(payload_json, ?) AS INTEGER) FROM measurements ORDER BY CAST(json_extract(payload_json, ?) AS INTEGER), seq LIMIT 1 OFFSET ?",
+                        (f"$.{column}", f"$.{column}", offset),
+                    ).fetchone()
+                    if row is None or isinstance(row[0], bool) or not isinstance(row[0], int) or row[0] <= 0:
+                        raise CustodyError("executor_original_resource_measurement_reference_invalid")
+                    return int(row[0])
+                latency = {kind: {"count": count, "p50": percentile(kind, .50), "p95": percentile(kind, .95), "p99": percentile(kind, .99), "max": percentile(kind, 1.0)} for kind in ("wall_ns", "cpu_ns")}
+        except original_product.OriginalProductError as exc:
+            raise CustodyError("executor_original_resource_measurement_reference_invalid") from exc
+        if telemetry.get("clock_receipt", {}).get("timing_source") != "stdlib" or telemetry.get("process_cpu_scope") != "worker_process_only_excludes_descendants" or telemetry.get("descendant_observation") != "external_supervisor_zero_required":
+            raise CustodyError("executor_original_resource_descendant_process_invalid")
+        if telemetry.get("peak_rss_bytes") != 0 or not isinstance(telemetry.get("storage_bytes"), int) or telemetry["storage_bytes"] <= 0:
+            raise CustodyError("executor_original_resource_invalid")
+        passage, query = telemetry.get("passage_embedding"), telemetry.get("query_embedding")
+        if not isinstance(passage, Mapping) or not isinstance(query, Mapping):
+            raise CustodyError("executor_original_resource_invalid")
+        receipt = {
+            "schema": formal.RESOURCE_SCHEMA, "arm_id": "original_public_product", "execution_role": "fresh_build",
+            "resource_semantics": "native_public_product", "measurement_scope": "rank_only_excludes_trace_and_receipt_serialization",
+            "measurement_mode": "live_original_public_product", "resource_comparability": resource_comparability,
+            "p5_repeat_accounting": "not_applicable", "ingest_seconds": telemetry.get("ingest_seconds"), "index_seconds": telemetry.get("index_seconds"),
+            "query_measurements": {"schema": "aerp7-original-product-resource-measurement-reference-v1", "replicate_reference": reference, "sequence": sequence},
+            "query_latency_ns": {"wall": latency["wall_ns"], "cpu": latency["cpu_ns"]},
+            "passage_embedding": {"calls": passage.get("calls"), "texts": passage.get("texts"), "measurement_kind": "public_upsert_request_proxy", "native_embedding_observable": False, "limitation": "native_internal_embedding_calls_unobservable; public upsert request ledger only"},
+            "query_embedding": {"calls": query.get("calls"), "texts": query.get("texts"), "measurement_kind": "public_search_request_proxy", "native_embedding_observable": False, "limitation": "native_internal_embedding_calls_unobservable; public search request ledger only"},
+            "storage_scope": "palace_directory_after_cold_reopen", "storage_bytes": telemetry["storage_bytes"], "peak_rss_bytes": 0,
+            "artifact_sha256": "0" * 64, "build_id": reference["build_id"], "index_sha256": reference["index_sha256"],
+            "input_denominators": dict(denominators), "hardware_runtime": _runtime(),
+        }
+        receipt["resource_sha256"] = formal.resource_digest(receipt)
+        return receipt
+    # The streaming worker publishes query measurements as a reference to its
+    # durable SQLite sequence.  Materialize only the query-sized sidecar rows
+    # for the resource receipt; rankings/traces/candidate payloads remain in
+    # the persistent replicate store and never enter the worker packet.
+    measurement_rows: Any = telemetry.get("query_measurements")
+    validation_replicate: Mapping[str, Any] = replicate
+    if (
+        isinstance(replicate, Mapping)
+        and replicate.get("schema") == original_product.ORIGINAL_REPLICATE_REFERENCE_SCHEMA
+        and isinstance(measurement_rows, Mapping)
+    ):
+        try:
+            reference = original_product.validate_original_replicate_reference(replicate)
+        except original_product.OriginalProductError as exc:
+            raise CustodyError("executor_original_resource_measurement_reference_invalid") from exc
+        if (
+            measurement_rows.get("schema") != original_product.ORIGINAL_STREAM_TELEMETRY_SCHEMA
+            or measurement_rows.get("table") != "measurements"
+            or measurement_rows.get("replicate_reference_sha256") != _digest(reference)
+            or measurement_rows.get("count") != int(denominators["query_count"])
+        ):
+            raise CustodyError("executor_original_resource_measurement_reference_invalid")
+        measurement_reference = dict(measurement_rows)
+        try:
+            with original_product.OriginalReplicateStore.open(reference) as store:
+                measurement_rows = list(store.iter_measurements())
+                rankings = list(store.iter_rankings())
+        except original_product.OriginalProductError as exc:
+            raise CustodyError("executor_original_resource_measurement_reference_invalid") from exc
+        # ``measurement_rows`` and ``rankings`` are both bounded by query_count
+        # and are required only by the legacy sidecar validator.
+        if original_product._digest_sequence(iter(measurement_rows)) != measurement_reference["sha256"]:
+            raise CustodyError("executor_original_resource_measurement_reference_invalid")
+        validation_replicate = {"rankings": rankings}
+    else:
+        measurement_rows = telemetry.get("query_measurements")
     try:
         measurements = original_product.validate_query_measurements(
-            measurements=telemetry.get("query_measurements"),
-            replicate=replicate,
+            measurements=measurement_rows,
+            replicate=validation_replicate,
             expected_count=int(denominators["query_count"]),
         )
         original_product._validate_clock_receipt(telemetry.get("clock_receipt"))
@@ -419,6 +532,7 @@ def _current_execution_receipt(*, role: str, arm_id: str, protocol: Mapping[str,
     MiniLM tree receipt; it cannot borrow this synthetic receipt.
     """
     code = live_executor_code_receipt()
+    projection_sha256 = projection.reference["projection_canonical_sha256"] if isinstance(projection, rank.CandidateProjectionStore) else canonical_sha256(projection)
     model = {"mode": "synthetic_rehearsal", "protocol_model_sha256": _digest(protocol["model_receipt"]), "encoder_identity": getattr(encoder, "identity", None)}
     receipt = {
         "schema": formal.CURRENT_EXECUTION_RECEIPT_SCHEMA,
@@ -426,7 +540,7 @@ def _current_execution_receipt(*, role: str, arm_id: str, protocol: Mapping[str,
         "execution_role": role,
         "arm_id": arm_id,
         "protocol_sha256": protocol["protocol_sha256"],
-        "projection_sha256": canonical_sha256(projection),
+        "projection_sha256": projection_sha256,
         "worker_config_sha256": _digest(worker_config),
         "method_input_sha256": _digest({"arm_id": arm_id, "method_receipt": artifact["method_receipt"], "serializer_receipt": artifact["serializer_receipt"]}),
         "observed_code_before": code,
@@ -435,7 +549,10 @@ def _current_execution_receipt(*, role: str, arm_id: str, protocol: Mapping[str,
         "observed_model_after": model,
         "provider": {"mode": "synthetic", "providers": []},
         "encoder_identity": getattr(encoder, "identity", None),
-        "artifact_file_sha256": hashlib.sha256(_bytes(artifact)).hexdigest(),
+        # Streamed workers return a small artifact reference.  Its payload
+        # digest is the scientific file identity; legacy synthetic workers may
+        # still return an inline artifact and retain the old computation.
+        "artifact_file_sha256": str(artifact.get("payload_sha256")) if artifact.get("payload_sha256") else hashlib.sha256(_bytes(artifact)).hexdigest(),
         "artifact_sha256": artifact["artifact_sha256"],
         "resource_sha256": resource["resource_sha256"],
         "process_id": os.getpid(),
@@ -481,7 +598,13 @@ def _live_model_observation(*, model_dir: Path, expected: Mapping[str, Any]) -> 
     return observation, encoder
 
 
-def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projection: Mapping[str, Any], worker_config: Mapping[str, Any], model_dir: Path) -> dict[str, Any]:
+def _projection_denominators(projection: Any) -> dict[str, int]:
+    if isinstance(projection, rank.CandidateProjectionStore):
+        return {"query_count": projection.reference["query_count"], "candidate_text_count": projection.reference["candidate_text_count"]}
+    return formal.projection_denominators(projection)
+
+
+def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projection: Mapping[str, Any], worker_config: Mapping[str, Any], model_dir: Path, artifact_path: Path | None = None, ready_path: Path | None = None) -> dict[str, Any]:
     """Execute one live, pinned current arm; synthetic packets cannot reach it."""
     frozen = formal.validate_formal_protocol(protocol)
     if role not in {"raw", "p5_primary", "p5_repeat", "six"}:
@@ -494,14 +617,22 @@ def run_live_current_execution(*, role: str, protocol: Mapping[str, Any], projec
     code_before = _clean_protocol_code_observation(expected=frozen["current_code_receipt"])
     model_before, encoder = _live_model_observation(model_dir=model_dir, expected=frozen["model_receipt"])
     measurements: list[dict[str, Any]] = []
+    measurement_receipt: Sequence[Mapping[str, Any]] | Mapping[str, Any] = measurements
     with RssMonitor(os.getpid()) as monitor:
-        artifact = rank.rank_projection(projection=projection, encoder=encoder, arm_id=arm_id, model_receipt=frozen["model_receipt"], code_receipt=frozen["current_code_receipt"], query_measurements=measurements)
+        if isinstance(projection, rank.CandidateProjectionStore):
+            if artifact_path is None or ready_path is None:
+                raise CustodyError("executor_stream_artifact_output_missing")
+            with rank.PersistedMeasurementSink.create(directory=artifact_path.parent, stem=artifact_path.stem, generation_id=projection.reference["generation_id"], projection_sha256=projection.reference["projection_canonical_sha256"]) as sink:
+                artifact = rank.rank_projection_stream(store=projection, encoder=encoder, arm_id=arm_id, artifact_path=artifact_path, ready_path=ready_path, model_receipt=frozen["model_receipt"], code_receipt=frozen["current_code_receipt"], measurement_sink=sink)
+            measurement_receipt = artifact["measurement_reference"]
+        else:
+            artifact = rank.rank_projection(projection=projection, encoder=encoder, arm_id=arm_id, model_receipt=frozen["model_receipt"], code_receipt=frozen["current_code_receipt"], query_measurements=measurements)
     model_after, _unused = _live_model_observation(model_dir=model_dir, expected=frozen["model_receipt"])
     code_after = _clean_protocol_code_observation(expected=frozen["current_code_receipt"])
     adapter = encoder.receipt()
     resource = _resource(
-        arm_id=arm_id, artifact_sha256=artifact["artifact_sha256"], denominators=formal.projection_denominators(projection),
-        query_measurements=measurements, role={"p5_primary": "primary", "p5_repeat": "repeat"}.get(role),
+        arm_id=arm_id, artifact_sha256=artifact["artifact_sha256"], denominators=_projection_denominators(projection),
+        query_measurements=measurement_receipt, role={"p5_primary": "primary", "p5_repeat": "repeat"}.get(role),
         peak_rss_bytes=monitor.peak_bytes,
         passage_embedding={"calls": adapter["passage_call_count"], "texts": adapter["passage_text_count"]},
         query_embedding={"calls": adapter["query_call_count"], "texts": adapter["query_text_count"]},
@@ -669,8 +800,87 @@ def _publish_generation(*, staging: Path, staging_identity: tuple[int, int], out
         raise
 
 
-def _candidate_projection(protocol: Mapping[str, Any], bundle: Path, worker_config: Mapping[str, Any], staging_parent: Path) -> dict[str, Any]:
-    return formal.load_candidate_worker_projection(worker_config=worker_config, protocol=protocol, candidate_bundle_root=bundle, staging_parent=staging_parent)
+def _rebase_published_artifact_reference(value: Mapping[str, Any], *, staging: Path, output: Path) -> dict[str, Any]:
+    """Rebase a validated staged artifact ref across the atomic generation rename.
+
+    Workers must publish their artifact beside the packet while the generation
+    is staged.  The coordinator validates that ref while those files exist,
+    then the whole staging directory is renamed to ``output``.  Only the two
+    path fields move; all digests/receipts remain byte-identical and are
+    intentionally not recomputed.
+    """
+    if value.get("schema") != rank.RANKING_ARTIFACT_REFERENCE_SCHEMA:
+        return dict(value)
+    staging_root = staging.resolve(strict=True)
+    target_root = output.resolve()
+    rebased = dict(value)
+    for key in ("artifact_path", "ready_path"):
+        source = Path(str(value.get(key))).resolve(strict=True)
+        if source.parent != staging_root:
+            raise CustodyError("executor_artifact_reference_stage_path_invalid")
+        rebased[key] = str(target_root / source.name)
+    return rebased
+
+
+def _original_support_root(*, staging: Path, output: Path) -> Path:
+    """Return the generation-unique stable parent for original stream refs.
+
+    Original replicate references contain absolute SQLite/READY paths.  The
+    public generation is atomically renamed from ``staging`` to ``output``;
+    keeping these files in a sibling support directory makes those paths
+    stable across that rename while retaining an exact generation ownership
+    token for failure cleanup.
+    """
+    return output.parent / f".{output.name}.original-{staging.name}"
+
+
+def _publish_original_artifact_reference(*, candidate_reference: Mapping[str, Any],
+                                          replicate_references: Sequence[Mapping[str, Any]],
+                                          model_receipt: Mapping[str, Any],
+                                          code_receipt: Mapping[str, Any],
+                                          artifact_path: Path, ready_path: Path,
+                                          projection: Mapping[str, Any] | None,
+                                          protocol: Mapping[str, Any]) -> dict[str, Any]:
+    """Publish and formally validate the persistent five-build original ref.
+
+    The worker/coordinator seam hands this function only immutable references.
+    It is intentionally the single executor-owned publication point: the
+    canonical artifact contains five durable refs, while rankings, traces,
+    ledger rows, and their SQLite payloads stay behind those refs.
+    """
+    try:
+        artifact = original_product.wrap_original_public_rankings_streaming(
+            candidate_reference=candidate_reference,
+            replicate_references=replicate_references,
+            model_receipt=model_receipt,
+            code_receipt=code_receipt,
+            artifact_path=artifact_path,
+            ready_path=ready_path,
+        )
+        return formal._validate_public_ranking_artifact(
+            artifact, projection=projection, protocol=protocol,
+        )
+    except (original_product.OriginalProductError, CustodyError) as exc:
+        raise CustodyError("executor_original_artifact_reference_invalid") from exc
+
+
+def _candidate_projection(protocol: Mapping[str, Any], bundle: Path, worker_config: Mapping[str, Any], staging_parent: Path, stream_current: bool = False) -> Any:
+    if stream_current:
+        reference = formal.load_candidate_worker_reference(
+            worker_config=worker_config,
+            protocol=protocol,
+            candidate_bundle_root=bundle,
+            staging_parent=staging_parent,
+        )
+        return rank.CandidateProjectionStore.open(reference, staging_parent, expected_bundle_root=bundle)
+    # The original public-product lane remains deliberately separate: it needs
+    # the legacy full projection adapter for its five fresh-build replicates.
+    return formal.load_candidate_worker_projection(
+        worker_config=worker_config,
+        protocol=protocol,
+        candidate_bundle_root=bundle,
+        staging_parent=staging_parent,
+    )
 
 
 def current_worker(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -697,11 +907,13 @@ def current_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         model_dir = Path(str(config["model_dir"]))
         if not model_dir.is_dir() or model_dir.is_symlink():
             raise CustodyError("executor_current_live_input_invalid")
-        projection = _candidate_projection(protocol, bundle, worker_config, staging_parent)
-        live = run_live_current_execution(
-            role=role, protocol=protocol, projection=projection,
-            worker_config=worker_config, model_dir=model_dir,
-        )
+        projection = _candidate_projection(protocol, bundle, worker_config, staging_parent, True)
+        live_kwargs = {"role": role, "protocol": protocol, "projection": projection, "worker_config": worker_config, "model_dir": model_dir}
+        if isinstance(projection, rank.CandidateProjectionStore):
+            output = Path(str(config["output_path"])); live_kwargs.update({"artifact_path": output.with_name("." + output.stem + ".artifact.json"), "ready_path": output.with_name("." + output.stem + ".artifact.READY.json")})
+        live = run_live_current_execution(**live_kwargs)
+        if isinstance(projection, rank.CandidateProjectionStore):
+            projection.close()
         packet = {
             "schema": FORMAL_CURRENT_PACKET_SCHEMA, "execution_role": role,
             **live, "process_id": os.getpid(), "packet_sha256": "",
@@ -709,20 +921,28 @@ def current_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         packet["packet_sha256"] = _digest({key: item for key, item in packet.items() if key != "packet_sha256"})
         _write_new(output, packet)
         return packet
-    encoder = _CountingSyntheticEncoder(); encoder.identity = protocol["model_receipt"]["encoder_identity"]; query_measurements: list[dict[str, Any]] = []
+    encoder = _CountingSyntheticEncoder(); encoder.identity = protocol["model_receipt"]["encoder_identity"]; query_measurements: list[dict[str, Any]] = []; measurement_receipt: Sequence[Mapping[str, Any]] | Mapping[str, Any] = query_measurements
     with RssMonitor(os.getpid()) as monitor:
-        projection = _candidate_projection(protocol, bundle, worker_config, staging_parent)
-        artifact = rank.rank_projection(projection=projection, encoder=encoder, arm_id=role_to_arm[role], model_receipt=protocol["model_receipt"], code_receipt=protocol["current_code_receipt"], query_measurements=query_measurements)
-    denominators = formal.projection_denominators(projection)
+        projection = _candidate_projection(protocol, bundle, worker_config, staging_parent, True)
+        if isinstance(projection, rank.CandidateProjectionStore):
+            output = Path(str(config["output_path"])); artifact_path = output.with_name("." + output.stem + ".artifact.json")
+            with rank.PersistedMeasurementSink.create(directory=artifact_path.parent, stem=artifact_path.stem, generation_id=projection.reference["generation_id"], projection_sha256=projection.reference["projection_canonical_sha256"]) as sink:
+                artifact = rank.rank_projection_stream(store=projection, encoder=encoder, arm_id=role_to_arm[role], artifact_path=artifact_path, ready_path=output.with_name("." + output.stem + ".artifact.READY.json"), model_receipt=protocol["model_receipt"], code_receipt=protocol["current_code_receipt"], measurement_sink=sink)
+            measurement_receipt = artifact["measurement_reference"]
+        else:
+            artifact = rank.rank_projection(projection=projection, encoder=encoder, arm_id=role_to_arm[role], model_receipt=protocol["model_receipt"], code_receipt=protocol["current_code_receipt"], query_measurements=query_measurements)
+    denominators = _projection_denominators(projection)
     resource = _resource(
         arm_id=role_to_arm[role], artifact_sha256=artifact["artifact_sha256"], denominators=denominators,
-        query_measurements=query_measurements, role={"p5_primary": "primary", "p5_repeat": "repeat"}.get(role),
+        query_measurements=measurement_receipt, role={"p5_primary": "primary", "p5_repeat": "repeat"}.get(role),
         peak_rss_bytes=monitor.peak_bytes,
         passage_embedding={"calls": encoder.passage_calls, "texts": encoder.passage_texts},
         query_embedding={"calls": encoder.query_calls, "texts": encoder.query_texts},
         resource_comparability=protocol["resource_thresholds"]["resource_comparability"],
     )
     execution_receipt = _current_execution_receipt(role=role, arm_id=role_to_arm[role], protocol=protocol, projection=projection, worker_config=worker_config, encoder=encoder, artifact=artifact, resource=resource)
+    if isinstance(projection, rank.CandidateProjectionStore):
+        projection.close()
     packet = {"schema": CURRENT_PACKET_SCHEMA, "execution_role": role, "artifact": artifact, "resource_receipt": resource, "execution_receipt": execution_receipt, "process_id": os.getpid(), "packet_sha256": ""}
     packet["packet_sha256"] = _digest({key: item for key, item in packet.items() if key != "packet_sha256"})
     _write_new(output, packet); return packet
@@ -755,15 +975,15 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         )
     bundle = Path(str(config["candidate_bundle"])); output = Path(str(config["output_path"])); build_id = str(config["build_id"])
     # Candidate worker config is created in memory only for reading label-free data.
-    worker_config = {"role": "candidate_ranker", "projection_sha256": protocol["candidate"]["projection_canonical_sha256"], "projection_raw_sha256": protocol["candidate"]["projection_raw_sha256"], "projection_path": "projection.json", "model_receipt": protocol["model_receipt"], "code_receipt": protocol["current_code_receipt"], "staging_root": "staging", "arms": ["strong_raw", "static_p5", "six_view_secondary"], "top_k": 10, "tie_break": "stable_ranking_key_ascending", "serializer_contract": protocol["serializer_contract"]}
-    staging = Path(tempfile.mkdtemp(prefix="aerp7-original-synthetic-"))
-    (staging / "staging").mkdir()
-    try:
-        projection = _candidate_projection(protocol, bundle, worker_config, staging)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    denominators = formal.projection_denominators(projection)
+    worker_config = {"role": "candidate_ranker", "projection_sha256": protocol["candidate"]["projection_canonical_sha256"], "projection_raw_sha256": protocol["candidate"]["projection_raw_sha256"], "candidate_reference_sha256": formal._digest(protocol["candidate"]["candidate_reference"]), "projection_path": "projection.json", "model_receipt": protocol["model_receipt"], "code_receipt": protocol["current_code_receipt"], "staging_root": "staging", "arms": ["strong_raw", "static_p5", "six_view_secondary"], "top_k": 10, "tie_break": "stable_ranking_key_ascending", "serializer_contract": protocol["serializer_contract"]}
     if synthetic:
+        staging = Path(tempfile.mkdtemp(prefix="aerp7-original-synthetic-"))
+        (staging / "staging").mkdir()
+        try:
+            projection = _candidate_projection(protocol, bundle, worker_config, staging)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        denominators = formal.projection_denominators(projection)
         started = time.perf_counter_ns()
         with RssMonitor(os.getpid()) as monitor:
             replicate = _synthetic_original_replicate(projection, protocol, build_id)
@@ -781,8 +1001,20 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         packet = {"schema": ORIGINAL_PACKET_SCHEMA, "replicate": replicate, "resource_receipt": resource, "process_id": os.getpid(), "packet_sha256": ""}
     else:
         draft_path = Path(str(config["draft_path"])); palace_path = Path(str(config["palace_path"]))
-        if output.parent.resolve() != draft_path.parent.resolve() or output.parent.resolve() != palace_path.parent.resolve() or any(path.exists() or path.is_symlink() for path in (output, draft_path, palace_path)):
+        replicate_staging_parent = Path(str(config["replicate_staging_parent"]))
+        if output.parent.resolve() != draft_path.parent.resolve() or output.parent.resolve() != palace_path.parent.resolve() or not replicate_staging_parent.is_dir() or replicate_staging_parent.is_symlink() or any(path.exists() or path.is_symlink() for path in (output, draft_path, palace_path)):
             raise CustodyError("executor_original_output_capability_invalid")
+        candidate_reference = formal.load_candidate_worker_reference(
+            worker_config=worker_config, protocol=protocol,
+            candidate_bundle_root=bundle, staging_parent=output.parent,
+        )
+        corpus_count = sum(1 for _ in rank.CandidateProjectionCursor(candidate_reference, expected_bundle_root=bundle).iter_corpora())
+        if corpus_count <= 0:
+            raise CustodyError("executor_original_candidate_denominator_invalid")
+        denominators = {
+            "query_count": candidate_reference["query_count"],
+            "candidate_text_count": candidate_reference["candidate_text_count"],
+        }
         policy = protocol["execution_checkpoint"]["original_execution_policy"]
         original_root, model_dir, original_python = (Path(str(config[key])) for key in ("original_root", "model_dir", "original_python"))
         if (
@@ -799,12 +1031,14 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         ) as (seams, live_receipt):
             observer = original_product.LiveOriginalObserver(
                 palace_path=palace_path, provider=seams.encoder.runtime_identity,
-                denominators=denominators, corpus_count=len(projection["corpora"]),
+                denominators=denominators, corpus_count=corpus_count,
             )
-            draft = original_product.run_original_public_replicate(
-                projection=projection, build_id=build_id, collection_identity=f"{build_id}-collection",
+            draft = original_product.run_original_public_replicate_streaming(
+                candidate_reference=candidate_reference, build_id=build_id,
+                collection_identity=f"{build_id}-collection",
                 palace_path=palace_path, observer=observer, seams=seams, live_receipt=live_receipt,
                 formal=True, resource_sink=lambda _value: None,
+                staging_parent=replicate_staging_parent,
             )
         draft_bytes = original_product.serialize_worker_draft(draft)
         _write_bytes_new(draft_path, draft_bytes)
@@ -827,7 +1061,7 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
     _write_new(output, packet); return packet
 
 
-def coordinator_reaudit_original_worker_packet(*, packet: Mapping[str, Any], draft_path: Path, palace_path: Path, projection: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def coordinator_reaudit_original_worker_packet(*, packet: Mapping[str, Any], draft_path: Path, palace_path: Path, projection: Mapping[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Turn one exact worker draft into a replica only after coordinator audit.
 
     This function deliberately reads the canonical draft file after the worker
@@ -852,9 +1086,23 @@ def coordinator_reaudit_original_worker_packet(*, packet: Mapping[str, Any], dra
     resource = dict(packet["resource_receipt"])
     if resource.get("build_id") != worker_replicate.get("build_id") or resource.get("index_sha256") != worker_replicate.get("index_sha256"):
         raise CustodyError("executor_original_worker_resource_crossbinding_invalid")
-    replicate = original_product.coordinator_reaudit_replicate(
-        draft=draft, palace_path=palace_path, projection=projection,
-    )
+    if getattr(draft, "candidate_reference", None) is not None:
+        if projection is not None:
+            raise CustodyError("executor_original_stream_projection_materialized")
+        try:
+            completed = original_product.coordinator_reaudit_streaming_replicate(
+                draft=draft, candidate_reference=draft.candidate_reference,
+                palace_path=palace_path,
+            )
+            replicate = completed.as_reference() if isinstance(completed, original_product.OriginalReplicateReference) else dict(completed)
+        except original_product.OriginalProductError as exc:
+            raise CustodyError("executor_original_stream_coordinator_audit_invalid") from exc
+    else:
+        if projection is None:
+            raise CustodyError("executor_original_projection_required")
+        replicate = original_product.coordinator_reaudit_replicate(
+            draft=draft, palace_path=palace_path, projection=projection,
+        )
     if replicate.get("build_id") != worker_replicate.get("build_id"):
         raise CustodyError("executor_original_worker_resource_crossbinding_invalid")
     # The worker measurement first binds the worker-only index receipt.  After
@@ -917,13 +1165,22 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
     protocol_path = Path(str(config["protocol_path"]))
     bundle = Path(str(config["candidate_bundle"]))
     (staging / "staging").mkdir()
-    public_bundle = staging / "public-candidate"; public_bundle.mkdir()
-    # Snapshot only the already committed, label-free capability.  The original
-    # input directory is not supplied to any child and need not share a parent.
+    original_support = _original_support_root(staging=staging, output=Path(str(config["output_dir"])))
+    if not synthetic:
+        if original_support.exists() or original_support.is_symlink():
+            raise CustodyError("executor_original_support_present")
+        original_support.mkdir()
+    # The published candidate bundle is already immutable and candidate-only.
+    # Keep its exact path from the protocol reference instead of copying a
+    # multi-GB projection into staging; every cursor use rechecks READY/raw/
+    # canonical bytes and the configured bundle root.
+    if not bundle.is_dir() or bundle.is_symlink():
+        raise CustodyError("executor_candidate_capability_invalid")
     for name in ("projection.json", "READY.json"):
         source = bundle / name
-        if not source.is_file() or source.is_symlink(): raise CustodyError("executor_candidate_capability_invalid")
-        _write_bytes_new(public_bundle / name, source.read_bytes())
+        if not source.is_file() or source.is_symlink():
+            raise CustodyError("executor_candidate_capability_invalid")
+    public_bundle = bundle
     # The only persistent child configs are purpose-minimal label-free files.
     worker = formal.canonical_candidate_worker_config(protocol)
     worker_path = staging / "current-worker-config.json"; _write_new(worker_path, worker)
@@ -972,6 +1229,7 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
                 "build_id": f"formal-build-{number}", "original_root": str(Path(str(config["original_root"])).resolve()),
                 "model_dir": str(Path(str(config["model_dir"])).resolve()), "palace_path": str(palace_path.resolve()),
                 "original_python": str(Path(str(config["original_python"])).resolve()),
+                "replicate_staging_parent": str(original_support.resolve()),
             }
             original_jobs.append((draft_path, palace_path))
         supervisors[f"original-{number}"] = _run_subprocess(
@@ -989,7 +1247,17 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
         }:
             raise CustodyError("executor_original_worker_execution_identity_invalid")
         original_packets.append(original_packet)
-    projection = formal.load_candidate_worker_projection(worker_config=worker, protocol=protocol, candidate_bundle_root=public_bundle, staging_parent=staging)
+    # The legacy full projection is a synthetic-rehearsal oracle only.  A
+    # formal coordinator hands around the READY-bound public reference; its
+    # endpoint validators open their own bounded cursor/store when rows are
+    # genuinely required.
+    projection = (
+        formal.load_candidate_worker_projection(
+            worker_config=worker, protocol=protocol,
+            candidate_bundle_root=public_bundle, staging_parent=staging,
+        )
+        if synthetic else None
+    )
     if synthetic:
         original_replicates = [row["replicate"] for row in original_packets]
     else:
@@ -997,7 +1265,8 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             raise CustodyError("executor_original_worker_coverage_invalid")
         reaudited = [
             coordinator_reaudit_original_worker_packet(
-                packet=packet, draft_path=draft_path, palace_path=palace_path, projection=projection,
+                packet=packet, draft_path=draft_path, palace_path=palace_path,
+                projection=projection if synthetic else None,
             )
             for packet, (draft_path, palace_path) in zip(original_packets, original_jobs, strict=True)
         ]
@@ -1015,12 +1284,35 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             rebound["packet_sha256"] = _digest({key: item for key, item in rebound.items() if key != "packet_sha256"})
             rebound_packets.append(rebound)
         original_packets = rebound_packets
-    sealed = {"replicates": original_replicates, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": protocol["original_code_receipt"], "original_code_after": protocol["original_code_receipt"]}
-    sealed["worker_sha256"] = formal._digest(sealed)
-    checked_original = formal.validate_original_worker_receipt(sealed, projection=projection, protocol=protocol)
+    if synthetic:
+        sealed = {"replicates": original_replicates, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": protocol["original_code_receipt"], "original_code_after": protocol["original_code_receipt"]}
+        sealed["worker_sha256"] = formal._digest(sealed)
+        checked_original = formal.validate_original_worker_receipt(sealed, projection=projection, protocol=protocol)
+    else:
+        checked_original = {
+            "artifact": _publish_original_artifact_reference(
+                candidate_reference=protocol["candidate"]["candidate_reference"],
+                replicate_references=original_replicates,
+                model_receipt=protocol["model_receipt"],
+                code_receipt=protocol["original_code_receipt"],
+                artifact_path=original_support / "original-artifact.json",
+                ready_path=original_support / "original-artifact.READY.json",
+                projection=projection,
+                protocol=protocol,
+            ),
+        }
     current_by_role = {row["execution_role"]: row for row in current_packets}
     if set(current_by_role) != {"raw", "p5_primary", "p5_repeat", "six"}: raise CustodyError("executor_current_role_coverage_invalid")
-    if _bytes(current_by_role["p5_primary"]["artifact"]) != _bytes(current_by_role["p5_repeat"]["artifact"]): raise CustodyError("executor_current_p5_nondeterministic")
+    primary_artifact = current_by_role["p5_primary"]["artifact"]; repeat_artifact = current_by_role["p5_repeat"]["artifact"]
+    if (
+        isinstance(primary_artifact, Mapping) and isinstance(repeat_artifact, Mapping)
+        and primary_artifact.get("schema") == rank.RANKING_ARTIFACT_REFERENCE_SCHEMA
+        and repeat_artifact.get("schema") == rank.RANKING_ARTIFACT_REFERENCE_SCHEMA
+    ):
+        p5_same = primary_artifact.get("artifact_sha256") == repeat_artifact.get("artifact_sha256")
+    else:
+        p5_same = _bytes(primary_artifact) == _bytes(repeat_artifact)
+    if not p5_same: raise CustodyError("executor_current_p5_nondeterministic")
     current_artifacts = [current_by_role["raw"]["artifact"], current_by_role["p5_primary"]["artifact"], current_by_role["six"]["artifact"]]
     execution_receipts = []
     for role, supervisor_name in (("raw", "current-raw"), ("p5_primary", "current-p5_primary"), ("p5_repeat", "current-p5_repeat"), ("six", "current-six")):
@@ -1028,33 +1320,72 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
         receipt["supervisor_sha256"] = _digest(supervisors[supervisor_name])
         receipt["execution_sha256"] = _digest({key: item for key, item in receipt.items() if key != "execution_sha256"})
         execution_receipts.append(receipt)
-    current_receipt = {"schema": formal.CURRENT_WORKER_SCHEMA, "lifecycle": list(formal.CURRENT_LIFECYCLE), "projection_sha256": canonical_sha256(projection), "artifact_sha256": {row["arm_id"]: row["artifact_sha256"] for row in current_artifacts}, "static_p5_primary_sha256": current_by_role["p5_primary"]["artifact"]["artifact_sha256"], "static_p5_repeat_sha256": current_by_role["p5_repeat"]["artifact"]["artifact_sha256"], "static_p5_byte_identical": True, "static_p5_execution_count": 2, "execution_receipts": execution_receipts}
+    projection_sha256 = canonical_sha256(projection) if projection is not None else protocol["candidate"]["projection_canonical_sha256"]
+    current_receipt = {"schema": formal.CURRENT_WORKER_SCHEMA, "lifecycle": list(formal.CURRENT_LIFECYCLE), "projection_sha256": projection_sha256, "artifact_sha256": {row["arm_id"]: row["artifact_sha256"] for row in current_artifacts}, "static_p5_primary_sha256": current_by_role["p5_primary"]["artifact"]["artifact_sha256"], "static_p5_repeat_sha256": current_by_role["p5_repeat"]["artifact"]["artifact_sha256"], "static_p5_byte_identical": True, "static_p5_execution_count": 2, "execution_receipts": execution_receipts}
     current_receipt["worker_sha256"] = formal._digest(current_receipt)
     artifacts = [checked_original["artifact"], *current_artifacts]
-    endpoint = formal.freeze_endpoint_manifest(projection=projection, protocol=protocol, ranking_artifacts=artifacts)
+    endpoint = formal.freeze_endpoint_manifest(
+        projection=projection if synthetic else None,
+        candidate_reference=None if synthetic else protocol["candidate"]["candidate_reference"],
+        protocol=protocol, ranking_artifacts=artifacts,
+    )
     # Rebind each original receipt to the actual aggregate artifact only after the
     # five isolated subprocess packets are accepted.
     original_resources = []
     for packet in original_packets:
         receipt = dict(packet["resource_receipt"]); receipt["artifact_sha256"] = checked_original["artifact"]["artifact_sha256"]; receipt["resource_sha256"] = formal.resource_digest(receipt); original_resources.append(receipt)
     resources = [*original_resources, *(row["resource_receipt"] for row in current_packets)]
-    expected_queries = formal.projection_query_keys(projection)
+    expected_queries = formal.projection_query_keys(projection) if projection is not None else None
+    expected_denominators = (
+        formal.projection_denominators(projection)
+        if projection is not None
+        else formal.projection_reference_denominators(protocol["candidate"]["candidate_reference"], protocol=protocol)
+    )
+    expected_query_coverage = (
+        None if projection is not None
+        else formal.projection_reference_query_coverage_sha256(protocol["candidate"]["candidate_reference"], protocol=protocol)
+    )
+    artifacts_by_arm = {artifact["arm_id"]: artifact for artifact in current_artifacts}
     for receipt in resources:
-        formal.validate_resource_receipt(receipt, arm_id=receipt["arm_id"], thresholds=protocol["resource_thresholds"], expected_denominators=formal.projection_denominators(projection), expected_query_keys=expected_queries)
+        artifact = artifacts_by_arm.get(receipt["arm_id"])
+        measurement_base = (
+            Path(str(artifact["artifact_path"])).parent
+            if isinstance(artifact, Mapping) and artifact.get("schema") == rank.RANKING_ARTIFACT_REFERENCE_SCHEMA
+            else None
+        )
+        formal.validate_resource_receipt(receipt, arm_id=receipt["arm_id"], thresholds=protocol["resource_thresholds"], expected_denominators=expected_denominators, expected_query_keys=expected_queries, measurement_base_path=measurement_base, expected_query_coverage_sha256=expected_query_coverage, expected_projection_sha256=protocol["candidate"]["projection_canonical_sha256"])
     expected_resource_modes = {"synthetic_rehearsal"} if synthetic else {"live_native_adapter", "live_original_public_product"}
     if any(receipt["measurement_mode"] not in expected_resource_modes for receipt in resources):
         raise CustodyError("executor_resource_mode_invalid")
     formal.validate_current_execution_receipts(
         execution_receipts, current_worker_receipt=current_receipt, protocol=protocol, projection=projection,
+        candidate_reference=None if synthetic else protocol["candidate"]["candidate_reference"],
         resources=resources, ranking_artifacts=current_artifacts, supervisors=supervisors, allow_synthetic=synthetic,
     )
+    # Four isolated current workers share one derived candidate SQLite store.
+    # It remains only until every artifact (including the P5 repeat) validates.
+    # The cleanup receipt is public observability, not a scientific input.
+    with rank.CandidateProjectionStore.open(
+        protocol["candidate"]["candidate_reference"], staging,
+        expected_bundle_root=public_bundle,
+    ) as shared_store:
+        candidate_store_cleanup = shared_store.cleanup_after_artifacts_validated(
+            [current_by_role[name]["artifact"] for name in ("raw", "p5_primary", "p5_repeat", "six")],
+            expected_count=4,
+        )
+    output = Path(str(config["output_dir"]))
+    published_current_artifacts = [
+        _rebase_published_artifact_reference(artifact, staging=staging, output=output)
+        for artifact in current_artifacts
+    ]
     packet = {
         "schema": FREEZE_PACKET_SCHEMA if synthetic else FORMAL_FREEZE_PACKET_SCHEMA,
         "synthetic_test_mode": synthetic,
         "formal_eligible": not synthetic, "authorization_sha256": authorization["authorization_sha256"],
-        "protocol": protocol, "projection_sha256": canonical_sha256(projection),
-        "current_worker_receipt": current_receipt, "ranking_artifacts": artifacts,
+        "protocol": protocol, "projection_sha256": projection_sha256,
+        "current_worker_receipt": current_receipt, "ranking_artifacts": [checked_original["artifact"], *published_current_artifacts],
         "endpoint_manifest": endpoint, "resource_receipts": resources, "supervisors": supervisors,
+        "candidate_store_cleanup": candidate_store_cleanup,
         "packet_sha256": "",
     }
     packet["packet_sha256"] = _digest({key: item for key, item in packet.items() if key != "packet_sha256"})
@@ -1096,6 +1427,7 @@ def public_coordinator(config: Mapping[str, Any]) -> dict[str, Any]:
     _consume_authorization(authorization=authorization, output_dir=output)
     staging = _new_staging_generation(output=output, authorization=authorization)
     staging_identity = _generation_identity(staging)
+    original_support = _original_support_root(staging=staging, output=output)
     try:
         packet = _build_staged_generation(
             config=config, protocol=protocol, authorization=authorization, staging=staging,
@@ -1106,6 +1438,12 @@ def public_coordinator(config: Mapping[str, Any]) -> dict[str, Any]:
         # failed run leaves no final output and no incomplete generation.
         if staging.exists():
             _discard_owned_generation(staging, staging_identity)
+        if original_support.exists() or original_support.is_symlink():
+            if original_support.is_symlink() or not original_support.is_dir():
+                raise CustodyError("executor_original_support_cleanup_invalid")
+            shutil.rmtree(original_support)
+            if original_support.exists():
+                raise CustodyError("executor_original_support_cleanup_failed")
         raise
     published = _load(output / "public-freeze.json")
     if published != packet:

@@ -15,6 +15,7 @@ from benchmarks import aerp7_convomem_authoring as authoring
 from benchmarks import aerp7_convomem_confirmation as confirmation
 from benchmarks import aerp7_convomem_executor as executor
 from benchmarks import aerp7_convomem_formal as formal
+from benchmarks import aerp7_original_product as original_product
 from benchmarks import aerp7_custodian_executor as custodian
 from benchmarks.aerp7_convomem_confirmation import CustodyError
 
@@ -327,8 +328,16 @@ def _existing_receipt(*, path: Path, plan: Mapping[str, Any], repo_root: Path, p
 
 
 def _candidate_receipt(built: Mapping[str, Any]) -> dict[str, Any]:
-    root = Path(str(built["candidate_output_dir"])); projection = confirmation.load_candidate_projection(root)
-    return {**{key: built[key] for key in ("generation_id", "projection_raw_sha256", "projection_canonical_sha256")}, "ready_sha256": confirmation._snapshot(root / "READY.json", "aerp7_one_shot_candidate_ready")[2], **formal.projection_denominators(projection)}
+    required = {"candidate_output_dir", "generation_id", "projection_raw_sha256", "projection_canonical_sha256", "dataset", "query_count", "candidate_text_count"}
+    if not required <= set(built):
+        raise CustodyError("aerp7_one_shot_candidate_receipt_invalid")
+    root = Path(str(built["candidate_output_dir"]))
+    reference = original_product.candidate_projection_reference(
+        bundle_path=root, generation_id=built["generation_id"],
+        projection_raw_sha256=built["projection_raw_sha256"], projection_canonical_sha256=built["projection_canonical_sha256"],
+        dataset=built["dataset"], query_count=built["query_count"], candidate_text_count=built["candidate_text_count"],
+    )
+    return {**{key: built[key] for key in ("generation_id", "projection_raw_sha256", "projection_canonical_sha256", "query_count", "candidate_text_count")}, "ready_sha256": confirmation._snapshot(root / "READY.json", "aerp7_one_shot_candidate_ready", retain=False)[2], "candidate_reference": reference}
 
 
 def _custodian_private_payload(*, plan: Mapping[str, Any], private: Mapping[str, bytes], public_freeze: Mapping[str, Any], freeze_file_sha256: str) -> dict[str, Any]:
@@ -454,8 +463,28 @@ def run_one_shot(*, signed_plan: Mapping[str, Any], operator_capability: bytes, 
         source_after = authoring.observe_source_manifest(canonical_root=Path(plan["canonical_root"]), premix_root=Path(plan["premix_root"]), expected=plan["source_manifest"])
         if source_before != source_after:
             raise CustodyError("aerp7_one_shot_source_toctou")
+        # Capacity is a private coordinator gate.  It binds the generation's
+        # custody receipt only after both bundles are published, but strictly
+        # before the public coordinator can launch its first ranking worker.
+        candidate_receipt = _candidate_receipt(built)
+        custody_reference = confirmation.custody_reference(
+            candidate_bundle=Path(plan["candidate_output_dir"]), custody_bundle=Path(plan["custody_output_dir"]),
+            candidate_reference=candidate_receipt["candidate_reference"],
+        )
+        private_preflight = authoring.author_private_disk_preflight(
+            plan=plan, candidate_reference=candidate_receipt["candidate_reference"], custody_reference=custody_reference,
+            operator_capability=operator_capability,
+        )
+        checked_preflight = authoring.validate_private_disk_preflight(
+            private_preflight, operator_capability=operator_capability, expected_plan_sha256=plan["plan_sha256"],
+        )
+        formal.enforce_private_disk_preflight(
+            preflight=checked_preflight, candidate_bundle_root=Path(plan["candidate_output_dir"]),
+            custody_bundle_root=Path(plan["custody_output_dir"]), candidate_reference=candidate_receipt["candidate_reference"],
+            staging_root=Path(plan["staging_root"]),
+        )
         stage = "protocol"; _publish_progress(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage)
-        protocol = authoring.author_formal_protocol(repo_root=repo_root, candidate_receipt=_candidate_receipt(built), model_receipt=model_receipt, expected_checkpoint_path=Path(plan["expected_checkpoint_path"]), preparse_semantics=plan["census_semantics"], preparse_current_code_receipt=plan["preparse_current_code_receipt"])
+        protocol = authoring.author_formal_protocol(repo_root=repo_root, candidate_receipt=candidate_receipt, model_receipt=model_receipt, expected_checkpoint_path=Path(plan["expected_checkpoint_path"]), preparse_semantics=plan["census_semantics"], preparse_current_code_receipt=plan["preparse_current_code_receipt"])
         if protocol["execution_checkpoint"] != binding: raise CustodyError("aerp7_one_shot_checkpoint_drift")
         protocol_path, authorization_path = Path(plan["protocol_path"]), Path(plan["authorization_path"])
         executor._write_new(protocol_path, protocol)

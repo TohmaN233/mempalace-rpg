@@ -15,6 +15,8 @@ import hmac
 import json
 import math
 import os
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -22,11 +24,12 @@ from typing import Any, Callable, Mapping, Sequence
 from benchmarks import aerp7_convomem_rank as rank
 from benchmarks import aerp7_convomem_scoring as score
 from benchmarks import aerp7_convomem_confirmation as confirmation
+from benchmarks import aerp7_original_product as original_product
 from benchmarks import aerp_execution_checkpoint as execution_checkpoint
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256, validate_candidate_projection
 
 
-FORMAL_PROTOCOL_SCHEMA = "aerp7-convomem-formal-protocol-v1"
+FORMAL_PROTOCOL_SCHEMA = "aerp7-convomem-formal-protocol-v2"
 RELEASE_SCHEMA = "aerp7-convomem-release-authorization-v1"
 REHEARSAL_RELEASE_SCHEMA = "aerp7-convomem-rehearsal-release-authorization-v1"
 RESOURCE_SCHEMA = "aerp7-convomem-resource-receipt-v2"
@@ -34,10 +37,13 @@ AUDIT_ENVELOPE_SCHEMA = "aerp7-convomem-formal-audit-envelope-v1"
 POST_SCORE_ATTESTATION_SCHEMA = "aerp7-convomem-post-score-attestation-v1"
 CURRENT_WORKER_SCHEMA = "aerp7-convomem-current-worker-receipt-v1"
 CURRENT_EXECUTION_RECEIPT_SCHEMA = "aerp7-convomem-current-execution-receipt-v2"
+PRIVATE_DISK_PREFLIGHT_SCHEMA = "aerp7-convomem-private-disk-preflight-v1"
+PRIVATE_DISK_CALIBRATION_SCHEMA = "aerp7-convomem-private-disk-calibration-v1"
+CANDIDATE_TRANSPORT = {"schema": confirmation.CANDIDATE_PROJECTION_REFERENCE_SCHEMA, "worker_input": "persistent_reference_cursor_v1"}
 CURRENT_LIFECYCLE = ("candidate_only", "rank_strong_raw", "rank_static_p5", "repeat_static_p5", "rank_six_view_secondary", "freeze")
 ORIGINAL_LIFECYCLE = ("isolated", "ingest_all", "close", "cold_reopen", "query_all", "worker_audit", "coordinator_audit", "freeze")
 _FORBIDDEN_CANDIDATE_TOKENS = frozenset({"custody", "secret", "source", "answer", "evidence", "label", "canonical", "premix", "official_root", "source_root"})
-_CANDIDATE_WORKER_KEYS = frozenset({"role", "projection_sha256", "projection_raw_sha256", "projection_path", "model_receipt", "code_receipt", "staging_root", "arms", "top_k", "tie_break", "serializer_contract"})
+_CANDIDATE_WORKER_KEYS = frozenset({"role", "projection_sha256", "projection_raw_sha256", "candidate_reference_sha256", "projection_path", "model_receipt", "code_receipt", "staging_root", "arms", "top_k", "tie_break", "serializer_contract"})
 _RESOURCE_ARMS = frozenset(score.FORMAL_ARMS)
 
 
@@ -71,6 +77,150 @@ def _positive_int(value: Any, code: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise CustodyError(code)
     return value
+
+
+def _nonnegative_int(value: Any, code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CustodyError(code)
+    return value
+
+
+_DISK_CURRENT_OUTPUTS = frozenset({"strong_raw", "static_p5_primary", "static_p5_repeat", "six_view_secondary"})
+_DISK_ORIGINAL_REPLICATES = frozenset({"replicate_01", "replicate_02", "replicate_03", "replicate_04", "replicate_05"})
+_DISK_CHROMA_POLICY = "sequential_one_build_peak_v1"
+
+
+def private_disk_calibration_digest(value: Mapping[str, Any]) -> str:
+    return _digest({key: item for key, item in value.items() if key != "calibration_sha256"})
+
+
+def _disk_component_map(value: Any, *, keys: frozenset[str], code: str) -> dict[str, int]:
+    row = _obj(value, code)
+    if set(row) != keys:
+        raise CustodyError(code)
+    return {key: _nonnegative_int(row[key], code) for key in sorted(keys)}
+
+
+def validate_private_disk_calibration(value: Any) -> dict[str, Any]:
+    """Validate a signed-plan capacity calibration with no inferred defaults.
+
+    It is coordinator-private operational metadata.  It intentionally does not
+    enter the formal protocol, public worker configs, packets, or artifacts.
+    """
+    row = _obj(value, "private_disk_calibration_invalid")
+    required = {
+        "schema", "calibration_id", "source_manifest_sha256", "model_receipt_sha256",
+        "candidate_resident_bytes", "custody_resident_bytes", "custody_sqlite_store_bytes", "shared_current_store_bytes",
+        "current_ranking_measurement_bytes", "original_replicate_store_bytes",
+        "original_candidate_index_peak_bytes", "original_chroma_peak_bytes",
+        "original_chroma_peak_policy", "scoring_ephemeral_store_bytes", "scoring_report_bytes",
+        "safety_margin_bytes", "total_required_additional_bytes", "calibration_sha256",
+    }
+    if set(row) != required or row.get("schema") != PRIVATE_DISK_CALIBRATION_SCHEMA:
+        raise CustodyError("private_disk_calibration_invalid")
+    _text(row.get("calibration_id"), "private_disk_calibration_invalid")
+    _hex(row.get("source_manifest_sha256"), "private_disk_calibration_invalid")
+    _hex(row.get("model_receipt_sha256"), "private_disk_calibration_invalid")
+    if row.get("original_chroma_peak_policy") != _DISK_CHROMA_POLICY:
+        raise CustodyError("private_disk_calibration_invalid")
+    current = _disk_component_map(row.get("current_ranking_measurement_bytes"), keys=_DISK_CURRENT_OUTPUTS, code="private_disk_calibration_invalid")
+    originals = _disk_component_map(row.get("original_replicate_store_bytes"), keys=_DISK_ORIGINAL_REPLICATES, code="private_disk_calibration_invalid")
+    fields = (
+        "candidate_resident_bytes", "custody_resident_bytes", "custody_sqlite_store_bytes", "shared_current_store_bytes",
+        "original_candidate_index_peak_bytes", "original_chroma_peak_bytes",
+        "scoring_ephemeral_store_bytes", "scoring_report_bytes", "safety_margin_bytes",
+    )
+    values = {key: _nonnegative_int(row.get(key), "private_disk_calibration_invalid") for key in fields}
+    # Chroma can only be supplied by a real calibration; zero would be an
+    # implicit fallback/guess and is deliberately rejected.
+    if values["original_chroma_peak_bytes"] <= 0:
+        raise CustodyError("private_disk_calibration_original_chroma_missing")
+    expected_total = sum(values.values()) + sum(current.values()) + sum(originals.values())
+    if row.get("total_required_additional_bytes") != expected_total:
+        raise CustodyError("private_disk_calibration_arithmetic_invalid")
+    _hex(row.get("calibration_sha256"), "private_disk_calibration_invalid")
+    if row["calibration_sha256"] != private_disk_calibration_digest(row):
+        raise CustodyError("private_disk_calibration_digest_invalid")
+    return row
+
+
+def private_disk_preflight_digest(value: Mapping[str, Any]) -> str:
+    return _digest({key: item for key, item in value.items() if key not in {"preflight_sha256", "preflight_hmac"}})
+
+
+def validate_private_disk_preflight(value: Any) -> dict[str, Any]:
+    row = _obj(value, "private_disk_preflight_invalid")
+    required = {
+        "schema", "plan_sha256", "calibration", "custody_reference_sha256", "generation_id",
+        "candidate_input_bytes", "custody_input_bytes", "custody_logical_item_count",
+        "custody_evidence_span_count", "custody_sqlite_store_bytes",
+        "custody_peak_disk_input_and_store_bytes", "preflight_sha256", "preflight_hmac",
+    }
+    if set(row) != required or row.get("schema") != PRIVATE_DISK_PREFLIGHT_SCHEMA:
+        raise CustodyError("private_disk_preflight_invalid")
+    for key in ("plan_sha256", "custody_reference_sha256", "preflight_sha256"):
+        _hex(row.get(key), "private_disk_preflight_invalid")
+    _text(row.get("generation_id"), "private_disk_preflight_invalid")
+    calibration = validate_private_disk_calibration(row.get("calibration"))
+    for key in (
+        "candidate_input_bytes", "custody_input_bytes", "custody_logical_item_count",
+        "custody_evidence_span_count", "custody_sqlite_store_bytes",
+        "custody_peak_disk_input_and_store_bytes",
+    ):
+        _nonnegative_int(row.get(key), "private_disk_preflight_invalid")
+    if row["custody_peak_disk_input_and_store_bytes"] != (
+        row["candidate_input_bytes"] + row["custody_input_bytes"] + row["custody_sqlite_store_bytes"]
+    ):
+        raise CustodyError("private_disk_preflight_arithmetic_invalid")
+    if row["custody_sqlite_store_bytes"] != calibration["custody_sqlite_store_bytes"]:
+        raise CustodyError("private_disk_preflight_calibration_invalid")
+    if row["preflight_sha256"] != private_disk_preflight_digest(row):
+        raise CustodyError("private_disk_preflight_digest_invalid")
+    if not isinstance(row.get("preflight_hmac"), str) or len(row["preflight_hmac"]) != 64:
+        raise CustodyError("private_disk_preflight_invalid")
+    return row
+
+
+def enforce_private_disk_preflight(*, preflight: Mapping[str, Any], candidate_bundle_root: Path,
+                                   custody_bundle_root: Path, candidate_reference: Mapping[str, Any],
+                                   staging_root: Path) -> dict[str, Any]:
+    """Reverify private custody bindings and free space before the first worker.
+
+    ``custody_bundle_root`` is supplied only by the private coordinator path;
+    it is never inferred from the public candidate capability.
+    """
+    row = validate_private_disk_preflight(preflight)
+    candidate_root = candidate_bundle_root.resolve(strict=True)
+    custody_root = custody_bundle_root.resolve(strict=True)
+    if candidate_root != Path(candidate_reference.get("bundle_path", "")).resolve(strict=True):
+        raise CustodyError("private_disk_preflight_candidate_reference_invalid")
+    reference = confirmation.custody_reference(
+        candidate_bundle=candidate_root, custody_bundle=custody_root, candidate_reference=candidate_reference,
+    )
+    if _digest(reference) != row["custody_reference_sha256"] or reference["generation_id"] != row["generation_id"]:
+        raise CustodyError("private_disk_preflight_custody_reference_drift")
+    candidate_input = (candidate_root / "projection.json").stat().st_size
+    custody_input = (custody_root / "sealed-custody.json").stat().st_size
+    observed = {
+        "candidate_input_bytes": candidate_input,
+        "custody_input_bytes": custody_input,
+        "custody_logical_item_count": reference["item_count"],
+        "custody_evidence_span_count": reference["evidence_span_count"],
+    }
+    if any(row[key] != value for key, value in observed.items()):
+        raise CustodyError("private_disk_preflight_custody_receipt_drift")
+    calibration = row["calibration"]
+    if candidate_input > calibration["candidate_resident_bytes"] or custody_input > calibration["custody_resident_bytes"]:
+        raise CustodyError("private_disk_preflight_resident_estimate_insufficient")
+    try:
+        free_bytes = shutil.disk_usage(staging_root).free
+    except OSError as exc:
+        raise CustodyError("private_disk_preflight_disk_unavailable") from exc
+    if free_bytes < calibration["total_required_additional_bytes"]:
+        raise CustodyError("private_disk_preflight_insufficient_free_bytes")
+    return {"schema": PRIVATE_DISK_PREFLIGHT_SCHEMA, "preflight_sha256": row["preflight_sha256"],
+            "calibration_sha256": calibration["calibration_sha256"], "free_disk_bytes": free_bytes,
+            "total_required_additional_bytes": calibration["total_required_additional_bytes"]}
 
 
 def _finite_nonnegative(value: Any, code: str) -> float:
@@ -121,13 +271,22 @@ def _primary_current_arm(value: Any) -> dict[str, Any]:
 
 def _candidate_receipt(value: Any) -> dict[str, Any]:
     row = _obj(value, "formal_candidate_receipt_invalid")
-    required = {"generation_id", "ready_sha256", "projection_raw_sha256", "projection_canonical_sha256", "query_count", "candidate_text_count"}
+    required = {"generation_id", "ready_sha256", "projection_raw_sha256", "projection_canonical_sha256", "query_count", "candidate_text_count", "candidate_reference"}
     if set(row) != required:
         raise CustodyError("formal_candidate_receipt_invalid")
     _text(row.get("generation_id"), "formal_candidate_receipt_invalid")
-    for key in required - {"generation_id"}:
+    for key in required - {"generation_id", "candidate_reference"}:
         if key in {"query_count", "candidate_text_count"}: _positive_int(row.get(key), "formal_candidate_receipt_invalid")
         else: _hex(row.get(key), "formal_candidate_receipt_invalid")
+    reference = rank.validate_candidate_projection_reference(row.get("candidate_reference"))
+    if (
+        reference["generation_id"] != row["generation_id"]
+        or reference["projection_raw_sha256"] != row["projection_raw_sha256"]
+        or reference["projection_canonical_sha256"] != row["projection_canonical_sha256"]
+        or reference["query_count"] != row["query_count"]
+        or reference["candidate_text_count"] != row["candidate_text_count"]
+    ):
+        raise CustodyError("formal_candidate_reference_binding_invalid")
     return row
 
 
@@ -141,6 +300,65 @@ def projection_query_keys(value: Any) -> list[dict[str, str]]:
     """The text-free, canonical per-query binding used by resource sidecars."""
     projection = validate_candidate_projection(value)
     return [{"item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"])} for item in sorted(projection["items"], key=lambda item: item["item_id"])]
+
+
+def _candidate_reference_binding(
+    value: Any, *, protocol: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate the small public candidate capability without opening JSON.
+
+    Formal coordinator paths pass this reference between endpoints.  Keeping
+    the projection out of the packet is intentional: a reader which needs
+    rows must use the ranker's bounded cursor/store instead of this helper.
+    """
+    frozen = validate_formal_protocol(protocol)
+    try:
+        reference = rank.validate_candidate_projection_reference(value)
+    except CustodyError:
+        raise
+    if reference != frozen["candidate"]["candidate_reference"]:
+        raise CustodyError("formal_candidate_reference_binding_invalid")
+    return reference
+
+
+def projection_reference_denominators(
+    value: Any, *, protocol: Mapping[str, Any]
+) -> dict[str, int]:
+    """Return frozen candidate denominators from a READY-bound reference."""
+    reference = _candidate_reference_binding(value, protocol=protocol)
+    return {
+        "query_count": int(reference["query_count"]),
+        "candidate_text_count": int(reference["candidate_text_count"]),
+    }
+
+
+def projection_reference_query_coverage_sha256(
+    value: Any, *, protocol: Mapping[str, Any]
+) -> str:
+    """Stream the canonical query-key sequence without a Python row list."""
+    reference = _candidate_reference_binding(value, protocol=protocol)
+    digest = hashlib.sha256(b"[")
+    count = 0
+    first = True
+    previous: str | None = None
+    # Candidate JSON preserves publication order, while resource sidecars are
+    # canonically item-id ordered.  Use an ephemeral SQLite cursor to obtain
+    # that exact order without retaining a query list.
+    with tempfile.TemporaryDirectory(prefix=".aerp7-formal-query-coverage-", dir=Path(reference["bundle_path"]).parent) as temporary:
+        with rank.CandidateProjectionStore.open(reference, Path(temporary)) as store:
+            for item in store.iter_items():
+                item_id = _hex(item.get("item_id"), "formal_candidate_query_key_invalid")
+                if previous is not None and item_id <= previous:
+                    raise CustodyError("formal_candidate_query_order_invalid")
+                payload = _bytes({"item_id": item_id, "query_sha256": rank._query_digest(item.get("query_text"))})
+                if not first:
+                    digest.update(b",")
+                digest.update(payload)
+                first = False; previous = item_id; count += 1
+    digest.update(b"]")
+    if count != reference["query_count"]:
+        raise CustodyError("formal_candidate_query_denominator_invalid")
+    return digest.hexdigest()
 
 
 def _resource_thresholds(value: Any) -> dict[str, Any]:
@@ -162,7 +380,7 @@ def validate_formal_protocol(value: Any) -> dict[str, Any]:
     row = _obj(value, "formal_protocol_invalid")
     required = {
         "schema", "synthetic_test_mode", "candidate", "current_code_receipt", "original_code_receipt", "execution_checkpoint", "source_receipt",
-        "model_receipt", "arms", "primary_current_arm", "serializer_contract", "top_k", "tie_break", "original_build_count", "p5_repeat_required",
+        "model_receipt", "candidate_transport", "arms", "primary_current_arm", "serializer_contract", "top_k", "tie_break", "original_build_count", "p5_repeat_required",
         "bootstrap", "gates", "resource_thresholds", "protocol_sha256",
     }
     if set(row) != required or row.get("schema") != FORMAL_PROTOCOL_SCHEMA or row.get("synthetic_test_mode") is not False:
@@ -175,6 +393,8 @@ def validate_formal_protocol(value: Any) -> dict[str, Any]:
     if row.get("source_receipt") != rank.PROTOCOL_SOURCE:
         raise CustodyError("formal_source_receipt_invalid")
     _model_receipt(row.get("model_receipt")); _primary_current_arm(row.get("primary_current_arm"))
+    if row.get("candidate_transport") != CANDIDATE_TRANSPORT:
+        raise CustodyError("formal_candidate_transport_invalid")
     if tuple(row.get("arms", ())) != score.FORMAL_ARMS or row.get("serializer_contract") != {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}:
         raise CustodyError("formal_arm_contract_invalid")
     if row.get("top_k") != 10 or row.get("tie_break") != "stable_ranking_key_ascending":
@@ -205,6 +425,8 @@ def validate_candidate_worker_config(value: Any, *, protocol: Mapping[str, Any])
             raise CustodyError("candidate_worker_forbidden_field")
     if row.get("projection_sha256") != frozen["candidate"]["projection_canonical_sha256"] or row.get("projection_raw_sha256") != frozen["candidate"]["projection_raw_sha256"]:
         raise CustodyError("candidate_worker_projection_binding_invalid")
+    if row.get("candidate_reference_sha256") != _digest(frozen["candidate"]["candidate_reference"]):
+        raise CustodyError("candidate_worker_reference_binding_invalid")
     projection_path = _text(row.get("projection_path"), "candidate_worker_config_invalid")
     staging_root = _text(row.get("staging_root"), "candidate_worker_config_invalid")
     if Path(projection_path).is_absolute() or Path(staging_root).is_absolute() or ".." in Path(projection_path).parts or ".." in Path(staging_root).parts:
@@ -223,7 +445,7 @@ def canonical_candidate_worker_config(protocol: Mapping[str, Any]) -> dict[str, 
     frozen = validate_formal_protocol(protocol)
     return {
         "role": "candidate_ranker", "projection_sha256": frozen["candidate"]["projection_canonical_sha256"],
-        "projection_raw_sha256": frozen["candidate"]["projection_raw_sha256"], "projection_path": "projection.json",
+        "projection_raw_sha256": frozen["candidate"]["projection_raw_sha256"], "candidate_reference_sha256": _digest(frozen["candidate"]["candidate_reference"]), "projection_path": "projection.json",
         "model_receipt": frozen["model_receipt"], "code_receipt": frozen["current_code_receipt"],
         "staging_root": "staging", "arms": ["strong_raw", "static_p5", "six_view_secondary"],
         "top_k": frozen["top_k"], "tie_break": frozen["tie_break"], "serializer_contract": frozen["serializer_contract"],
@@ -251,28 +473,37 @@ def _inside(root: Path, relative: str, code: str) -> Path:
     return resolved
 
 
-def load_candidate_worker_projection(*, worker_config: Mapping[str, Any], protocol: Mapping[str, Any], candidate_bundle_root: Path, staging_parent: Path) -> dict[str, Any]:
-    """The real candidate-side file capability: projection+READY only, no custody path."""
+def load_candidate_worker_reference(*, worker_config: Mapping[str, Any], protocol: Mapping[str, Any], candidate_bundle_root: Path, staging_parent: Path) -> dict[str, Any]:
+    """Open the immutable public capability without materializing its projection."""
     frozen = validate_formal_protocol(protocol); config = validate_candidate_worker_config(worker_config, protocol=frozen)
     if config["projection_path"] != "projection.json":
         raise CustodyError("candidate_projection_path_invalid")
-    # Reuse the custody module's double-read, lstat/identity/alias/drift-safe
-    # candidate snapshot.  It never names or opens any custody file.
-    projection, ready, raw = confirmation._candidate_snapshot(candidate_bundle_root)
-    ready_raw = confirmation._snapshot(candidate_bundle_root / "READY.json", "candidate_bundle_not_ready")[0]
-    if hashlib.sha256(raw).hexdigest() != frozen["candidate"]["projection_raw_sha256"] or hashlib.sha256(ready_raw).hexdigest() != frozen["candidate"]["ready_sha256"]:
+    reference = rank.validate_candidate_projection_reference(frozen["candidate"]["candidate_reference"])
+    if Path(reference["bundle_path"]).resolve(strict=True) != candidate_bundle_root.resolve(strict=True):
+        raise CustodyError("candidate_reference_bundle_binding_invalid")
+    cursor = rank.CandidateProjectionCursor(reference, expected_bundle_root=candidate_bundle_root)
+    cursor.reverify()
+    ready_raw, _identity, _size = cursor._read_regular(cursor.ready_path, "candidate_bundle_not_ready")
+    if hashlib.sha256(ready_raw).hexdigest() != frozen["candidate"]["ready_sha256"]:
         raise CustodyError("candidate_bundle_raw_binding_invalid")
-    if ready.get("generation_id") != frozen["candidate"]["generation_id"] or ready["projection"].get("raw_sha256") != frozen["candidate"]["projection_raw_sha256"] or ready["projection"].get("canonical_sha256") != frozen["candidate"]["projection_canonical_sha256"]:
-        raise CustodyError("candidate_ready_binding_invalid")
-    if canonical_sha256(projection) != frozen["candidate"]["projection_canonical_sha256"]:
-        raise CustodyError("candidate_projection_canonical_binding_invalid")
-    if {key: frozen["candidate"][key] for key in ("query_count", "candidate_text_count")} != projection_denominators(projection):
-        raise CustodyError("candidate_projection_denominator_binding_invalid")
     # This validates a concrete writable staging capability without opening any other input.
     staging = _inside(staging_parent, config["staging_root"], "candidate_staging_path_invalid")
     candidate_root = candidate_bundle_root.resolve(strict=True)
     if staging == candidate_root or candidate_root in staging.parents or staging in candidate_root.parents:
         raise CustodyError("candidate_staging_custody_overlap")
+    return reference
+
+
+def load_candidate_worker_projection(*, worker_config: Mapping[str, Any], protocol: Mapping[str, Any], candidate_bundle_root: Path, staging_parent: Path) -> dict[str, Any]:
+    """Legacy full-materialization adapter for tests and pre-stream consumers.
+
+    New workers must use :func:`load_candidate_worker_reference`; this adapter
+    keeps the old public validator until every endpoint has moved to cursors.
+    """
+    reference = load_candidate_worker_reference(worker_config=worker_config, protocol=protocol, candidate_bundle_root=candidate_bundle_root, staging_parent=staging_parent)
+    projection, _ready, _raw = confirmation._candidate_snapshot(candidate_bundle_root)
+    if canonical_sha256(projection) != reference["projection_canonical_sha256"] or projection_denominators(projection) != {key: reference[key] for key in ("query_count", "candidate_text_count")}:
+        raise CustodyError("candidate_projection_denominator_binding_invalid")
     return projection
 
 
@@ -290,7 +521,7 @@ def _latency_percentiles(values: Sequence[int]) -> dict[str, int]:
     return {"count": len(rows), "p50": at(.50), "p95": at(.95), "p99": at(.99), "max": rows[-1]}
 
 
-def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[str, Any], expected_denominators: Mapping[str, int], expected_query_keys: Sequence[Mapping[str, str]] | None = None) -> dict[str, Any]:
+def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[str, Any], expected_denominators: Mapping[str, int], expected_query_keys: Sequence[Mapping[str, str]] | None = None, measurement_base_path: Path | None = None, expected_query_coverage_sha256: str | None = None, expected_projection_sha256: str | None = None, expected_generation_id: str | None = None) -> dict[str, Any]:
     """Validate measurement coverage and enforce thresholds frozen in protocol."""
     limits = _resource_thresholds(thresholds); row = _obj(value, "formal_resource_receipt_invalid")
     required = {"schema", "arm_id", "execution_role", "resource_semantics", "measurement_scope", "measurement_mode", "resource_comparability", "p5_repeat_accounting", "ingest_seconds", "index_seconds", "query_measurements", "query_latency_ns", "passage_embedding", "query_embedding", "storage_scope", "storage_bytes", "peak_rss_bytes", "artifact_sha256", "build_id", "index_sha256", "input_denominators", "hardware_runtime", "resource_sha256"}
@@ -314,25 +545,76 @@ def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[st
         raise CustodyError("formal_resource_comparability_invalid")
     ingest, index = _finite_nonnegative(row.get("ingest_seconds"), "formal_resource_receipt_invalid"), _finite_nonnegative(row.get("index_seconds"), "formal_resource_receipt_invalid")
     measurements = row.get("query_measurements")
-    if not isinstance(measurements, list) or not measurements:
-        raise CustodyError("formal_resource_measurements_invalid")
-    seen_items: set[str] = set(); walls: list[int] = []; cpus: list[int] = []
-    for measurement in measurements:
-        value = _obj(measurement, "formal_resource_measurements_invalid")
-        if set(value) != {"item_id", "query_sha256", "wall_ns", "cpu_ns"}:
+    walls: list[int] = []; cpus: list[int] = []
+    measurement_count: int
+    if isinstance(measurements, list):
+        if not measurements:
             raise CustodyError("formal_resource_measurements_invalid")
-        item_id, query_sha = _hex(value.get("item_id"), "formal_resource_measurements_invalid"), _hex(value.get("query_sha256"), "formal_resource_measurements_invalid")
-        if item_id in seen_items:
-            raise CustodyError("formal_resource_measurements_invalid")
-        seen_items.add(item_id); _positive_int(value.get("wall_ns"), "formal_resource_measurements_invalid"); _positive_int(value.get("cpu_ns"), "formal_resource_measurements_invalid")
-        walls.append(value["wall_ns"]); cpus.append(value["cpu_ns"])
-    if expected_query_keys is not None:
-        expected_keys = [dict(item) for item in expected_query_keys]
-        actual_keys = [{"item_id": item["item_id"], "query_sha256": item["query_sha256"]} for item in measurements]
-        if actual_keys != expected_keys:
+        seen_items: set[str] = set()
+        for measurement in measurements:
+            value = _obj(measurement, "formal_resource_measurements_invalid")
+            if set(value) != {"item_id", "query_sha256", "wall_ns", "cpu_ns"}:
+                raise CustodyError("formal_resource_measurements_invalid")
+            item_id, query_sha = _hex(value.get("item_id"), "formal_resource_measurements_invalid"), _hex(value.get("query_sha256"), "formal_resource_measurements_invalid")
+            if item_id in seen_items:
+                raise CustodyError("formal_resource_measurements_invalid")
+            seen_items.add(item_id); _positive_int(value.get("wall_ns"), "formal_resource_measurements_invalid"); _positive_int(value.get("cpu_ns"), "formal_resource_measurements_invalid")
+            walls.append(value["wall_ns"]); cpus.append(value["cpu_ns"])
+        measurement_count = len(measurements)
+        if expected_query_keys is not None:
+            expected_keys = [dict(item) for item in expected_query_keys]
+            actual_keys = [{"item_id": item["item_id"], "query_sha256": item["query_sha256"]} for item in measurements]
+            if actual_keys != expected_keys:
+                raise CustodyError("formal_resource_query_binding_invalid")
+    elif isinstance(measurements, Mapping) and measurements.get("schema") == rank.MEASUREMENT_REFERENCE_SCHEMA:
+        if measurement_base_path is None:
+            raise CustodyError("formal_resource_measurement_reference_base_required")
+        checked_reference = rank.validate_measurement_reference(
+            measurements, base_path=measurement_base_path,
+            expected_projection_sha256=expected_projection_sha256,
+            expected_generation_id=expected_generation_id,
+            expected_count=int(expected_denominators["query_count"]),
+        )
+        if expected_query_coverage_sha256 is not None and checked_reference["coverage_sha256"] != expected_query_coverage_sha256:
             raise CustodyError("formal_resource_query_binding_invalid")
+        measurement_count = checked_reference["count"]
+        computed_latency = {"wall": checked_reference["wall_summary"], "cpu": checked_reference["cpu_summary"]}
+    elif isinstance(measurements, Mapping) and measurements.get("schema") == "aerp7-original-product-resource-measurement-reference-v1":
+        if arm_id != "original_public_product" or set(measurements) != {"schema", "replicate_reference", "sequence"}:
+            raise CustodyError("formal_resource_measurement_reference_invalid")
+        try:
+            reference = original_product.validate_original_replicate_reference(measurements["replicate_reference"])
+            sequence = _obj(measurements["sequence"], "formal_resource_measurement_reference_invalid")
+            if (sequence.get("schema") != original_product.ORIGINAL_STREAM_TELEMETRY_SCHEMA or sequence.get("table") != "measurements" or sequence.get("replicate_reference_sha256") != _digest(reference) or sequence.get("count") != reference["measurement_count"]):
+                raise CustodyError("formal_resource_measurement_reference_invalid")
+            with original_product.OriginalReplicateStore.open(reference) as store:
+                summary = store.sequence_summary().get("measurements")
+                if summary != {"count": sequence["count"], "sha256": sequence.get("sha256")}:
+                    raise CustodyError("formal_resource_measurement_reference_invalid")
+                query_rows = rank.CandidateProjectionCursor(reference["candidate_reference"]).iter_items()
+                measured_rows = store.iter_measurements(); ranked_rows = store.iter_rankings(); measurement_count = 0
+                for query, measured, ranked in zip(query_rows, measured_rows, ranked_rows, strict=True):
+                    if measured.get("item_id") != query.get("item_id") or ranked.get("item_id") != query.get("item_id") or measured.get("query_sha256") != rank._query_digest(query.get("query_text")) or ranked.get("query_sha256") != measured.get("query_sha256"):
+                        raise CustodyError("formal_resource_query_binding_invalid")
+                    measurement_count += 1
+                if measurement_count != reference["measurement_count"]:
+                    raise CustodyError("formal_resource_measurement_reference_invalid")
+                # The source store is already a bounded SQLite table.  Query its
+                # sorted scalar columns instead of retaining million samples.
+                def percentile(column: str, fraction: float) -> int:
+                    offset = min(measurement_count - 1, int((measurement_count - 1) * fraction))
+                    item = store.connection.execute("SELECT CAST(json_extract(payload_json, ?) AS INTEGER) FROM measurements ORDER BY CAST(json_extract(payload_json, ?) AS INTEGER), seq LIMIT 1 OFFSET ?", (f"$.{column}", f"$.{column}", offset)).fetchone()
+                    if item is None or isinstance(item[0], bool) or not isinstance(item[0], int) or item[0] <= 0:
+                        raise CustodyError("formal_resource_measurement_reference_invalid")
+                    return int(item[0])
+                computed_latency = {"wall": {"count": measurement_count, "p50": percentile("wall_ns", .50), "p95": percentile("wall_ns", .95), "p99": percentile("wall_ns", .99), "max": percentile("wall_ns", 1.0)}, "cpu": {"count": measurement_count, "p50": percentile("cpu_ns", .50), "p95": percentile("cpu_ns", .95), "p99": percentile("cpu_ns", .99), "max": percentile("cpu_ns", 1.0)}}
+        except original_product.OriginalProductError as exc:
+            raise CustodyError("formal_resource_measurement_reference_invalid") from exc
+    else:
+        raise CustodyError("formal_resource_measurements_invalid")
     latency = _obj(row.get("query_latency_ns"), "formal_resource_receipt_invalid")
-    if set(latency) != {"wall", "cpu"} or latency != {"wall": _latency_percentiles(walls), "cpu": _latency_percentiles(cpus)}:
+    expected_latency = computed_latency if isinstance(measurements, Mapping) else {"wall": _latency_percentiles(walls), "cpu": _latency_percentiles(cpus)}
+    if set(latency) != {"wall", "cpu"} or latency != expected_latency:
         raise CustodyError("formal_resource_percentile_recompute_invalid")
     for key in ("passage_embedding", "query_embedding"):
         calls = _obj(row.get(key), "formal_resource_receipt_invalid")
@@ -348,7 +630,7 @@ def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[st
     denominators = _obj(row.get("input_denominators"), "formal_resource_receipt_invalid")
     if set(denominators) != {"query_count", "candidate_text_count"} or _positive_int(denominators.get("query_count"), "formal_resource_receipt_invalid") < 1 or _positive_int(denominators.get("candidate_text_count"), "formal_resource_receipt_invalid") < 1:
         raise CustodyError("formal_resource_receipt_invalid")
-    if denominators != dict(expected_denominators) or latency["wall"]["count"] != denominators["query_count"] or latency["cpu"]["count"] != denominators["query_count"] or len(measurements) != denominators["query_count"]:
+    if denominators != dict(expected_denominators) or latency["wall"]["count"] != denominators["query_count"] or latency["cpu"]["count"] != denominators["query_count"] or measurement_count != denominators["query_count"]:
         raise CustodyError("formal_resource_denominator_binding_invalid")
     if row["passage_embedding"]["calls"] <= 0 or row["passage_embedding"]["texts"] < denominators["candidate_text_count"] or row["query_embedding"]["calls"] <= 0 or row["query_embedding"]["texts"] < denominators["query_count"]:
         raise CustodyError("formal_resource_call_coverage_invalid")
@@ -381,6 +663,67 @@ def validate_resource_receipt(value: Any, *, arm_id: str, thresholds: Mapping[st
     return row
 
 
+def _validate_public_ranking_artifact(value: Any, *, projection: Mapping[str, Any] | None, protocol: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate either a legacy inline artifact or its persistent public ref.
+
+    Persistent current and original-product references are re-read through
+    their READY-backed validators.  This layer additionally binds every
+    scientific receipt carried by either reference to the signed protocol.
+    """
+    frozen = validate_formal_protocol(protocol)
+    if isinstance(value, Mapping) and value.get("schema") == original_product.ORIGINAL_ARTIFACT_REFERENCE_SCHEMA:
+        try:
+            checked = original_product.validate_original_public_artifact_reference(value)
+        except original_product.OriginalProductError as exc:
+            raise CustodyError("original_artifact_reference_invalid") from exc
+        if (
+            checked["candidate_reference"] != frozen["candidate"]["candidate_reference"]
+            or checked["candidate_reference_sha256"] != _digest(frozen["candidate"]["candidate_reference"])
+            or checked["generation_id"] != frozen["candidate"]["generation_id"]
+            or checked["replicate_count"] != frozen["original_build_count"]
+            or len(checked["replicate_references"]) != frozen["original_build_count"]
+            or checked["model_receipt"] != frozen["model_receipt"]
+            or checked["model_sha256"] != _digest(frozen["model_receipt"])
+            or checked["method_receipt"] != rank.ORIGINAL_METHOD
+            or checked["method_sha256"] != _digest(rank.ORIGINAL_METHOD)
+            or checked["source_receipt"] != rank.PROTOCOL_SOURCE
+            or checked["source_commit_sha256"] != _digest(rank.PROTOCOL_SOURCE)
+            or checked["serializer_receipt"] != rank.ORIGINAL_MEMPALACE_SERIALIZER
+            or checked["serializer_sha256"] != _digest(rank.ORIGINAL_MEMPALACE_SERIALIZER)
+            or _code_receipt(checked["code_receipt"], "original_artifact_reference_code_invalid") != frozen["original_code_receipt"]
+            or checked["code_sha256"] != _digest(frozen["original_code_receipt"])
+        ):
+            raise CustodyError("original_artifact_reference_protocol_binding_invalid")
+        return checked
+    if isinstance(value, Mapping) and value.get("schema") == rank.RANKING_ARTIFACT_REFERENCE_SCHEMA:
+        checked = rank.validate_ranking_artifact_reference(
+            value, expected_projection_sha256=frozen["candidate"]["projection_canonical_sha256"],
+        )
+        if (
+            checked["arm_id"] not in rank.CURRENT_ARMS
+            or checked["method_receipt"] != rank._arm_method(checked["arm_id"])
+            or checked["serializer_receipt"] != rank.CURRENT_SERIALIZER
+                or checked["serializer_sha256"] != _digest(rank.CURRENT_SERIALIZER)
+                or checked["source_receipt"] != rank.PROTOCOL_SOURCE
+                or checked["source_commit_sha256"] != _digest(rank.PROTOCOL_SOURCE)
+                # The stream artifact's input receipt is a persistent relation
+                # reference.  Its embedded legacy digest is deliberately the
+                # byte-identical digest of the former inline receipt; hashing
+                # the reference object itself would silently change the
+                # preregistered public input binding.
+                or checked["input_sha256"] != checked["input_receipt"]["legacy_input_sha256"]
+                or checked["model_sha256"] != _digest(_model_receipt(checked["model_receipt"]))
+            or _model_receipt(checked["model_receipt"]) != frozen["model_receipt"]
+            or checked["code_sha256"] != _digest(_code_receipt(checked["code_receipt"], "ranking_artifact_reference_code_invalid"))
+            or _code_receipt(checked["code_receipt"], "ranking_artifact_reference_code_invalid") != frozen["current_code_receipt"]
+        ):
+            raise CustodyError("ranking_artifact_reference_protocol_binding_invalid")
+        return checked
+    if projection is None:
+        raise CustodyError("ranking_artifact_inline_projection_required")
+    return rank.validate_frozen_ranking(value, projection=projection)
+
+
 def freeze_current_worker(*, encoder: Any, protocol: Mapping[str, Any], worker_config: Mapping[str, Any], candidate_bundle_root: Path, staging_parent: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Candidate-only current worker: exactly three arms and a byte-identical P5 repeat."""
     frozen_protocol = validate_formal_protocol(protocol)
@@ -404,11 +747,22 @@ def freeze_current_worker(*, encoder: Any, protocol: Mapping[str, Any], worker_c
     return artifacts, receipt
 
 
-def validate_current_worker_receipt(value: Any, *, projection: Mapping[str, Any], require_execution_receipts: bool = False) -> dict[str, Any]:
+def validate_current_worker_receipt(value: Any, *, projection: Mapping[str, Any] | None = None,
+                                    candidate_reference: Mapping[str, Any] | None = None,
+                                    protocol: Mapping[str, Any] | None = None,
+                                    require_execution_receipts: bool = False) -> dict[str, Any]:
     row = _obj(value, "current_worker_receipt_invalid")
     required = {"schema", "lifecycle", "projection_sha256", "artifact_sha256", "static_p5_primary_sha256", "static_p5_repeat_sha256", "static_p5_byte_identical", "static_p5_execution_count", "worker_sha256"}
     permitted = required | {"execution_receipts"}
-    if set(row) not in ((permitted,) if require_execution_receipts else (required, permitted)) or row.get("schema") != CURRENT_WORKER_SCHEMA or row.get("lifecycle") != list(CURRENT_LIFECYCLE) or row.get("projection_sha256") != canonical_sha256(validate_candidate_projection(projection)):
+    if (projection is None) == (candidate_reference is None):
+        raise CustodyError("current_worker_candidate_input_ambiguous")
+    if candidate_reference is not None:
+        if protocol is None:
+            raise CustodyError("current_worker_reference_protocol_required")
+        expected_projection_sha256 = _candidate_reference_binding(candidate_reference, protocol=protocol)["projection_canonical_sha256"]
+    else:
+        expected_projection_sha256 = canonical_sha256(validate_candidate_projection(projection))
+    if set(row) not in ((permitted,) if require_execution_receipts else (required, permitted)) or row.get("schema") != CURRENT_WORKER_SCHEMA or row.get("lifecycle") != list(CURRENT_LIFECYCLE) or row.get("projection_sha256") != expected_projection_sha256:
         raise CustodyError("current_worker_receipt_invalid")
     if set(_obj(row["artifact_sha256"], "current_worker_receipt_invalid")) != {"strong_raw", "static_p5", "six_view_secondary"} or row["static_p5_primary_sha256"] != row["artifact_sha256"]["static_p5"] or row["static_p5_repeat_sha256"] != row["artifact_sha256"]["static_p5"] or row["static_p5_byte_identical"] is not True or row["static_p5_execution_count"] != 2:
         raise CustodyError("current_worker_repeat_invalid")
@@ -425,14 +779,14 @@ def validate_current_worker_receipt(value: Any, *, projection: Mapping[str, Any]
     return row
 
 
-def validate_current_execution_receipts(value: Any, *, current_worker_receipt: Mapping[str, Any], protocol: Mapping[str, Any], projection: Mapping[str, Any], resources: Sequence[Mapping[str, Any]], ranking_artifacts: Sequence[Mapping[str, Any]], supervisors: Mapping[str, Any] | None = None, allow_synthetic: bool = False) -> list[dict[str, Any]]:
+def validate_current_execution_receipts(value: Any, *, current_worker_receipt: Mapping[str, Any], protocol: Mapping[str, Any], projection: Mapping[str, Any] | None = None, candidate_reference: Mapping[str, Any] | None = None, resources: Sequence[Mapping[str, Any]], ranking_artifacts: Sequence[Mapping[str, Any]], supervisors: Mapping[str, Any] | None = None, allow_synthetic: bool = False) -> list[dict[str, Any]]:
     """Validate four independently produced execution receipts before freezing.
 
     This deliberately validates the sidecar receipts outside the frozen ranking
     artifact: timing, process IDs, runtime and supervisor details must never
     perturb a ranking artifact's canonical bytes.
     """
-    aggregate = validate_current_worker_receipt(current_worker_receipt, projection=projection, require_execution_receipts=True)
+    aggregate = validate_current_worker_receipt(current_worker_receipt, projection=projection, candidate_reference=candidate_reference, protocol=protocol, require_execution_receipts=True)
     frozen = validate_formal_protocol(protocol)
     rows = value
     if not isinstance(rows, list) or rows != aggregate["execution_receipts"] or len(rows) != 4:
@@ -441,7 +795,12 @@ def validate_current_execution_receipts(value: Any, *, current_worker_receipt: M
         "raw": ("strong_raw", "primary"), "p5_primary": ("static_p5", "primary"),
         "p5_repeat": ("static_p5", "repeat"), "six": ("six_view_secondary", "primary"),
     }
-    artifact_by_arm = {item["arm_id"]: item for item in ranking_artifacts if isinstance(item, Mapping) and isinstance(item.get("arm_id"), str)}
+    artifact_by_arm: dict[str, dict[str, Any]] = {}
+    for artifact in ranking_artifacts:
+        checked_artifact = _validate_public_ranking_artifact(artifact, projection=projection, protocol=frozen)
+        if checked_artifact["arm_id"] in artifact_by_arm:
+            raise CustodyError("current_execution_artifact_coverage_invalid")
+        artifact_by_arm[checked_artifact["arm_id"]] = checked_artifact
     if set(artifact_by_arm) != {"strong_raw", "static_p5", "six_view_secondary"}:
         raise CustodyError("current_execution_artifact_coverage_invalid")
     seen: set[str] = set(); checked: list[dict[str, Any]] = []
@@ -469,7 +828,8 @@ def validate_current_execution_receipts(value: Any, *, current_worker_receipt: M
         expected_measurement_mode = "synthetic_rehearsal" if allow_synthetic else "live_native_adapter"
         if matched_resources[0].get("measurement_mode") != expected_measurement_mode:
             raise CustodyError("current_execution_resource_mode_invalid")
-        if row["artifact_file_sha256"] != hashlib.sha256(_bytes(artifact)).hexdigest() or row["artifact_sha256"] != artifact.get("artifact_sha256") or row["artifact_sha256"] != aggregate["artifact_sha256"][arm_id] or row["execution_sha256"] != _digest({key: item for key, item in row.items() if key != "execution_sha256"}):
+        artifact_file_sha256 = artifact.get("payload_sha256") if artifact.get("schema") == rank.RANKING_ARTIFACT_REFERENCE_SCHEMA else hashlib.sha256(_bytes(artifact)).hexdigest()
+        if row["artifact_file_sha256"] != artifact_file_sha256 or row["artifact_sha256"] != artifact.get("artifact_sha256") or row["artifact_sha256"] != aggregate["artifact_sha256"][arm_id] or row["execution_sha256"] != _digest({key: item for key, item in row.items() if key != "execution_sha256"}):
             raise CustodyError("current_execution_receipt_digest_invalid")
         if row["worker_config_sha256"] != _digest(canonical_candidate_worker_config(frozen)) or row["method_input_sha256"] != _digest({"arm_id": arm_id, "method_receipt": artifact["method_receipt"], "serializer_receipt": artifact["serializer_receipt"]}):
             raise CustodyError("current_execution_replay_binding_invalid")
@@ -533,21 +893,39 @@ def validate_original_worker_receipt(value: Any, *, projection: Any, protocol: M
     return {**row, "artifact": artifact}
 
 
-def freeze_endpoint_manifest(*, projection: Any, protocol: Mapping[str, Any], ranking_artifacts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Bind all public freezes before a custodian is even eligible to load labels."""
-    frozen_protocol = validate_formal_protocol(protocol); frozen_projection = validate_candidate_projection(projection)
-    if canonical_sha256(frozen_projection) != frozen_protocol["candidate"]["projection_canonical_sha256"]:
-        raise CustodyError("endpoint_projection_protocol_binding_invalid")
+def freeze_endpoint_manifest(*, projection: Any | None = None,
+                             candidate_reference: Mapping[str, Any] | None = None,
+                             protocol: Mapping[str, Any],
+                             ranking_artifacts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Bind all public freezes before a custodian is even eligible to load labels.
+
+    ``projection`` is the legacy rehearsal shape.  Formal callers provide the
+    READY-bound ``candidate_reference`` so this coordinator stage neither
+    materializes nor serializes the candidate projection.
+    """
+    frozen_protocol = validate_formal_protocol(protocol)
+    if (projection is None) == (candidate_reference is None):
+        raise CustodyError("endpoint_candidate_input_ambiguous")
+    if candidate_reference is not None:
+        _candidate_reference_binding(candidate_reference, protocol=frozen_protocol)
+        projection_sha256 = frozen_protocol["candidate"]["projection_canonical_sha256"]
+        validation_projection = None
+    else:
+        frozen_projection = validate_candidate_projection(projection)
+        projection_sha256 = canonical_sha256(frozen_projection)
+        if projection_sha256 != frozen_protocol["candidate"]["projection_canonical_sha256"]:
+            raise CustodyError("endpoint_projection_protocol_binding_invalid")
+        validation_projection = frozen_projection
     by_arm: dict[str, dict[str, Any]] = {}
     for artifact in ranking_artifacts:
-        checked = rank.validate_frozen_ranking(artifact, projection=frozen_projection)
+        checked = _validate_public_ranking_artifact(artifact, projection=validation_projection, protocol=frozen_protocol)
         if checked["arm_id"] in by_arm:
             raise CustodyError("endpoint_duplicate_arm")
         by_arm[checked["arm_id"]] = checked
     if tuple(by_arm) != score.FORMAL_ARMS:
         raise CustodyError("endpoint_arm_coverage_invalid")
     manifest = {
-        "schema": score.MANIFEST_SCHEMA, "projection_sha256": canonical_sha256(frozen_projection), "protocol_source": rank.PROTOCOL_SOURCE,
+        "schema": score.MANIFEST_SCHEMA, "projection_sha256": projection_sha256, "protocol_source": rank.PROTOCOL_SOURCE,
         "serializer_contract": frozen_protocol["serializer_contract"],
         "arms": [{"arm_id": arm, "ranking_artifact_sha256": by_arm[arm]["artifact_sha256"], "confidence_contract": rank.CONFIDENCE_CONTRACT if arm in rank.CURRENT_ARMS else None} for arm in score.FORMAL_ARMS],
         "directory_endpoints": [{"directory_group": group, "endpoint": endpoint} for group, endpoint in score.UPSTREAM_GROUPS.items()],
@@ -604,27 +982,62 @@ def _resource_digest_values(value: Mapping[str, Any]) -> list[str]:
     return digests
 
 
-def _validate_release_authorization(value: Any, *, projection: Mapping[str, Any], ranking_artifacts: Sequence[Mapping[str, Any]], current_worker_receipt: Mapping[str, Any], protocol: Mapping[str, Any], endpoint_manifest: Mapping[str, Any], resource_receipts: Sequence[Mapping[str, Any]], custody_ready_sha256: str, custody_bundle_sha256: str, custody_capability_secret: bytes, rehearsal: bool) -> dict[str, Any]:
+def _validate_release_authorization(value: Any, *, projection: Mapping[str, Any] | None = None,
+                                    candidate_reference: Mapping[str, Any] | None = None,
+                                    ranking_artifacts: Sequence[Mapping[str, Any]], current_worker_receipt: Mapping[str, Any],
+                                    protocol: Mapping[str, Any], endpoint_manifest: Mapping[str, Any],
+                                    resource_receipts: Sequence[Mapping[str, Any]], custody_ready_sha256: str,
+                                    custody_bundle_sha256: str, custody_capability_secret: bytes,
+                                    rehearsal: bool) -> dict[str, Any]:
     """Validate a custodian-only release capability; it contains no secret or labels."""
     frozen_protocol = validate_formal_protocol(protocol)
-    projection = validate_candidate_projection(projection)
-    if canonical_sha256(projection) != frozen_protocol["candidate"]["projection_canonical_sha256"]:
-        raise CustodyError("release_projection_protocol_binding_invalid")
-    if {key: frozen_protocol["candidate"][key] for key in ("query_count", "candidate_text_count")} != projection_denominators(projection):
-        raise CustodyError("release_projection_denominator_binding_invalid")
-    current_worker = validate_current_worker_receipt(current_worker_receipt, projection=projection, require_execution_receipts=True)
+    if (projection is None) == (candidate_reference is None):
+        raise CustodyError("release_candidate_input_ambiguous")
+    if candidate_reference is not None:
+        reference = _candidate_reference_binding(candidate_reference, protocol=frozen_protocol)
+        denominators = projection_reference_denominators(reference, protocol=frozen_protocol)
+        expected_queries = None
+        expected_query_coverage = projection_reference_query_coverage_sha256(reference, protocol=frozen_protocol)
+        validation_projection = None
+        current_worker = validate_current_worker_receipt(
+            current_worker_receipt, candidate_reference=reference, protocol=frozen_protocol,
+            require_execution_receipts=True,
+        )
+    else:
+        validation_projection = validate_candidate_projection(projection)
+        if canonical_sha256(validation_projection) != frozen_protocol["candidate"]["projection_canonical_sha256"]:
+            raise CustodyError("release_projection_protocol_binding_invalid")
+        denominators = projection_denominators(validation_projection)
+        if {key: frozen_protocol["candidate"][key] for key in ("query_count", "candidate_text_count")} != denominators:
+            raise CustodyError("release_projection_denominator_binding_invalid")
+        expected_queries = projection_query_keys(validation_projection)
+        expected_query_coverage = None
+        current_worker = validate_current_worker_receipt(current_worker_receipt, projection=validation_projection, require_execution_receipts=True)
     endpoint = score.validate_endpoint_manifest(endpoint_manifest, projection_sha256=frozen_protocol["candidate"]["projection_canonical_sha256"])
     _hex(custody_ready_sha256, "release_custody_ready_invalid"); _hex(custody_bundle_sha256, "release_custody_bundle_invalid")
-    expected_queries = projection_query_keys(projection)
     resources: dict[str, list[dict[str, Any]]] = {}
     for receipt in resource_receipts:
-        checked = validate_resource_receipt(receipt, arm_id=_obj(receipt, "release_resource_invalid").get("arm_id"), thresholds=frozen_protocol["resource_thresholds"], expected_denominators=projection_denominators(projection), expected_query_keys=expected_queries)
+        arm_id = _obj(receipt, "release_resource_invalid").get("arm_id")
+        matching_artifacts = [
+            artifact for artifact in ranking_artifacts
+            if isinstance(artifact, Mapping)
+            and artifact.get("schema") == rank.RANKING_ARTIFACT_REFERENCE_SCHEMA
+            and artifact.get("arm_id") == arm_id
+        ]
+        measurement_base = Path(str(matching_artifacts[0]["artifact_path"])).parent if len(matching_artifacts) == 1 else None
+        checked = validate_resource_receipt(
+            receipt, arm_id=arm_id, thresholds=frozen_protocol["resource_thresholds"],
+            expected_denominators=denominators, expected_query_keys=expected_queries,
+            measurement_base_path=measurement_base, expected_query_coverage_sha256=expected_query_coverage,
+            expected_projection_sha256=frozen_protocol["candidate"]["projection_canonical_sha256"],
+            expected_generation_id=frozen_protocol["candidate"]["generation_id"],
+        )
         resources.setdefault(checked["arm_id"], []).append(checked)
     if set(resources) != _RESOURCE_ARMS:
         raise CustodyError("release_resource_coverage_invalid")
     artifacts: dict[str, dict[str, Any]] = {}
     for artifact in ranking_artifacts:
-        checked = rank.validate_frozen_ranking(artifact, projection=projection)
+        checked = _validate_public_ranking_artifact(artifact, projection=validation_projection, protocol=frozen_protocol)
         if checked["arm_id"] in artifacts: raise CustodyError("release_ranking_artifact_duplicate")
         expected_code = frozen_protocol["original_code_receipt"] if checked["arm_id"] == "original_public_product" else frozen_protocol["current_code_receipt"]
         if checked["model_receipt"] != frozen_protocol["model_receipt"] or checked["code_receipt"] != expected_code:
@@ -650,7 +1063,13 @@ def _validate_release_authorization(value: Any, *, projection: Mapping[str, Any]
         raise CustodyError("release_original_resource_mode_invalid")
     if len({item["build_id"] for item in originals}) != 5 or len({item["index_sha256"] for item in originals}) != 5:
         raise CustodyError("release_resource_original_identity_invalid")
-    expected_original = {replicate["build_id"]: replicate["index_sha256"] for replicate in artifacts["original_public_product"]["replicates"]}
+    original_artifact = artifacts["original_public_product"]
+    original_replicates = (
+        original_artifact["replicate_references"]
+        if original_artifact.get("schema") == original_product.ORIGINAL_ARTIFACT_REFERENCE_SCHEMA
+        else original_artifact["replicates"]
+    )
+    expected_original = {replicate["build_id"]: replicate["index_sha256"] for replicate in original_replicates}
     if len(expected_original) != 5 or {item["build_id"]: item["index_sha256"] for item in originals} != expected_original:
         raise CustodyError("release_resource_original_artifact_binding_invalid")
     for build_id, index_sha in expected_original.items(): _text(build_id, "release_resource_original_artifact_binding_invalid"); _hex(index_sha, "release_resource_original_artifact_binding_invalid")
@@ -667,7 +1086,8 @@ def _validate_release_authorization(value: Any, *, projection: Mapping[str, Any]
         raise CustodyError("release_resource_artifact_binding_invalid")
     validate_current_execution_receipts(
         current_worker["execution_receipts"], current_worker_receipt=current_worker,
-        protocol=frozen_protocol, projection=projection, resources=resource_receipts,
+        protocol=frozen_protocol, projection=validation_projection,
+        candidate_reference=candidate_reference, resources=resource_receipts,
         ranking_artifacts=[artifacts[arm] for arm in ("strong_raw", "static_p5", "six_view_secondary")],
         allow_synthetic=rehearsal,
     )
@@ -693,10 +1113,24 @@ def validate_rehearsal_release_authorization(value: Any, **kwargs: Any) -> dict[
     return _validate_release_authorization(value, **kwargs, rehearsal=True)
 
 
-def _open_custody_after_authorization(*, release_authorization: Mapping[str, Any], projection: Mapping[str, Any], ranking_artifacts: Sequence[Mapping[str, Any]], current_worker_receipt: Mapping[str, Any], protocol: Mapping[str, Any], endpoint_manifest: Mapping[str, Any], resource_receipts: Sequence[Mapping[str, Any]], custody_ready_sha256: str, custody_bundle_sha256: str, custody_capability_secret: bytes, candidate_bundle_root: Path, custody_bundle_root: Path, binding_secret: bytes, rehearsal: bool) -> Any:
+def _open_custody_after_authorization(*, release_authorization: Mapping[str, Any],
+                                      projection: Mapping[str, Any] | None = None,
+                                      candidate_reference: Mapping[str, Any] | None = None,
+                                      ranking_artifacts: Sequence[Mapping[str, Any]], current_worker_receipt: Mapping[str, Any],
+                                      protocol: Mapping[str, Any], endpoint_manifest: Mapping[str, Any],
+                                      resource_receipts: Sequence[Mapping[str, Any]], custody_ready_sha256: str,
+                                      custody_bundle_sha256: str, custody_capability_secret: bytes,
+                                      candidate_bundle_root: Path, custody_bundle_root: Path,
+                                      binding_secret: bytes, rehearsal: bool) -> Any:
     """Custodian scaffold: public gates precede an actual confirmation loader."""
     validator = validate_rehearsal_release_authorization if rehearsal else validate_release_authorization
-    validator(release_authorization, projection=projection, ranking_artifacts=ranking_artifacts, current_worker_receipt=current_worker_receipt, protocol=protocol, endpoint_manifest=endpoint_manifest, resource_receipts=resource_receipts, custody_ready_sha256=custody_ready_sha256, custody_bundle_sha256=custody_bundle_sha256, custody_capability_secret=custody_capability_secret)
+    validator(
+        release_authorization, projection=projection, candidate_reference=candidate_reference,
+        ranking_artifacts=ranking_artifacts, current_worker_receipt=current_worker_receipt,
+        protocol=protocol, endpoint_manifest=endpoint_manifest, resource_receipts=resource_receipts,
+        custody_ready_sha256=custody_ready_sha256, custody_bundle_sha256=custody_bundle_sha256,
+        custody_capability_secret=custody_capability_secret,
+    )
     candidate_ready, candidate_ready_identity, candidate_ready_sha = confirmation._snapshot(candidate_bundle_root / "READY.json", "candidate_bundle_not_ready")
     if candidate_ready_sha != release_authorization["candidate_ready_sha256"] or candidate_ready_sha != protocol["candidate"]["ready_sha256"]:
         raise CustodyError("candidate_release_ready_binding_invalid")
@@ -704,7 +1138,23 @@ def _open_custody_after_authorization(*, release_authorization: Mapping[str, Any
     before_custody, before_custody_identity, before_custody_sha = confirmation._snapshot(custody_bundle_root / "sealed-custody.json", "custody_bundle_not_ready")
     if before_ready_sha != custody_ready_sha256 or before_custody_sha != custody_bundle_sha256 or before_ready_identity == before_custody_identity:
         raise CustodyError("custody_release_bundle_binding_invalid")
-    value = confirmation.load_custody_for_scoring(candidate_bundle_root, custody_bundle_root, binding_secret=binding_secret)
+    # Custody ingress is itself a READY-bound reference and an ephemeral
+    # SQLite cursor.  The historical JSON loader returns full dictionaries and
+    # is deliberately not reachable from a formal release.
+    reference = confirmation.custody_reference(
+        candidate_bundle=candidate_bundle_root,
+        custody_bundle=custody_bundle_root,
+        candidate_reference=protocol["candidate"]["candidate_reference"],
+    )
+    if (
+        reference["ready_sha256"] != custody_ready_sha256
+        or reference["custody_raw_sha256"] != custody_bundle_sha256
+        or reference["generation_id"] != protocol["candidate"]["generation_id"]
+    ):
+        raise CustodyError("custody_release_bundle_binding_invalid")
+    value = confirmation.CustodyStore.open(
+        reference, staging_parent=custody_bundle_root.parent, binding_secret=binding_secret,
+    )
     after_candidate_ready, after_candidate_ready_identity, after_candidate_ready_sha = confirmation._snapshot(candidate_bundle_root / "READY.json", "candidate_bundle_generation_drift")
     after_ready, after_ready_identity, after_ready_sha = confirmation._snapshot(custody_bundle_root / "READY.json", "custody_bundle_generation_drift")
     after_custody, after_custody_identity, after_custody_sha = confirmation._snapshot(custody_bundle_root / "sealed-custody.json", "custody_bundle_generation_drift")
@@ -785,15 +1235,33 @@ def publish_nonreplace(path: Path, payload: bytes, *, fsync_parent: Callable[[Pa
     return {"published": True, "retry_idempotent": False, "sha256": hashlib.sha256(payload).hexdigest()}
 
 
-def _audit_envelope(*, report: Mapping[str, Any], post_score_attestation: Mapping[str, Any], scorer_attestation_secret: bytes, release_authorization: Mapping[str, Any], projection: Mapping[str, Any], ranking_artifacts: Sequence[Mapping[str, Any]], current_worker_receipt: Mapping[str, Any], protocol: Mapping[str, Any], endpoint_manifest: Mapping[str, Any], resource_receipts: Sequence[Mapping[str, Any]], custody_ready_sha256: str, custody_bundle_sha256: str, custody_capability_secret: bytes, rehearsal: bool) -> dict[str, Any]:
+def _audit_envelope(*, report: Mapping[str, Any], post_score_attestation: Mapping[str, Any],
+                    scorer_attestation_secret: bytes, release_authorization: Mapping[str, Any],
+                    projection: Mapping[str, Any] | None = None,
+                    candidate_reference: Mapping[str, Any] | None = None,
+                    ranking_artifacts: Sequence[Mapping[str, Any]], current_worker_receipt: Mapping[str, Any],
+                    protocol: Mapping[str, Any], endpoint_manifest: Mapping[str, Any],
+                    resource_receipts: Sequence[Mapping[str, Any]], custody_ready_sha256: str,
+                    custody_bundle_sha256: str, custody_capability_secret: bytes,
+                    rehearsal: bool) -> dict[str, Any]:
     validator = validate_rehearsal_release_authorization if rehearsal else validate_release_authorization
-    release = validator(release_authorization, projection=projection, ranking_artifacts=ranking_artifacts, current_worker_receipt=current_worker_receipt, protocol=protocol, endpoint_manifest=endpoint_manifest, resource_receipts=resource_receipts, custody_ready_sha256=custody_ready_sha256, custody_bundle_sha256=custody_bundle_sha256, custody_capability_secret=custody_capability_secret)
+    release = validator(
+        release_authorization, projection=projection, candidate_reference=candidate_reference,
+        ranking_artifacts=ranking_artifacts, current_worker_receipt=current_worker_receipt,
+        protocol=protocol, endpoint_manifest=endpoint_manifest, resource_receipts=resource_receipts,
+        custody_ready_sha256=custody_ready_sha256, custody_bundle_sha256=custody_bundle_sha256,
+        custody_capability_secret=custody_capability_secret,
+    )
     checked = score.validate_report(report)
     endpoint = score.validate_endpoint_manifest(endpoint_manifest, projection_sha256=protocol["candidate"]["projection_canonical_sha256"])
     if checked["projection_sha256"] != endpoint["projection_sha256"] or checked["endpoint_manifest_sha256"] != endpoint["manifest_sha256"] or checked["ranking_artifact_sha256"] != {arm["arm_id"]: arm["ranking_artifact_sha256"] for arm in endpoint["arms"]}:
         raise CustodyError("publish_report_release_binding_invalid")
     attestation = validate_post_score_attestation(post_score_attestation, release=release, report=checked, protocol=protocol, endpoint_manifest=endpoint, scorer_attestation_secret=scorer_attestation_secret)
-    value = {"schema": AUDIT_ENVELOPE_SCHEMA, "protocol": validate_formal_protocol(protocol), "endpoint_manifest": endpoint, "current_worker_receipt": validate_current_worker_receipt(current_worker_receipt, projection=projection, require_execution_receipts=True), "resource_receipts": list(resource_receipts), "release_authorization": release, "report": checked, "post_score_attestation": attestation}
+    worker = validate_current_worker_receipt(
+        current_worker_receipt, projection=projection, candidate_reference=candidate_reference,
+        protocol=protocol, require_execution_receipts=True,
+    )
+    value = {"schema": AUDIT_ENVELOPE_SCHEMA, "protocol": validate_formal_protocol(protocol), "endpoint_manifest": endpoint, "current_worker_receipt": worker, "resource_receipts": list(resource_receipts), "release_authorization": release, "report": checked, "post_score_attestation": attestation}
     value["envelope_sha256"] = _digest(value)
     return value
 

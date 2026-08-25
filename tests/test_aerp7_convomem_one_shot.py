@@ -12,6 +12,23 @@ from benchmarks import aerp7_convomem_executor as executor
 from benchmarks.aerp7_convomem_confirmation import CustodyError
 
 
+def _disk_calibration(model_receipt):
+    current = {key: 100 for key in ("strong_raw", "static_p5_primary", "static_p5_repeat", "six_view_secondary")}
+    originals = {f"replicate_{index:02d}": 100 for index in range(1, 6)}
+    row = {
+        "schema": authoring.formal.PRIVATE_DISK_CALIBRATION_SCHEMA, "calibration_id": "unit-calibration",
+        "source_manifest_sha256": authoring._digest(authoring.CENSUS_SOURCE_MANIFEST), "model_receipt_sha256": authoring._digest(model_receipt),
+        "candidate_resident_bytes": 100, "custody_resident_bytes": 100, "custody_sqlite_store_bytes": 100, "shared_current_store_bytes": 100,
+        "current_ranking_measurement_bytes": current, "original_replicate_store_bytes": originals,
+        "original_candidate_index_peak_bytes": 100, "original_chroma_peak_bytes": 100,
+        "original_chroma_peak_policy": "sequential_one_build_peak_v1", "scoring_ephemeral_store_bytes": 100,
+        "scoring_report_bytes": 100, "safety_margin_bytes": 100,
+    }
+    row["total_required_additional_bytes"] = sum((100, 100, 100, 100, 100, 100, 100, 100, 100, *current.values(), *originals.values()))
+    row["calibration_sha256"] = authoring.formal.private_disk_calibration_digest(row)
+    return row
+
+
 def _plan(tmp_path: Path, secret: bytes):
     names = {
         "canonical_root": "canonical", "premix_root": "premix", "candidate_output_dir": "candidate", "custody_output_dir": "custody", "staging_root": "staging",
@@ -19,12 +36,24 @@ def _plan(tmp_path: Path, secret: bytes):
     }
     row = {"schema": authoring.PLAN_SCHEMA, **{key: str((tmp_path / value).resolve()) for key, value in names.items()}, "custodian_nonce": "n" * 32, "public_authorization_nonce": "u" * 32, "custodian_expires_at_unix": 2_000_000_000}
     row.update({"source_manifest": authoring.CENSUS_SOURCE_MANIFEST, "census_semantics": authoring.CENSUS_SEMANTICS, "preparse_current_code_receipt": {"head": "1" * 64, "tree": "2" * 64, "diff_digest": "3" * 64, "dirty_policy": "clean_required"}, "model_receipt": {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": "a" * 64, "bytes": 1}]}})
+    row["disk_preflight_calibration"] = _disk_calibration(row["model_receipt"])
     Path(row["staging_root"]).mkdir()
     return authoring.sign_one_shot_plan(row, operator_capability=secret)
 
 
 def _private():
     return {"custody_binding_secret": b"b" * 32, "custody_capability_secret": b"c" * 32, "evidence_token_secret": b"e" * 32, "scorer_attestation_secret": b"a" * 32}
+
+
+def test_candidate_receipt_builds_a_persistent_reference_without_loading_projection(tmp_path, monkeypatch):
+    root = tmp_path / "candidate"; root.mkdir()
+    built = {"candidate_output_dir": str(root), "generation_id": "g", "projection_raw_sha256": "a" * 64, "projection_canonical_sha256": "b" * 64, "dataset": {key: value * 64 for key, value in (("canonical_sha256", "c"), ("premix_sha256", "d"), ("revision_sha256", "e"), ("source_inventory_sha256", "f"))}, "query_count": 3, "candidate_text_count": 7}
+    expected = {"reference": "stream"}; calls = []
+    monkeypatch.setattr(one.confirmation, "load_candidate_projection", lambda *_args: (_ for _ in ()).throw(AssertionError("one-shot must not materialize projection")))
+    monkeypatch.setattr(one.confirmation, "_snapshot", lambda path, *_args, **_kwargs: (b"{}", (1, 2), "r" * 64))
+    monkeypatch.setattr(one.original_product, "candidate_projection_reference", lambda **kwargs: calls.append(kwargs) or expected)
+    assert one._candidate_receipt(built) == {"generation_id": "g", "projection_raw_sha256": "a" * 64, "projection_canonical_sha256": "b" * 64, "query_count": 3, "candidate_text_count": 7, "ready_sha256": "r" * 64, "candidate_reference": expected}
+    assert calls == [{"bundle_path": root, "generation_id": "g", "projection_raw_sha256": "a" * 64, "projection_canonical_sha256": "b" * 64, "dataset": built["dataset"], "query_count": 3, "candidate_text_count": 7}]
 
 
 def _mark_completed_final(plan, private):
@@ -61,7 +90,14 @@ def _install_success(monkeypatch, tmp_path, plan, calls):
     monkeypatch.setattr(checkpoint, "require_live_binding", lambda *_args, **_kwargs: binding)
     monkeypatch.setattr(one.confirmation, "build_prelabel_bundle", lambda **_kwargs: calls.append("source") or built)
     monkeypatch.setattr(one, "_publish_generation_seal", lambda **_kwargs: built)
-    monkeypatch.setattr(one, "_candidate_receipt", lambda _built: {"generation_id": "g", "ready_sha256": "r" * 64, "projection_raw_sha256": "a" * 64, "projection_canonical_sha256": "b" * 64, "query_count": 1, "candidate_text_count": 1})
+    candidate_reference = {"reference": "candidate"}
+    monkeypatch.setattr(one, "_candidate_receipt", lambda _built: {"generation_id": "g", "ready_sha256": "r" * 64, "projection_raw_sha256": "a" * 64, "projection_canonical_sha256": "b" * 64, "query_count": 1, "candidate_text_count": 1, "candidate_reference": candidate_reference})
+    custody_reference = {"reference": "custody"}
+    monkeypatch.setattr(one.confirmation, "custody_reference", lambda **_kwargs: custody_reference)
+    preflight = {"preflight": "private"}
+    monkeypatch.setattr(authoring, "author_private_disk_preflight", lambda **_kwargs: calls.append("preflight-author") or preflight)
+    monkeypatch.setattr(authoring, "validate_private_disk_preflight", lambda value, **_kwargs: value)
+    monkeypatch.setattr(one.formal, "enforce_private_disk_preflight", lambda **_kwargs: calls.append("preflight-gate") or {"checked": True})
     monkeypatch.setattr(authoring, "author_formal_protocol", lambda **_kwargs: calls.append("protocol") or protocol)
     monkeypatch.setattr(authoring, "sign_operator_authorization", lambda **_kwargs: calls.append("operator-auth") or {"auth": True})
     writes = []
@@ -105,7 +141,7 @@ def _install_success(monkeypatch, tmp_path, plan, calls):
 def test_one_shot_runs_in_order_and_rejects_any_second_formal_attempt(tmp_path, monkeypatch):
     secret = b"o" * 32; plan = _plan(tmp_path, secret); calls = []; _install_success(monkeypatch, tmp_path, plan, calls)
     result = one.run_one_shot(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=plan["model_receipt"], repo_root=tmp_path)
-    assert calls == ["checkpoint", "source", "protocol", "operator-auth", "public", "custodian"]
+    assert calls == ["checkpoint", "source", "preflight-author", "preflight-gate", "protocol", "operator-auth", "public", "custodian"]
     assert result["gate_outcome"] == "PASS" and Path(plan["one_shot_receipt_path"]).is_file()
     with pytest.raises(CustodyError, match="formal_output_not_new"):
         one.run_one_shot(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=plan["model_receipt"], repo_root=tmp_path)

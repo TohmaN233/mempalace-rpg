@@ -32,6 +32,7 @@ CENSUS_SOURCE_MANIFEST = {
 }
 CENSUS_SEMANTICS = {
     "selection_algorithm": confirmation.CENSUS_SELECTION_ALGORITHM, "selection_seed": None,
+    "candidate_projection_transport": formal.CANDIDATE_TRANSPORT,
     "persona_quota": "ALL", "per_persona_group_quota": "ALL",
     "context_rank_indices": "ALL_AVAILABLE_SORTED", "source_receipt": rank.PROTOCOL_SOURCE,
     "primary_current_arm": {"arm_id": "six_view_secondary", "config_sha256": formal._digest(rank._arm_method("six_view_secondary")), "ranker_code_sha256": formal._ranker_code_sha256()},
@@ -130,7 +131,7 @@ def author_formal_protocol(*, repo_root: Path, candidate_receipt: Mapping[str, A
         "schema": formal.FORMAL_PROTOCOL_SCHEMA, "synthetic_test_mode": False,
         "candidate": receipt, "current_code_receipt": code, "original_code_receipt": original_code,
         "execution_checkpoint": binding, "source_receipt": rank.PROTOCOL_SOURCE,
-        "model_receipt": dict(model_receipt), "arms": list(formal.score.FORMAL_ARMS),
+        "model_receipt": dict(model_receipt), "candidate_transport": dict(preparse_semantics["candidate_projection_transport"]), "arms": list(formal.score.FORMAL_ARMS),
         "primary_current_arm": dict(preparse_semantics["primary_current_arm"]),
         "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER},
         "top_k": 10, "tie_break": "stable_ranking_key_ascending", "original_build_count": 5,
@@ -151,6 +152,57 @@ def sign_operator_authorization(*, protocol: Mapping[str, Any], output_dir: Path
     return {**unsigned, "authorization_sha256": digest, "operator_hmac": hmac.new(capability, executor._bytes({**unsigned, "authorization_sha256": digest}), hashlib.sha256).hexdigest()}
 
 
+def author_private_disk_preflight(*, plan: Mapping[str, Any], candidate_reference: Mapping[str, Any],
+                                  custody_reference: Mapping[str, Any], operator_capability: bytes) -> dict[str, Any]:
+    """Issue the coordinator-private capacity contract after generation publication.
+
+    The custody reference cannot be known while the pre-parse plan is authored.
+    Its capacity calibration is nevertheless signed in that plan, and this
+    second signed receipt binds it to the exact published generation before any
+    public rank worker is launched.
+    """
+    signed_plan = validate_one_shot_plan(plan, operator_capability=operator_capability)
+    candidate = rank.validate_candidate_projection_reference(candidate_reference)
+    custody = dict(custody_reference)
+    required_custody = {
+        "schema", "bundle_path", "candidate_reference", "custody_path", "ready_path", "generation_id",
+        "custody_raw_sha256", "custody_canonical_sha256", "dataset", "item_count", "evidence_span_count", "ready_sha256",
+    }
+    if set(custody) != required_custody or custody.get("candidate_reference") != candidate:
+        raise CustodyError("private_disk_preflight_custody_reference_invalid")
+    calibration = formal.validate_private_disk_calibration(signed_plan["disk_preflight_calibration"])
+    candidate_path, custody_path = Path(candidate["bundle_path"]) / "projection.json", Path(custody["custody_path"])
+    try:
+        candidate_input, custody_input = candidate_path.stat().st_size, custody_path.stat().st_size
+    except OSError as exc:
+        raise CustodyError("private_disk_preflight_input_unavailable") from exc
+    row = {
+        "schema": formal.PRIVATE_DISK_PREFLIGHT_SCHEMA, "plan_sha256": signed_plan["plan_sha256"],
+        "calibration": calibration, "custody_reference_sha256": _digest(custody),
+        "generation_id": candidate["generation_id"], "candidate_input_bytes": candidate_input,
+        "custody_input_bytes": custody_input, "custody_logical_item_count": custody["item_count"],
+        "custody_evidence_span_count": custody["evidence_span_count"],
+        # This is a signed calibration, not an unobserved zero/default.  The
+        # executor later validates its complete input+SQLite peak arithmetic.
+        "custody_sqlite_store_bytes": calibration["custody_sqlite_store_bytes"],
+        "custody_peak_disk_input_and_store_bytes": candidate_input + custody_input + calibration["custody_sqlite_store_bytes"],
+    }
+    row["preflight_sha256"] = formal.private_disk_preflight_digest(row)
+    row["preflight_hmac"] = hmac.new(operator_capability, _bytes({key: item for key, item in row.items() if key != "preflight_hmac"}), hashlib.sha256).hexdigest()
+    return validate_private_disk_preflight(row, operator_capability=operator_capability, expected_plan_sha256=signed_plan["plan_sha256"])
+
+
+def validate_private_disk_preflight(value: Any, *, operator_capability: bytes,
+                                    expected_plan_sha256: str | None = None) -> dict[str, Any]:
+    row = formal.validate_private_disk_preflight(value)
+    if expected_plan_sha256 is not None and row["plan_sha256"] != expected_plan_sha256:
+        raise CustodyError("private_disk_preflight_plan_binding_invalid")
+    expected = hmac.new(operator_capability, _bytes({key: item for key, item in row.items() if key != "preflight_hmac"}), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(row["preflight_hmac"], expected):
+        raise CustodyError("private_disk_preflight_hmac_invalid")
+    return row
+
+
 def sign_one_shot_plan(value: Mapping[str, Any], *, operator_capability: bytes) -> dict[str, Any]:
     """Authenticate an operator's pre-parse plan; secrets stay out of the plan."""
     row = dict(value)
@@ -164,9 +216,9 @@ def sign_one_shot_plan(value: Mapping[str, Any], *, operator_capability: bytes) 
 def validate_one_shot_plan(value: Any, *, operator_capability: bytes) -> dict[str, Any]:
     if not isinstance(value, Mapping): raise CustodyError("aerp7_one_shot_plan_invalid")
     row = dict(value)
-    required = {"schema", "canonical_root", "premix_root", "candidate_output_dir", "custody_output_dir", "staging_root", "protocol_path", "authorization_path", "output_dir", "custodian_public_config_path", "final_output_path", "one_shot_receipt_path", "infrastructure_failure_receipt_path", "progress_receipt_path", "expected_checkpoint_path", "original_root", "model_dir", "python_executable", "original_python", "source_manifest", "model_receipt", "census_semantics", "preparse_current_code_receipt", "public_authorization_nonce", "custodian_nonce", "custodian_expires_at_unix", "plan_sha256", "plan_hmac"}
+    required = {"schema", "canonical_root", "premix_root", "candidate_output_dir", "custody_output_dir", "staging_root", "protocol_path", "authorization_path", "output_dir", "custodian_public_config_path", "final_output_path", "one_shot_receipt_path", "infrastructure_failure_receipt_path", "progress_receipt_path", "expected_checkpoint_path", "original_root", "model_dir", "python_executable", "original_python", "source_manifest", "model_receipt", "census_semantics", "preparse_current_code_receipt", "disk_preflight_calibration", "public_authorization_nonce", "custodian_nonce", "custodian_expires_at_unix", "plan_sha256", "plan_hmac"}
     if set(row) != required or row.get("schema") != PLAN_SCHEMA: raise CustodyError("aerp7_one_shot_plan_invalid")
-    path_keys = required - {"schema", "plan_sha256", "plan_hmac", "custodian_nonce", "public_authorization_nonce", "custodian_expires_at_unix", "source_manifest", "model_receipt", "census_semantics", "preparse_current_code_receipt"}
+    path_keys = required - {"schema", "plan_sha256", "plan_hmac", "custodian_nonce", "public_authorization_nonce", "custodian_expires_at_unix", "source_manifest", "model_receipt", "census_semantics", "preparse_current_code_receipt", "disk_preflight_calibration"}
     if any(not isinstance(row[key], str) or not Path(row[key]).is_absolute() for key in path_keys): raise CustodyError("aerp7_one_shot_plan_invalid")
     paths: dict[str, set[str]] = {}
     for key in path_keys:
@@ -177,6 +229,9 @@ def validate_one_shot_plan(value: Any, *, operator_capability: bytes) -> dict[st
     if row.get("source_manifest") != CENSUS_SOURCE_MANIFEST or row.get("census_semantics") != CENSUS_SEMANTICS:
         raise CustodyError("aerp7_one_shot_preparse_freeze_invalid")
     formal._model_receipt(row.get("model_receipt"))
+    calibration = formal.validate_private_disk_calibration(row.get("disk_preflight_calibration"))
+    if calibration["source_manifest_sha256"] != _digest(CENSUS_SOURCE_MANIFEST) or calibration["model_receipt_sha256"] != _digest(row["model_receipt"]):
+        raise CustodyError("private_disk_calibration_identity_drift")
     if clean_code_receipt_shape(row.get("preparse_current_code_receipt")) is None: raise CustodyError("aerp7_one_shot_plan_invalid")
     if row["plan_sha256"] != _digest({key: item for key, item in row.items() if key not in {"plan_sha256", "plan_hmac"}}): raise CustodyError("aerp7_one_shot_plan_digest_invalid")
     expected = hmac.new(operator_capability, _bytes({key: item for key, item in row.items() if key != "plan_hmac"}), hashlib.sha256).hexdigest()

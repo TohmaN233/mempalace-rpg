@@ -1,10 +1,16 @@
 import copy
 import hashlib
+import json
+import sqlite3
+import gc
+import tracemalloc
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from benchmarks import aerp7_convomem_rank as rank
-from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256
+from benchmarks.aerp7_convomem_confirmation import CANDIDATE_PROJECTION_REFERENCE_SCHEMA, CustodyError, canonical_sha256
 
 
 def h(value): return hashlib.sha256(value.encode()).hexdigest()
@@ -39,6 +45,380 @@ def original_replicates(p):
         index_receipt = {"build_id": "build-" + str(number), "fresh_build": True, "collection_identity": "collection-" + str(number), "index_identity_sha256": "", "cold_reopen": True, "call_contract": rank.ORIGINAL_CALL_CONTRACT, "input_coverage_sha256": rank._digest(input_receipt["item_corpora"]), "query_coverage_sha256": rank._digest([{"item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"])} for item in sorted(p["items"], key=lambda item: item["item_id"])]), "output_coverage_sha256": rank._digest([{"item_id": item["item_id"], "ranking_sha256": rank._digest(rows[[row["item_id"] for row in rows].index(item["item_id"])]["ranked_message_ids"])} for item in sorted(p["items"], key=lambda item: item["item_id"])]),"worker_physical_receipt":physical,"coordinator_physical_receipt":copy.deepcopy(physical)}; index_receipt["index_identity_sha256"]=rank._digest({"collection_identity":index_receipt["collection_identity"],"physical":physical})
         result.append({"build_id": "build-" + str(number), "input_receipt": input_receipt, "input_sha256": rank._digest(input_receipt), "index_receipt": index_receipt, "index_sha256": rank._digest(index_receipt), "trace_receipt": trace, "trace_sha256": rank._digest(trace), "rankings": rows})
     return result
+
+
+def candidate_reference(tmp_path, p):
+    bundle = tmp_path / "candidate"; bundle.mkdir()
+    raw = rank._bytes(p); (bundle / "projection.json").write_bytes(raw)
+    generation = h("generation-test")
+    ready = {
+        "schema": "aerp7-convomem-candidate-ready-v3", "generation_id": generation,
+        "projection": {"raw_sha256": hashlib.sha256(raw).hexdigest(), "canonical_sha256": canonical_sha256(p)},
+        "durability": {"platform": "synthetic", "directory_fsync_guaranteed": False, "steps": []},
+    }
+    (bundle / "READY.json").write_bytes(rank._bytes(ready))
+    reference = {
+        "schema": CANDIDATE_PROJECTION_REFERENCE_SCHEMA, "bundle_path": str(bundle.resolve()),
+        "projection_path": "projection.json", "ready_path": "READY.json", "generation_id": generation,
+        "projection_raw_sha256": hashlib.sha256(raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p),
+        "dataset": dict(p["dataset"]), "query_count": len(p["items"]),
+        "candidate_text_count": sum(len(row["candidates"]) for row in p["corpora"]),
+    }
+    return bundle, reference
+
+
+def multi_corpus_projection(corpus_count, candidates_per_corpus):
+    base = projection()
+    corpora = []; items = []
+    for corpus_number in range(corpus_count):
+        corpus_id = h("corpus-" + str(corpus_number))
+        candidates = [
+            {
+                "message_id": h(f"m-{corpus_number}-{message_number}"),
+                "opaque_conversation_id": h(f"conversation-{corpus_number}"),
+                "conversation_order": 0,
+                "message_order": message_number,
+                "corpus_order": message_number,
+                "speaker": "user" if message_number % 2 == 0 else "assistant",
+                "text": f"corpus-{corpus_number}-message-{message_number}-" + ("payload " * 128),
+            }
+            for message_number in range(candidates_per_corpus)
+        ]
+        corpora.append({"corpus_id": corpus_id, "declared_context_size": 2, "actual_conversation_count": 1, "actual_message_count": len(candidates), "candidates": candidates})
+        items.append({"item_id": h(f"item-{corpus_number}"), "persona_id": h(f"persona-{corpus_number}"), "query_text": f"query-{corpus_number}", "corpus_id": corpus_id})
+    base["corpora"] = corpora; base["items"] = items
+    base["selection_receipt"] = dict(base["selection_receipt"], selected_item_context_count=len(items))
+    return base
+
+
+def large_stream_projection(tmp_path, query_count):
+    """Create a candidate-only bundle whose rows are generated once for the seam."""
+    p = projection()
+    corpus = dict(p["corpora"][0])
+    corpus["candidates"] = [
+        {**row, "message_id": h("large-message-" + str(number))}
+        for number, row in enumerate(corpus["candidates"][:2])
+    ]
+    corpus["actual_message_count"] = len(corpus["candidates"])
+    p["corpora"] = [corpus]
+    p["items"] = [
+        {
+            "item_id": f"{number + 1:064x}",
+            "persona_id": h("large-persona-" + str(number)),
+            "query_text": "large query " + str(number),
+            "corpus_id": corpus["corpus_id"],
+        }
+        for number in range(query_count)
+    ]
+    p["selection_receipt"] = dict(p["selection_receipt"], selected_item_context_count=query_count)
+    bundle, reference = candidate_reference(tmp_path, p)
+    return p, bundle, reference
+
+
+def test_candidate_reference_store_rechecks_source_without_projection_load(tmp_path, monkeypatch):
+    p = projection(); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    assert store.reference == reference
+    assert len(list(store.iter_items())) == len(p["items"])
+    assert len(store.corpus(p["corpora"][0]["corpus_id"])["candidates"]) == len(p["corpora"][0]["candidates"])
+    # The source projection is never sent through the ordinary whole-object
+    # validator or json.loads; ijson feeds one bounded corpus/item at a time.
+    original_validator = rank.validate_candidate_projection
+    monkeypatch.setattr(rank, "validate_candidate_projection", lambda value: (_ for _ in ()).throw(AssertionError("whole projection validator used")))
+    assert len(list(store.iter_items())) == len(p["items"])
+    monkeypatch.setattr(rank, "validate_candidate_projection", original_validator)
+    store.close()
+
+
+def test_input_receipt_store_is_legacy_byte_equivalent(tmp_path):
+    p = multi_corpus_projection(3, 17); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    receipt_path = tmp_path / "receipt-items.json"
+    streamed_receipt = rank._input_receipt_store(store, rank.CURRENT_SERIALIZER, receipt_path=receipt_path)
+    legacy_receipt = rank._input_receipt(p, rank.CURRENT_SERIALIZER)
+    assert streamed_receipt["schema"] == rank.INPUT_RECEIPT_REFERENCE_SCHEMA
+    assert "item_corpora" not in streamed_receipt
+    materialized = rank.materialize_input_receipt_reference(streamed_receipt, base_path=tmp_path)
+    assert rank._bytes(materialized) == rank._bytes(legacy_receipt)
+    assert streamed_receipt["legacy_input_sha256"] == rank._digest(legacy_receipt)
+    assert streamed_receipt["item_corpus_set_sha256"] == hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    assert streamed_receipt["item_corpus_set_sha256"] == legacy_receipt["item_corpus_set_sha256"]
+    assert rank.validate_input_receipt_reference(streamed_receipt, base_path=tmp_path) == streamed_receipt
+    store.close()
+
+
+def test_input_receipt_store_peak_memory_is_bounded_by_one_corpus(tmp_path):
+    def measure(corpus_count):
+        p = multi_corpus_projection(corpus_count, 192)
+        root = tmp_path / f"candidate-{corpus_count}"; root.mkdir()
+        raw = rank._bytes(p); (root / "projection.json").write_bytes(raw)
+        generation = h(f"receipt-generation-{corpus_count}")
+        ready = {
+            "schema": "aerp7-convomem-candidate-ready-v3", "generation_id": generation,
+            "projection": {"raw_sha256": hashlib.sha256(raw).hexdigest(), "canonical_sha256": canonical_sha256(p)},
+            "durability": {"platform": "synthetic", "directory_fsync_guaranteed": False, "steps": []},
+        }
+        (root / "READY.json").write_bytes(rank._bytes(ready))
+        reference = {
+            "schema": CANDIDATE_PROJECTION_REFERENCE_SCHEMA, "bundle_path": str(root.resolve()), "projection_path": "projection.json", "ready_path": "READY.json", "generation_id": generation,
+            "projection_raw_sha256": hashlib.sha256(raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "dataset": dict(p["dataset"]),
+            "query_count": len(p["items"]), "candidate_text_count": sum(len(row["candidates"]) for row in p["corpora"]),
+        }
+        staging = tmp_path / f"staging-{corpus_count}"; staging.mkdir()
+        store = rank.CandidateProjectionStore.open(reference, staging)
+        gc.collect(); tracemalloc.start()
+        receipt = rank._input_receipt_store(store, rank.CURRENT_SERIALIZER)
+        _current, peak = tracemalloc.get_traced_memory(); tracemalloc.stop()
+        assert receipt["schema"] == rank.INPUT_RECEIPT_REFERENCE_SCHEMA
+        assert receipt["item_count"] == corpus_count
+        assert "item_corpora" not in receipt
+        store.close()
+        return peak
+
+    one_corpus_peak = measure(1)
+    many_corpora_peak = measure(8)
+    # The old implementation retained eight full corpus payloads.  A bounded
+    # cursor may vary with allocator noise, but its peak must not scale 8x.
+    assert many_corpora_peak < one_corpus_peak * 3 + 2 * 1024 * 1024
+
+
+def test_candidate_cursor_does_not_json_load_the_projection_payload(tmp_path, monkeypatch):
+    p = projection(); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    original_loads = rank.json.loads
+    loaded_sizes = []
+
+    def guarded_loads(value, *args, **kwargs):
+        size = len(value) if isinstance(value, (bytes, bytearray, str)) else 0
+        loaded_sizes.append(size)
+        if size > 1024:
+            raise AssertionError("whole projection payload was json-loaded")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(rank.json, "loads", guarded_loads)
+    assert len(list(store.iter_items())) == len(p["items"])
+    assert store.corpus_ids() == [p["corpora"][0]["corpus_id"]]
+    store.close()
+    assert max(loaded_sizes) <= 1024
+
+
+@pytest.mark.parametrize("arm_id", ("strong_raw", "static_p5", "six_view_secondary"))
+def test_streamed_rank_artifact_matches_in_memory_semantics_and_is_replayable(tmp_path, arm_id):
+    p = projection(); model, code = receipts(); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    measurement_sink = rank.PersistedMeasurementSink.create(
+        directory=tmp_path,
+        stem="external-measurements",
+        generation_id=reference["generation_id"],
+        projection_sha256=reference["projection_canonical_sha256"],
+    )
+    streamed = rank.rank_projection_stream(
+        store=store, encoder=Encoder(), arm_id=arm_id,
+        artifact_path=tmp_path / "artifact.json", ready_path=tmp_path / "artifact.READY.json",
+        model_receipt=model, code_receipt=code, measurement_sink=measurement_sink,
+    )
+    assert set(streamed) == {
+        "schema", "artifact_path", "ready_path", "arm_id", "projection_sha256", "generation_id", "payload_sha256", "artifact_sha256", "ready_sha256",
+        "method_receipt", "serializer_receipt", "input_receipt", "input_sha256", "model_receipt", "model_sha256", "source_receipt", "source_commit_sha256", "serializer_sha256", "code_receipt", "code_sha256", "trace_sha256", "measurement_reference",
+    }
+    artifact = json.loads((tmp_path / "artifact.json").read_bytes())
+    full = rank.rank_projection(projection=p, encoder=Encoder(), arm_id=arm_id, model_receipt=model, code_receipt=code)
+    assert artifact["input_receipt"]["schema"] == rank.INPUT_RECEIPT_REFERENCE_SCHEMA
+    # The persisted stream artifact is deliberately a small reference. Expand
+    # it only for this legacy semantic-parity assertion; production validation
+    # keeps the query relation external and bounded.
+    expanded = copy.deepcopy(artifact)
+    expanded["input_receipt"] = rank.materialize_input_receipt_reference(artifact["input_receipt"], base_path=tmp_path)
+    expanded["input_sha256"] = rank._digest(expanded["input_receipt"])
+    expanded["artifact_sha256"] = rank._digest({key: value for key, value in expanded.items() if key != "artifact_sha256"})
+    assert expanded["artifact_sha256"] == full["artifact_sha256"]
+    assert rank._bytes(expanded) == rank._bytes(full)
+    assert rank.validate_frozen_ranking(expanded, projection=p)["artifact_sha256"] == full["artifact_sha256"]
+    assert rank.validate_ranking_artifact_reference(streamed)["payload_sha256"] == streamed["payload_sha256"]
+    assert streamed["payload_sha256"] == hashlib.sha256((tmp_path / "artifact.json").read_bytes()).hexdigest()
+    assert streamed["arm_id"] == arm_id
+    measurement = rank.validate_measurement_reference(
+        streamed["measurement_reference"], base_path=tmp_path,
+        expected_projection_sha256=reference["projection_canonical_sha256"],
+        expected_generation_id=reference["generation_id"],
+        expected_count=len(p["items"]),
+    )
+    assert measurement["wall_summary"]["count"] == len(p["items"])
+    store.close()
+
+
+def test_stream_measurement_sink_matches_legacy_summary_and_digest(tmp_path):
+    rows = [
+        {"item_id": f"{number + 1:064x}", "query_sha256": h("query-" + str(number)), "wall_ns": wall, "cpu_ns": cpu}
+        for number, (wall, cpu) in enumerate(((90, 9), (10, 1), (70, 7), (30, 3), (50, 5)))
+    ]
+    sink = rank.PersistedMeasurementSink.create(
+        directory=tmp_path,
+        stem="summary-equivalence",
+        generation_id=h("measurement-generation"),
+        projection_sha256=h("measurement-projection"),
+    )
+    for row in rows:
+        sink.append(row)
+    reference = sink.finalize(expected_count=len(rows))
+    ordered_wall = sorted(row["wall_ns"] for row in rows)
+    ordered_cpu = sorted(row["cpu_ns"] for row in rows)
+
+    def legacy_summary(values):
+        ordered = sorted(values)
+        return {
+            "count": len(ordered),
+            "p50": ordered[int((len(ordered) - 1) * .50)],
+            "p95": ordered[int((len(ordered) - 1) * .95)],
+            "p99": ordered[int((len(ordered) - 1) * .99)],
+            "max": ordered[-1],
+        }
+
+    assert reference["sequence_sha256"] == rank._digest(rows)
+    assert reference["coverage_sha256"] == rank._digest([
+        {"item_id": row["item_id"], "query_sha256": row["query_sha256"]} for row in rows
+    ])
+    assert reference["wall_summary"] == legacy_summary([row["wall_ns"] for row in rows])
+    assert reference["cpu_summary"] == legacy_summary([row["cpu_ns"] for row in rows])
+    assert rank.validate_measurement_reference(
+        reference,
+        base_path=tmp_path,
+        expected_projection_sha256=h("measurement-projection"),
+        expected_generation_id=h("measurement-generation"),
+        expected_count=len(rows),
+    ) == reference
+
+
+def test_stream_rejects_inline_measurement_list_and_requires_persisted_sink(tmp_path):
+    p = projection(); model, code = receipts(); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    with pytest.raises(CustodyError, match="sink_required"):
+        rank.rank_projection_stream(
+            store=store, encoder=Encoder(), arm_id="strong_raw",
+            artifact_path=tmp_path / "inline-artifact.json",
+            ready_path=tmp_path / "inline-artifact.READY.json",
+            model_receipt=model, code_receipt=code, query_measurements=[],
+        )
+    store.close()
+
+
+def test_candidate_store_cleanup_requires_four_validated_artifacts_and_keeps_receipts(tmp_path):
+    p = projection(); model, code = receipts(); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    artifacts = []
+    for number, arm_id in enumerate(("strong_raw", "static_p5", "static_p5", "six_view_secondary")):
+        artifacts.append(rank.rank_projection_stream(
+            store=store, encoder=Encoder(), arm_id=arm_id,
+            artifact_path=tmp_path / f"cleanup-artifact-{number}.json",
+            ready_path=tmp_path / f"cleanup-artifact-{number}.READY.json",
+            model_receipt=model, code_receipt=code,
+        ))
+    database = store.database
+    wal = database.with_name(database.name + "-wal")
+    shm = database.with_name(database.name + "-shm")
+    wal.write_bytes(b"wal")
+    shm.write_bytes(b"shm")
+    with pytest.raises(CustodyError, match="artifact_count"):
+        store.cleanup_after_artifacts_validated(artifacts[:3])
+    assert database.is_file()
+    receipt_payload = tmp_path / ("." + database.stem + ".input-receipt-items.json")
+    assert receipt_payload.is_file()
+    cleanup = store.cleanup_after_artifacts_validated(artifacts)
+    assert cleanup["validated_artifact_count"] == 4
+    assert cleanup["removed_bytes"] >= 3
+    assert not database.exists() and not wal.exists() and not shm.exists()
+    assert receipt_payload.is_file()
+    assert all(Path(row["artifact_path"]).is_file() for row in artifacts)
+    assert store.cleanup_after_artifacts_validated(artifacts) == cleanup
+    store.close()
+
+
+def test_stream_measurement_memory_does_not_scale_with_100k_to_200k_rows(tmp_path, monkeypatch):
+    class FastRanker:
+        def rank(self, *, query, candidates):
+            first, second = candidates[:2]
+            return SimpleNamespace(
+                ranked_event_ids=[first.source_event_id, second.source_event_id],
+                scores={first.source_event_id: 2.0, second.source_event_id: 1.0},
+                trace={"encoder_identity": "synthetic-encoder", "query": query},
+            )
+
+    def fast_row(item, corpus, result):
+        ranked = list(result.ranked_event_ids)
+        row = {
+            "item_id": item["item_id"], "query_sha256": rank._query_digest(item["query_text"]),
+            "candidate_input_sha256": rank._candidate_input(corpus, rank.CURRENT_SERIALIZER),
+            "ranked_message_ids": ranked, "retrieved_conversation_ids": [corpus["candidates"][0]["opaque_conversation_id"]],
+            "confidence": .5, "confidence_receipt": {"contract": rank.CONFIDENCE_CONTRACT, "top_two_scores": [2.0, 1.0]},
+        }
+        trace = {
+            "item_id": item["item_id"], "query_sha256": row["query_sha256"],
+            "candidate_input_sha256": row["candidate_input_sha256"], "ranked_count": len(ranked),
+            "ranking_sha256": rank._digest(ranked),
+        }
+        return row, trace
+
+    monkeypatch.setattr(rank, "_ranker", lambda _encoder, _arm_id: FastRanker())
+    monkeypatch.setattr(rank, "_current_row", fast_row)
+    model, code = receipts()
+
+    def measure(query_count, label):
+        root = tmp_path / label
+        root.mkdir()
+        _projection, _bundle, reference = large_stream_projection(root, query_count)
+        staging = root / "staging"; staging.mkdir()
+        store = rank.CandidateProjectionStore.open(reference, staging)
+        gc.collect(); tracemalloc.start()
+        result = rank.rank_projection_stream(
+            store=store, encoder=Encoder(), arm_id="strong_raw",
+            artifact_path=staging / "artifact.json", ready_path=staging / "artifact.READY.json",
+            model_receipt=model, code_receipt=code,
+        )
+        _current, peak = tracemalloc.get_traced_memory(); tracemalloc.stop()
+        assert result["measurement_reference"]["count"] == query_count
+        store.close()
+        return peak
+
+    one_hundred_k_peak = measure(100_000, "one-hundred-k")
+    two_hundred_k_peak = measure(200_000, "two-hundred-k")
+    # The measurement sink must not retain one Python row per query.  SQLite
+    # and the external JSON sequence may grow on disk, but traced worker memory
+    # should remain bounded rather than doubling with the query census.
+    assert two_hundred_k_peak < one_hundred_k_peak * 2.25 + 16 * 1024 * 1024
+
+
+def test_candidate_store_fails_closed_on_projection_byte_drift(tmp_path):
+    p = projection(); bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    projection_path = bundle / "projection.json"
+    projection_path.write_bytes(projection_path.read_bytes() + b" ")
+    with pytest.raises(CustodyError, match="candidate_projection_raw_drift"):
+        store.iter_items().__next__()
+    store.close()
+
+
+def test_candidate_store_rejects_existing_database_without_exact_schema(tmp_path):
+    p = projection(); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    database = store.database
+    store.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE metadata")
+    connection.commit(); connection.close()
+    with pytest.raises(CustodyError, match="candidate_store_schema_invalid"):
+        rank.CandidateProjectionStore.open(reference, tmp_path)
+
+
+def test_candidate_store_rejects_existing_database_with_partial_rows(tmp_path):
+    p = projection(); _bundle, reference = candidate_reference(tmp_path, p)
+    store = rank.CandidateProjectionStore.open(reference, tmp_path)
+    database = store.database
+    store.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DELETE FROM items WHERE item_id = (SELECT item_id FROM items LIMIT 1)")
+    connection.commit(); connection.close()
+    with pytest.raises(CustodyError, match="candidate_store_denominator_invalid"):
+        rank.CandidateProjectionStore.open(reference, tmp_path)
 
 
 def test_current_freeze_is_deterministic_and_public_validator_recomputes_receipts():

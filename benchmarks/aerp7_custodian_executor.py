@@ -197,6 +197,7 @@ def _worker_config(protocol: Mapping[str, Any]) -> dict[str, Any]:
         "role": "candidate_ranker",
         "projection_sha256": protocol["candidate"]["projection_canonical_sha256"],
         "projection_raw_sha256": protocol["candidate"]["projection_raw_sha256"],
+        "candidate_reference_sha256": _digest(protocol["candidate"]["candidate_reference"]),
         "projection_path": "projection.json",
         "model_receipt": protocol["model_receipt"],
         "code_receipt": protocol["current_code_receipt"],
@@ -247,6 +248,59 @@ def _validate_supervisors(value: Any) -> dict[str, Any]:
     return rows
 
 
+def _validate_candidate_store_cleanup(value: Any, *, protocol: Mapping[str, Any],
+                                      current_worker: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the post-ranking deletion receipt without accepting extensions.
+
+    The SQLite cache is deliberately gone by the time custody is eligible.  Its
+    receipt is therefore the only public evidence that all four current runs
+    shared one candidate store and that the cache was removed afterwards.
+    """
+    if not isinstance(value, Mapping):
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    row = dict(value)
+    required = {
+        "schema", "database_path", "validated_artifact_count", "validated_artifact_sha256",
+        "candidate_text_count", "query_count", "store_bytes", "store_bytes_per_candidate_text",
+        "removed_files", "removed_bytes",
+    }
+    if set(row) != required or row.get("schema") != "aerp7-convomem-candidate-store-cleanup-v1":
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    if not isinstance(row.get("database_path"), str) or not row["database_path"]:
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    if row.get("validated_artifact_count") != 4:
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    _hex(row.get("validated_artifact_sha256"), "custodian_candidate_store_cleanup_invalid")
+    candidate = protocol["candidate"]
+    if row.get("query_count") != candidate["query_count"] or row.get("candidate_text_count") != candidate["candidate_text_count"]:
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    for key in ("store_bytes", "removed_bytes"):
+        if isinstance(row.get(key), bool) or not isinstance(row.get(key), int) or row[key] < 0:
+            raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    ratio = row.get("store_bytes_per_candidate_text")
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or ratio < 0 or ratio != row["store_bytes"] / row["candidate_text_count"]:
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    removed = row.get("removed_files")
+    if not isinstance(removed, list) or not removed:
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    total = 0
+    for item in removed:
+        if not isinstance(item, Mapping) or set(item) != {"path", "bytes"} or not isinstance(item.get("path"), str) or not item["path"] or isinstance(item.get("bytes"), bool) or not isinstance(item["bytes"], int) or item["bytes"] < 0:
+            raise CustodyError("custodian_candidate_store_cleanup_invalid")
+        total += item["bytes"]
+    if total != row["removed_bytes"] or row["removed_bytes"] != row["store_bytes"]:
+        raise CustodyError("custodian_candidate_store_cleanup_invalid")
+    expected = sorted([
+        current_worker["artifact_sha256"]["strong_raw"],
+        current_worker["artifact_sha256"]["static_p5"],
+        current_worker["static_p5_repeat_sha256"],
+        current_worker["artifact_sha256"]["six_view_secondary"],
+    ])
+    if row["validated_artifact_sha256"] != _digest(expected):
+        raise CustodyError("custodian_candidate_store_cleanup_binding_invalid")
+    return row
+
+
 def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
     """Complete label-free validation.  This must run before any custody read."""
     cfg = _public_config(config)
@@ -257,7 +311,7 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
     required = {
         "schema", "synthetic_test_mode", "formal_eligible", "authorization_sha256", "protocol",
         "projection_sha256", "current_worker_receipt", "ranking_artifacts", "endpoint_manifest",
-        "resource_receipts", "supervisors", "packet_sha256",
+        "resource_receipts", "supervisors", "candidate_store_cleanup", "packet_sha256",
     }
     synthetic = cfg["synthetic_test_mode"]
     expected_schema = executor.FREEZE_PACKET_SCHEMA if synthetic else executor.FORMAL_FREEZE_PACKET_SCHEMA
@@ -277,30 +331,69 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
     staging_parent = Path(tempfile.mkdtemp(prefix="aerp7-custodian-public-"))
     (staging_parent / "staging").mkdir()
     try:
-        projection = formal.load_candidate_worker_projection(
+        candidate_reference = formal.load_candidate_worker_reference(
             worker_config=_worker_config(protocol), protocol=protocol,
             candidate_bundle_root=candidate_root, staging_parent=staging_parent,
         )
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
-    if canonical_sha256(projection) != packet["projection_sha256"] or canonical_sha256(projection) != protocol["candidate"]["projection_canonical_sha256"]:
+    if candidate_reference["projection_canonical_sha256"] != packet["projection_sha256"] or candidate_reference["projection_canonical_sha256"] != protocol["candidate"]["projection_canonical_sha256"]:
         raise CustodyError("custodian_projection_packet_binding_invalid")
     if protocol["candidate"]["ready_sha256"] != cfg["candidate_ready_sha256"]:
         raise CustodyError("custodian_candidate_ready_public_binding_invalid")
-    current = formal.validate_current_worker_receipt(packet["current_worker_receipt"], projection=projection, require_execution_receipts=True)
-    artifacts = [rank.validate_frozen_ranking(item, projection=projection) for item in packet["ranking_artifacts"]]
+    legacy_projection: dict[str, Any] | None = None
+    if synthetic and any(
+        not isinstance(item, Mapping) or item.get("schema") not in {
+            rank.RANKING_ARTIFACT_REFERENCE_SCHEMA, "aerp7-original-product-artifact-reference-v1",
+        }
+        for item in packet["ranking_artifacts"]
+    ):
+        # Rehearsal fixtures intentionally retain the old inline original
+        # product.  This compatibility branch is forbidden to formal packets;
+        # it keeps recovery tests distinct from the live reference-only path.
+        staging_parent = Path(tempfile.mkdtemp(prefix="aerp7-custodian-rehearsal-"))
+        (staging_parent / "staging").mkdir()
+        try:
+            legacy_projection = formal.load_candidate_worker_projection(
+                worker_config=_worker_config(protocol), protocol=protocol,
+                candidate_bundle_root=candidate_root, staging_parent=staging_parent,
+            )
+        finally:
+            shutil.rmtree(staging_parent, ignore_errors=True)
+        if canonical_sha256(legacy_projection) != candidate_reference["projection_canonical_sha256"]:
+            raise CustodyError("custodian_projection_packet_binding_invalid")
+    current = formal.validate_current_worker_receipt(
+        packet["current_worker_receipt"], candidate_reference=candidate_reference,
+        protocol=protocol, require_execution_receipts=True,
+    )
+    cleanup = _validate_candidate_store_cleanup(packet["candidate_store_cleanup"], protocol=protocol, current_worker=current)
+    artifacts = [formal._validate_public_ranking_artifact(item, projection=legacy_projection, protocol=protocol) for item in packet["ranking_artifacts"]]
     if tuple(item["arm_id"] for item in artifacts) != score.FORMAL_ARMS:
         raise CustodyError("custodian_ranking_arm_coverage_invalid")
-    endpoint = score.validate_endpoint_manifest(packet["endpoint_manifest"], projection_sha256=canonical_sha256(projection))
+    endpoint = score.validate_endpoint_manifest(packet["endpoint_manifest"], projection_sha256=candidate_reference["projection_canonical_sha256"])
     artifact_digests = {item["arm_id"]: item["artifact_sha256"] for item in artifacts}
     if {item["arm_id"]: item["ranking_artifact_sha256"] for item in endpoint["arms"]} != artifact_digests or current["artifact_sha256"] != {arm: artifact_digests[arm] for arm in ("strong_raw", "static_p5", "six_view_secondary")}:
         raise CustodyError("custodian_endpoint_artifact_binding_invalid")
     resources = list(packet["resource_receipts"])
-    expected = formal.projection_denominators(projection); expected_queries = formal.projection_query_keys(projection)
+    expected = formal.projection_reference_denominators(candidate_reference, protocol=protocol)
+    expected_queries = formal.projection_query_keys(legacy_projection) if legacy_projection is not None else None
+    expected_coverage = formal.projection_reference_query_coverage_sha256(candidate_reference, protocol=protocol)
     for receipt in resources:
         if not isinstance(receipt, Mapping):
             raise CustodyError("custodian_resource_receipt_invalid")
-        formal.validate_resource_receipt(receipt, arm_id=receipt.get("arm_id"), thresholds=protocol["resource_thresholds"], expected_denominators=expected, expected_query_keys=expected_queries)
+        arm_id = receipt.get("arm_id")
+        matching = [
+            artifact for artifact in artifacts
+            if artifact.get("schema") == rank.RANKING_ARTIFACT_REFERENCE_SCHEMA and artifact.get("arm_id") == arm_id
+        ]
+        base = Path(str(matching[0]["artifact_path"])).parent if len(matching) == 1 else None
+        formal.validate_resource_receipt(
+            receipt, arm_id=arm_id, thresholds=protocol["resource_thresholds"],
+            expected_denominators=expected, expected_query_keys=expected_queries, measurement_base_path=base,
+            expected_query_coverage_sha256=expected_coverage,
+            expected_projection_sha256=candidate_reference["projection_canonical_sha256"],
+            expected_generation_id=candidate_reference["generation_id"],
+        )
     # Release validation also verifies every resource/replicate cross-binding;
     # this local coverage check catches incomplete public packets before custody.
     by_arm: dict[str, list[Mapping[str, Any]]] = {}
@@ -310,11 +403,12 @@ def validate_public_freeze(config: Mapping[str, Any]) -> dict[str, Any]:
         raise CustodyError("custodian_resource_coverage_invalid")
     supervisors = _validate_supervisors(packet["supervisors"])
     formal.validate_current_execution_receipts(
-        current["execution_receipts"], current_worker_receipt=current, protocol=protocol, projection=projection,
+        current["execution_receipts"], current_worker_receipt=current, protocol=protocol,
+        projection=legacy_projection, candidate_reference=None if legacy_projection is not None else candidate_reference,
         resources=resources, ranking_artifacts=[item for item in artifacts if item["arm_id"] != "original_public_product"],
         supervisors=supervisors, allow_synthetic=synthetic,
     )
-    return {"config": cfg, "packet": packet, "protocol": protocol, "projection": projection, "current_worker_receipt": current, "ranking_artifacts": artifacts, "endpoint_manifest": endpoint, "resource_receipts": resources, "supervisors": supervisors}
+    return {"config": cfg, "packet": packet, "protocol": protocol, "candidate_reference": candidate_reference, "projection": legacy_projection, "candidate_store_cleanup": cleanup, "current_worker_receipt": current, "ranking_artifacts": artifacts, "endpoint_manifest": endpoint, "resource_receipts": resources, "supervisors": supervisors}
 
 
 def _resource_map(resources: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -333,7 +427,10 @@ def _resource_map(resources: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 def _release(*, public: Mapping[str, Any], custody_ready_sha256: str, custody_bundle_sha256: str, capability: bytes, formal_live: bool) -> dict[str, Any]:
     protocol, endpoint = public["protocol"], public["endpoint_manifest"]
     resources, artifacts = public["resource_receipts"], public["ranking_artifacts"]
-    originals = next(item for item in artifacts if item["arm_id"] == "original_public_product")["replicates"]
+    original_artifact = next(item for item in artifacts if item["arm_id"] == "original_public_product")
+    originals = original_artifact.get("replicate_references", original_artifact.get("replicates"))
+    if not isinstance(originals, list):
+        raise CustodyError("custodian_original_artifact_reference_invalid")
     unsigned = {
         "schema": formal.RELEASE_SCHEMA if formal_live else formal.REHEARSAL_RELEASE_SCHEMA,
         "protocol_sha256": protocol["protocol_sha256"],
@@ -559,8 +656,9 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
         formal_live=formal_live,
     )
     release_validator = formal.validate_release_authorization if formal_live else formal.validate_rehearsal_release_authorization
+    candidate_input = ({"candidate_reference": public["candidate_reference"]} if formal_live else {"projection": public["projection"]})
     release_validator(
-        release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
+        release, **candidate_input, ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
         endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
         custody_ready_sha256=cfg["custody_ready_sha256"], custody_bundle_sha256=cfg["custody_bundle_sha256"],
@@ -578,29 +676,45 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     scorer_before = live_custodian_code_receipt()
     custody_opener = formal.open_custody_after_release if formal_live else formal.open_custody_after_rehearsal_release
     opened = custody_opener(
-        release_authorization=release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
+        release_authorization=release, **candidate_input, ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
         endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
         custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle,
         custody_capability_secret=private["custody_capability_secret"], candidate_bundle_root=Path(cfg["candidate_bundle"]),
         custody_bundle_root=custody_root, binding_secret=private["binding_secret"],
     )
-    # ``opened`` is the single minimal view held by this process.  The loader
-    # closure has no path and cannot cause a second arbitrary file read.
-    used = False
-    def custody_loader() -> Any:
-        nonlocal used
-        if used:
-            raise CustodyError("custodian_custody_loader_reused")
-        used = True
-        return opened
-    report = score.score_frozen(
-        projection=public["projection"], endpoint_manifest=public["endpoint_manifest"],
-        ranking_artifacts=public["ranking_artifacts"], custody_loader=custody_loader,
-        evidence_token_secret=private["evidence_token_secret"], formal_live=formal_live,
+    store_parent: Path | None = None
+    store: rank.CandidateProjectionStore | None = None
+    ledger_path = Path(cfg["output_path"]).with_name(
+        f".{Path(cfg['output_path']).name}.aerp7-mapping-ledger-{private['authorization_id']}.json"
     )
-    if not used:
-        raise CustodyError("custodian_score_did_not_open_custody")
+    try:
+        if formal_live:
+            store_parent = Path(tempfile.mkdtemp(prefix="aerp7-custodian-score-", dir=Path(cfg["candidate_bundle"]).parent))
+            store = rank.CandidateProjectionStore.open(
+                public["candidate_reference"], store_parent,
+                expected_bundle_root=Path(cfg["candidate_bundle"]),
+            )
+        report = score.score_frozen(
+            projection=store if formal_live else public["projection"], endpoint_manifest=public["endpoint_manifest"],
+            ranking_artifacts=public["ranking_artifacts"],
+            custody_store=opened if formal_live else None,
+            custody_loader=(None if formal_live else (lambda: opened)),
+            evidence_token_secret=private["evidence_token_secret"], formal_live=formal_live,
+            mapping_ledger_path=ledger_path if formal_live else None,
+        )
+    finally:
+        if store is not None:
+            store.close()
+        # The custody cursor owns an ephemeral SQLite materialization.  It is
+        # no longer needed once ``score_frozen`` has derived its public report;
+        # close it before publication so neither retry nor envelope validation
+        # can accidentally retain a private handle.
+        close_custody = getattr(opened, "close", None)
+        if callable(close_custody):
+            close_custody()
+        if store_parent is not None:
+            shutil.rmtree(store_parent, ignore_errors=True)
     decision = scientific_gate_decision(report, public["protocol"])
     post_unsigned = {
         "schema": formal.POST_SCORE_ATTESTATION_SCHEMA,
@@ -616,7 +730,7 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     envelope_builder = formal.audit_envelope if formal_live else formal.rehearsal_audit_envelope
     envelope = envelope_builder(
         report=report, post_score_attestation=post, scorer_attestation_secret=private["scorer_attestation_secret"],
-        release_authorization=release, projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
+        release_authorization=release, **candidate_input, ranking_artifacts=public["ranking_artifacts"],
         current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"],
         endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
         custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle,
@@ -658,10 +772,11 @@ def validate_completed_packet(*, config: Mapping[str, Any], outer: Mapping[str, 
     if row.get("gate_decision") != decision:
         raise CustodyError("custodian_completed_packet_gate_invalid")
     envelope_builder = formal.audit_envelope if formal_live else formal.rehearsal_audit_envelope
+    candidate_input = ({"candidate_reference": public["candidate_reference"]} if formal_live else {"projection": public["projection"]})
     try:
         expected_envelope = envelope_builder(
             report=row["envelope"]["report"], post_score_attestation=row["envelope"].get("post_score_attestation"), scorer_attestation_secret=private["scorer_attestation_secret"],
-            release_authorization=row["envelope"].get("release_authorization"), projection=public["projection"], ranking_artifacts=public["ranking_artifacts"],
+            release_authorization=row["envelope"].get("release_authorization"), **candidate_input, ranking_artifacts=public["ranking_artifacts"],
             current_worker_receipt=public["current_worker_receipt"], protocol=public["protocol"], endpoint_manifest=public["endpoint_manifest"], resource_receipts=public["resource_receipts"],
             custody_ready_sha256=cfg["custody_ready_sha256"], custody_bundle_sha256=cfg["custody_bundle_sha256"], custody_capability_secret=private["custody_capability_secret"],
         )

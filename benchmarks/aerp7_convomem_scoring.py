@@ -2,22 +2,34 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import ExitStack
 import hashlib
 import hmac
+import json
 import math
+import os
+from pathlib import Path
 import random
+import sqlite3
+import tempfile
 import unicodedata
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256, validate_candidate_projection
 from benchmarks.aerp7_convomem_rank import (
     CONFIDENCE_CONTRACT, CURRENT_ARMS, CURRENT_SERIALIZER, ORIGINAL_MEMPALACE_SERIALIZER,
-    PROTOCOL_SOURCE, RANKING_SCHEMA, validate_frozen_ranking,
+    CANDIDATE_PROJECTION_REFERENCE_SCHEMA, PROTOCOL_SOURCE, RANKING_ARTIFACT_REFERENCE_SCHEMA,
+    CandidateProjectionStore, validate_candidate_projection_reference,
+    validate_frozen_ranking, validate_ranking_artifact_reference,
 )
 
 MANIFEST_SCHEMA = "aerp7-convomem-endpoint-manifest-v3"
 CUSTODY_SCHEMA = "aerp7-convomem-custody-for-scoring-v2"
+CUSTODY_REFERENCE_SCHEMA = "aerp7-convomem-custody-reference-v1"
 SCHEMA = "aerp7-convomem-scoring-report-v3"
+MAPPING_LEDGER_REFERENCE_SCHEMA = "aerp7-convomem-mapping-ledger-reference-v1"
+MAPPING_LEDGER_READY_SCHEMA = "aerp7-convomem-mapping-ledger-ready-v1"
+MAPPING_LEDGER_FORMAT = "canonical-json-array-v1"
 UPSTREAM_GROUPS = {
     "user_evidence": "positive", "assistant_facts_evidence": "positive",
     "changing_evidence": "positive", "preference_evidence": "positive",
@@ -113,6 +125,744 @@ def validate_endpoint_manifest(value: Any, *, projection_sha256: str) -> dict[st
             raise CustodyError("formal_manifest_freeze_invalid")
     if row.get("manifest_sha256") != endpoint_manifest_digest(row): raise CustodyError("endpoint_manifest_digest_mismatch")
     return row
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _is_custody_store(value: Any) -> bool:
+    """Recognize the confirmation-owned streaming custody cursor lazily."""
+    try:
+        from benchmarks.aerp7_convomem_confirmation import CustodyStore
+    except ImportError:  # pragma: no cover - confirmation is a runtime dependency
+        return False
+    return isinstance(value, CustodyStore)
+
+
+def _custody_reference(value: Any) -> Mapping[str, Any]:
+    if not _is_custody_store(value):
+        raise CustodyError("scoring_custody_store_required")
+    reference = getattr(value, "reference", None)
+    required = {
+        "schema", "bundle_path", "candidate_reference", "custody_path", "ready_path",
+        "generation_id", "custody_raw_sha256", "custody_canonical_sha256", "dataset",
+        "item_count", "evidence_span_count", "ready_sha256",
+    }
+    if not isinstance(reference, Mapping) or set(reference) != required or reference.get("schema") != CUSTODY_REFERENCE_SCHEMA:
+        raise CustodyError("scoring_custody_reference_invalid")
+    try:
+        validate_candidate_projection_reference(reference["candidate_reference"])
+    except CustodyError as exc:
+        raise CustodyError("scoring_custody_reference_invalid") from exc
+    for key in ("custody_raw_sha256", "custody_canonical_sha256", "ready_sha256"):
+        _h(reference.get(key), "scoring_custody_reference_invalid")
+    for key in ("item_count", "evidence_span_count"):
+        _integer(reference.get(key), "scoring_custody_reference_invalid")
+        if reference[key] < 0:
+            raise CustodyError("scoring_custody_reference_invalid")
+    return reference
+
+
+class _ProjectionAccess:
+    """Small adapter over either the legacy map or a persistent candidate store.
+
+    The formal path receives a :class:`CandidateProjectionStore`; it never
+    asks this scorer to load ``projection.json`` into a Python object.  The
+    legacy map path is retained for the synthetic fixtures and old callers.
+    """
+
+    def __init__(self, projection: Any) -> None:
+        self.store: CandidateProjectionStore | None = projection if isinstance(projection, CandidateProjectionStore) else None
+        if self.store is not None:
+            self.reference = validate_candidate_projection_reference(self.store.reference)
+            self.inline: dict[str, Any] | None = None
+            self.digest = self.reference["projection_canonical_sha256"]
+            self.query_count = self.reference["query_count"]
+            self.candidate_text_count = self.reference["candidate_text_count"]
+            self._corpora: dict[str, dict[str, Any]] = {}
+            self._corpus_cache: dict[str, dict[str, Any]] = {}
+            return
+        if isinstance(projection, Mapping) and projection.get("schema") == CANDIDATE_PROJECTION_REFERENCE_SCHEMA:
+            # A reference is not sufficient to score: the store is the
+            # persistent, bounded-memory consumer and must be opened by the
+            # custody/coordinator boundary in its configured staging root.
+            raise CustodyError("scoring_candidate_store_required")
+        self.inline = validate_candidate_projection(projection)
+        self.reference = None
+        self.digest = _d(self.inline)
+        self.query_count = len(self.inline["items"])
+        self.candidate_text_count = sum(len(corpus["candidates"]) for corpus in self.inline["corpora"])
+        self._items = {item["item_id"]: item for item in self.inline["items"]}
+        self._corpora = {corpus["corpus_id"]: corpus for corpus in self.inline["corpora"]}
+
+    def iter_items(self) -> Iterator[dict[str, Any]]:
+        if self.store is not None:
+            for item in self.store.iter_items():
+                yield dict(item)
+            return
+        assert self.inline is not None
+        for item in self.inline["items"]:
+            yield dict(item)
+
+    def item(self, item_id: str) -> dict[str, Any] | None:
+        if self.store is not None:
+            try:
+                row = self.store.connection.execute("SELECT payload_json FROM items WHERE item_id=?", (item_id,)).fetchone()
+            except sqlite3.Error as exc:
+                raise CustodyError("candidate_store_item_invalid") from exc
+            if row is None:
+                return None
+            try:
+                value = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise CustodyError("candidate_store_item_invalid") from exc
+            return value if isinstance(value, dict) else None
+        return self._items.get(item_id)
+
+    def corpus(self, corpus_id: str) -> dict[str, Any]:
+        if self.store is not None:
+            cached = self._corpus_cache.get(corpus_id)
+            if cached is not None:
+                return cached
+            value = self.store.corpus(corpus_id)
+            # A one-corpus cache bounds memory by the largest corpus rather
+            # than retaining a slice of the 20+GB projection in the scorer.
+            if len(self._corpus_cache) >= 1:
+                self._corpus_cache.pop(next(iter(self._corpus_cache)))
+            self._corpus_cache[corpus_id] = value
+            return value
+        try:
+            return self._corpora[corpus_id]
+        except KeyError as exc:
+            raise CustodyError("candidate_projection_corpus_missing") from exc
+
+    def corpus_metadata(self, corpus_id: str) -> dict[str, Any]:
+        if self.store is None:
+            return self.corpus(corpus_id)
+        try:
+            row = self.store.connection.execute("SELECT payload_json FROM corpora WHERE corpus_id=?", (corpus_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise CustodyError("candidate_store_corpus_invalid") from exc
+        if row is None:
+            raise CustodyError("candidate_projection_corpus_missing")
+        try:
+            value = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CustodyError("candidate_store_corpus_invalid") from exc
+        if not isinstance(value, dict):
+            raise CustodyError("candidate_store_corpus_invalid")
+        return value
+
+
+class _ScoringDB:
+    """Ephemeral disk spool for custody rows, confidence pairs and ledgers."""
+
+    def __init__(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="aerp7-scoring-")
+        self.path = Path(self._tmp.name) / "score.sqlite3"
+        self.connection = sqlite3.connect(self.path)
+        self.connection.executescript(
+            """
+            CREATE TABLE projection_items(
+                item_id TEXT PRIMARY KEY, persona_id TEXT NOT NULL,
+                corpus_id TEXT NOT NULL, declared_context_size INTEGER NOT NULL,
+                actual_conversation_count INTEGER NOT NULL,
+                actual_message_count INTEGER NOT NULL, query_text TEXT NOT NULL
+            );
+            CREATE TABLE custody(
+                item_id TEXT PRIMARY KEY, directory_group TEXT NOT NULL,
+                conversations_json TEXT NOT NULL, mappings_json TEXT NOT NULL
+            );
+            CREATE TABLE ledger(
+                ordinal INTEGER PRIMARY KEY, item_id TEXT NOT NULL,
+                evidence_token TEXT NOT NULL, status TEXT NOT NULL
+            );
+            CREATE TABLE artifact_seen(
+                arm_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                PRIMARY KEY(arm_id, item_id)
+            );
+            CREATE TABLE preflight_rank(
+                arm_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                query_sha256 TEXT NOT NULL, candidate_input_sha256 TEXT NOT NULL,
+                ranked_count INTEGER NOT NULL, ranking_sha256 TEXT NOT NULL,
+                PRIMARY KEY(arm_id, item_id)
+            );
+            CREATE TABLE preflight_trace(
+                arm_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                PRIMARY KEY(arm_id, item_id)
+            );
+            CREATE TABLE confidence(
+                arm_id TEXT NOT NULL, persona_id TEXT NOT NULL,
+                declared_context_size INTEGER NOT NULL,
+                confidence REAL NOT NULL, label INTEGER NOT NULL
+            );
+            CREATE INDEX confidence_stratum
+                ON confidence(arm_id, persona_id, declared_context_size, confidence);
+            """
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        try:
+            self.connection.close()
+        finally:
+            self._tmp.cleanup()
+
+    def __enter__(self) -> "_ScoringDB":
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        self.close()
+
+
+class _CustodyIndex:
+    def __init__(self, db: _ScoringDB, *, ledger_count: int) -> None:
+        self.db = db
+        self.ledger_count = ledger_count
+
+    def get(self, item_id: str) -> tuple[str, list[str], list[dict[str, Any]]]:
+        row = self.db.connection.execute(
+            "SELECT directory_group, conversations_json, mappings_json FROM custody WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            raise CustodyError("scoring_custody_item_coverage_invalid")
+        try:
+            conversations = json.loads(row[1]); mappings = json.loads(row[2])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CustodyError("scoring_custody_item_invalid") from exc
+        if not isinstance(conversations, list) or not isinstance(mappings, list):
+            raise CustodyError("scoring_custody_item_invalid")
+        return str(row[0]), conversations, mappings
+
+    def iter_ledger(self) -> Iterator[dict[str, Any]]:
+        for item_id, token, status in self.db.connection.execute(
+            "SELECT item_id, evidence_token, status FROM ledger ORDER BY ordinal"
+        ):
+            yield {"item_id": item_id, "evidence_token": token, "status": status}
+
+    def legacy_ledger(self) -> list[dict[str, Any]]:
+        """Compatibility-only materialization for the small inline fixtures."""
+        return list(self.iter_ledger())
+
+
+def _write_mapping_ledger_reference(
+    index: _CustodyIndex, *, path: Path, projection_digest: str,
+) -> dict[str, Any]:
+    """Publish the label-free mapping ledger without retaining its rows.
+
+    The output is an ordinary persisted report sidecar.  It is written through
+    a same-directory temporary file and published only after its count/digest
+    are complete; an existing exact sidecar is accepted for an idempotent
+    retry, while a different sidecar fails closed.
+    """
+    # Resolve only after rejecting relative paths.  A relative path would make
+    # the report's persisted handle dependent on the caller's future cwd.
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise CustodyError("scoring_mapping_ledger_output_invalid")
+    if path.is_symlink():
+        raise CustodyError("scoring_mapping_ledger_output_invalid")
+    path = path.resolve()
+    ready_path = path.with_name(path.stem + ".READY.json")
+    if path.is_symlink() or ready_path.is_symlink() or not path.parent.is_dir():
+        raise CustodyError("scoring_mapping_ledger_output_invalid")
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{id(index)}")
+    ready_temporary = ready_path.with_name(f".{ready_path.name}.tmp-{os.getpid()}-{id(index)}")
+    published_payload = False
+    published_ready = False
+    digest = hashlib.sha256(); digest.update(b"["); first = True; count = 0
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(b"[")
+            for row in index.iter_ledger():
+                payload = _json(row).encode("utf-8")
+                if not first:
+                    stream.write(b","); digest.update(b",")
+                stream.write(payload); digest.update(payload); first = False; count += 1
+            stream.write(b"]"); digest.update(b"]"); stream.flush(); os.fsync(stream.fileno())
+        file_digest = digest.hexdigest()
+        ready_unsigned = {
+            "schema": MAPPING_LEDGER_READY_SCHEMA,
+            "format": MAPPING_LEDGER_FORMAT,
+            "projection_sha256": projection_digest,
+            "count": count,
+            "sha256": file_digest,
+        }
+        ready_digest = _d(ready_unsigned)
+        ready_payload = _json({**ready_unsigned, "ready_sha256": ready_digest}).encode("utf-8")
+        with ready_temporary.open("xb") as stream:
+            stream.write(ready_payload); stream.flush(); os.fsync(stream.fileno())
+        if path.exists() or ready_path.exists():
+            if (
+                path.is_symlink() or not path.is_file() or ready_path.is_symlink() or not ready_path.is_file()
+                or _stream_path_sha256(path) != file_digest
+                or ready_path.read_bytes() != ready_payload
+            ):
+                raise CustodyError("scoring_mapping_ledger_output_conflict")
+            temporary.unlink()
+            ready_temporary.unlink()
+        else:
+            try:
+                os.link(temporary, path)
+                published_payload = True
+                temporary.unlink()
+                os.link(ready_temporary, ready_path)
+                published_ready = True
+                ready_temporary.unlink()
+            except FileExistsError:
+                if (
+                    path.is_symlink() or not path.is_file() or ready_path.is_symlink() or not ready_path.is_file()
+                    or _stream_path_sha256(path) != file_digest
+                    or ready_path.read_bytes() != ready_payload
+                ):
+                    raise CustodyError("scoring_mapping_ledger_output_conflict")
+                temporary.unlink()
+                ready_temporary.unlink()
+        published_payload = False
+        published_ready = False
+        return {
+            "schema": MAPPING_LEDGER_REFERENCE_SCHEMA,
+            "format": MAPPING_LEDGER_FORMAT,
+            "path": str(path),
+            "ready_path": str(ready_path),
+            "projection_sha256": projection_digest,
+            "count": count,
+            "sha256": file_digest,
+            "ready_sha256": ready_digest,
+        }
+    except CustodyError:
+        raise
+    except OSError as exc:
+        raise CustodyError("scoring_mapping_ledger_publish_failed") from exc
+    finally:
+        if published_ready:
+            try:
+                ready_path.unlink()
+            except FileNotFoundError:
+                pass
+        if published_payload:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            ready_temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _stream_path_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise CustodyError("scoring_mapping_ledger_read_failed") from exc
+    return digest.hexdigest()
+
+
+def _validate_ledger_entry(value: Any) -> dict[str, Any]:
+    entry = _o(value, "scoring_report_ledger_invalid")
+    if set(entry) != {"item_id", "evidence_token", "status"} or entry["status"] not in {"mapped", "unmatched", "ambiguous"}:
+        raise CustodyError("scoring_report_ledger_invalid")
+    _h(entry["item_id"], "scoring_report_ledger_invalid")
+    _h(entry["evidence_token"], "scoring_report_ledger_invalid")
+    return entry
+
+
+def _validate_ledger_entries(entries: Iterable[Any]) -> int:
+    """Validate legacy rows through a disk-backed uniqueness index."""
+    temporary = tempfile.TemporaryDirectory(prefix="aerp7-ledger-validate-")
+    connection = sqlite3.connect(Path(temporary.name) / "seen.sqlite3")
+    try:
+        connection.execute("CREATE TABLE seen(item_id TEXT NOT NULL, evidence_token TEXT NOT NULL, PRIMARY KEY(item_id, evidence_token))")
+        count = 0
+        for value in entries:
+            entry = _validate_ledger_entry(value)
+            try:
+                connection.execute("INSERT INTO seen VALUES (?, ?)", (entry["item_id"], entry["evidence_token"]))
+            except sqlite3.IntegrityError as exc:
+                raise CustodyError("scoring_report_ledger_duplicate") from exc
+            count += 1
+        connection.commit()
+        return count
+    finally:
+        connection.close(); temporary.cleanup()
+
+
+def _validate_mapping_ledger_reference(value: Any, *, projection_digest: str) -> dict[str, Any]:
+    reference = _o(value, "scoring_report_ledger_reference_invalid")
+    required = {"schema", "format", "path", "ready_path", "projection_sha256", "count", "sha256", "ready_sha256"}
+    if set(reference) != required or reference.get("schema") != MAPPING_LEDGER_REFERENCE_SCHEMA or reference.get("format") != MAPPING_LEDGER_FORMAT:
+        raise CustodyError("scoring_report_ledger_reference_invalid")
+    path_value, ready_value = reference.get("path"), reference.get("ready_path")
+    if not isinstance(path_value, str) or not isinstance(ready_value, str) or not Path(path_value).is_absolute() or not Path(ready_value).is_absolute():
+        raise CustodyError("scoring_report_ledger_reference_invalid")
+    path, ready_path = Path(path_value), Path(ready_value)
+    if path.parent != ready_path.parent or path.is_symlink() or not path.is_file() or ready_path.is_symlink() or not ready_path.is_file() or reference.get("projection_sha256") != projection_digest:
+        raise CustodyError("scoring_report_ledger_reference_invalid")
+    _integer(reference.get("count"), "scoring_report_ledger_reference_invalid")
+    if reference["count"] < 0:
+        raise CustodyError("scoring_report_ledger_reference_invalid")
+    _h(reference.get("sha256"), "scoring_report_ledger_reference_invalid")
+    _h(reference.get("ready_sha256"), "scoring_report_ledger_reference_invalid")
+    if _stream_path_sha256(path) != reference["sha256"]:
+        raise CustodyError("scoring_report_ledger_reference_drift")
+    try:
+        ready_raw = ready_path.read_bytes()
+        ready = json.loads(ready_raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CustodyError("scoring_report_ledger_ready_invalid") from exc
+    ready_unsigned = {
+        "schema": MAPPING_LEDGER_READY_SCHEMA,
+        "format": MAPPING_LEDGER_FORMAT,
+        "projection_sha256": reference["projection_sha256"],
+        "count": reference["count"],
+        "sha256": reference["sha256"],
+    }
+    if ready_raw != _json(ready).encode("utf-8") or ready != {**ready_unsigned, "ready_sha256": reference["ready_sha256"]} or reference["ready_sha256"] != _d(ready_unsigned):
+        raise CustodyError("scoring_report_ledger_ready_invalid")
+    parser = _ijson(); count = 0
+    try:
+        with path.open("rb") as stream:
+            count = _validate_ledger_entries(parser.items(stream, "item", use_float=True))
+    except CustodyError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise CustodyError("scoring_report_ledger_reference_invalid") from exc
+    if count != reference["count"]:
+        raise CustodyError("scoring_report_ledger_reference_count_invalid")
+    return reference
+
+
+def _prepare_projection_items(access: _ProjectionAccess, db: _ScoringDB) -> None:
+    count = 0
+    for item in access.iter_items():
+        required = ("item_id", "persona_id", "corpus_id")
+        if any(not isinstance(item.get(key), str) or not item[key] for key in required):
+            raise CustodyError("candidate_projection_item_invalid")
+        corpus = access.corpus_metadata(item["corpus_id"])
+        values = (
+            item["item_id"], item["persona_id"], item["corpus_id"],
+            corpus.get("declared_context_size"), corpus.get("actual_conversation_count"),
+            corpus.get("actual_message_count"), item.get("query_text"),
+        )
+        if not isinstance(values[6], str) or not values[6].strip() or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in values[3:6]):
+            raise CustodyError("candidate_projection_corpus_invalid")
+        try:
+            db.connection.execute(
+                "INSERT INTO projection_items VALUES (?, ?, ?, ?, ?, ?, ?)", values
+            )
+        except sqlite3.IntegrityError as exc:
+            raise CustodyError("candidate_projection_item_duplicate") from exc
+        count += 1
+    if count != access.query_count:
+        raise CustodyError("candidate_projection_query_denominator_invalid")
+    db.connection.commit()
+
+
+def _prepare_custody_rows(
+    access: _ProjectionAccess, custody_items: Iterable[Any], secret: bytes, *,
+    formal_live: bool, db: _ScoringDB,
+) -> _CustodyIndex:
+    """Resolve one custody cursor at a time, keeping only compact rows on disk."""
+    if not isinstance(secret, bytes) or len(secret) < 32:
+        raise CustodyError("scoring_secret_too_short")
+    ordinal = 0
+    for raw in custody_items:
+        item = _o(raw, "scoring_custody_item_invalid")
+        required = {"item_id", "directory_group", "evidence_conversation_ids", "evidence_spans"}
+        item_id = item.get("item_id")
+        if set(item) != required or not isinstance(item_id, str) or item_id == item_id.strip() == "" or item.get("directory_group") not in UPSTREAM_GROUPS:
+            raise CustodyError("scoring_custody_item_invalid")
+        projection_item = db.connection.execute(
+            "SELECT corpus_id FROM projection_items WHERE item_id=?", (item_id,)
+        ).fetchone()
+        if projection_item is None:
+            raise CustodyError("scoring_custody_item_invalid")
+        corpus = access.corpus(str(projection_item[0]))
+        endpoint = UPSTREAM_GROUPS[item["directory_group"]]
+        conversations = _l(item["evidence_conversation_ids"], "scoring_custody_conversations_invalid")
+        allowed = {candidate.get("opaque_conversation_id") for candidate in corpus["candidates"]}
+        if len(conversations) != len(set(conversations)) or set(conversations) - allowed:
+            raise CustodyError("scoring_custody_conversations_invalid")
+        spans = _l(item["evidence_spans"], "scoring_custody_evidence_invalid")
+        if endpoint == "positive" and not spans:
+            raise CustodyError("positive_evidence_span_missing")
+        if endpoint == "abstention" and (spans or conversations):
+            raise CustodyError("abstention_evidence_must_be_empty")
+        mappings: list[dict[str, Any]] = []
+        for span_ordinal, raw_span in enumerate(spans):
+            span = _o(raw_span, "scoring_custody_evidence_invalid")
+            if set(span) != {"speaker", "text"} or not isinstance(span["speaker"], str) or not isinstance(span["text"], str):
+                raise CustodyError("scoring_custody_evidence_invalid")
+            hits = [
+                candidate["message_id"] for candidate in corpus["candidates"]
+                if candidate["opaque_conversation_id"] in conversations
+                and (normalize_v1(candidate["speaker"]), normalize_v1(candidate["text"])) == (normalize_v1(span["speaker"]), normalize_v1(span["text"]))
+            ]
+            status = "mapped" if len(hits) == 1 else "unmatched" if not hits else "ambiguous"
+            private = {"status": status}
+            if status == "mapped":
+                private["message_id"] = hits[0]
+            mappings.append(private)
+            token = hmac.new(secret, f"aerp7-public-ledger/v1/{item_id}/{span_ordinal}".encode("utf-8"), hashlib.sha256).hexdigest()
+            db.connection.execute(
+                "INSERT INTO ledger VALUES (?, ?, ?, ?)", (ordinal, item_id, token, status)
+            )
+            ordinal += 1
+        try:
+            db.connection.execute(
+                "INSERT INTO custody VALUES (?, ?, ?, ?)",
+                (item_id, item["directory_group"], _json(list(conversations)), _json(mappings)),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise CustodyError("scoring_custody_item_invalid") from exc
+        if formal_live and any(mapping["status"] != "mapped" for mapping in mappings):
+            raise CustodyError("scoring_exact_evidence_mapping_incomplete")
+    count = db.connection.execute("SELECT COUNT(*) FROM custody").fetchone()[0]
+    if count != access.query_count:
+        raise CustodyError("scoring_custody_item_coverage_invalid")
+    db.connection.commit()
+    return _CustodyIndex(db, ledger_count=ordinal)
+
+
+def _prepare_custody(
+    access: _ProjectionAccess, custody: Any, secret: bytes, *, formal_live: bool, db: _ScoringDB,
+) -> _CustodyIndex:
+    """Accept only the small legacy map or the confirmation CustodyStore."""
+    if _is_custody_store(custody):
+        reference = _custody_reference(custody)
+        candidate_reference = reference.get("candidate_reference")
+        if not isinstance(candidate_reference, Mapping) or candidate_reference.get("projection_canonical_sha256") != access.digest:
+            raise CustodyError("scoring_custody_projection_binding_invalid")
+        if access.reference is not None and dict(candidate_reference) != access.reference:
+            raise CustodyError("scoring_custody_candidate_reference_invalid")
+        if reference.get("item_count") != access.query_count:
+            raise CustodyError("scoring_custody_item_coverage_invalid")
+        index = _prepare_custody_rows(
+            access, custody.iter_scoring_items(), secret, formal_live=formal_live, db=db,
+        )
+        # The signed custody reference carries the expected label-span
+        # denominator.  Bind it to the streamed ledger before ranking rows are
+        # consumed so truncation/duplication cannot be hidden by a later
+        # report-side count.
+        evidence_span_count = reference.get("evidence_span_count")
+        if isinstance(evidence_span_count, bool) or not isinstance(evidence_span_count, int) or evidence_span_count < 0 or evidence_span_count != index.ledger_count:
+            raise CustodyError("scoring_custody_ledger_count_invalid")
+        return index
+    row = _o(custody, "scoring_custody_invalid")
+    if set(row) != {"schema", "projection_sha256", "items"} or row.get("schema") != CUSTODY_SCHEMA or row.get("projection_sha256") != access.digest:
+        raise CustodyError("scoring_custody_schema_invalid")
+    custody_items = _l(row["items"], "scoring_custody_items_invalid")
+    return _prepare_custody_rows(
+        access, custody_items, secret, formal_live=formal_live, db=db,
+    )
+
+
+def _ijson() -> Any:
+    try:
+        import ijson
+    except ImportError as exc:  # pragma: no cover - pinned runtime dependency
+        raise CustodyError("scoring_streaming_dependency_missing") from exc
+    return ijson
+
+
+def _stream_json_array(path: Path, prefix: str) -> Iterator[dict[str, Any]]:
+    parser = _ijson()
+    try:
+        with path.open("rb") as handle:
+            for value in parser.items(handle, prefix, use_float=True):
+                if not isinstance(value, Mapping):
+                    raise CustodyError("ranking_artifact_stream_row_invalid")
+                yield dict(value)
+    except OSError as exc:
+        raise CustodyError("ranking_artifact_stream_read_failed") from exc
+
+
+class _ArtifactReader:
+    """Uniform row cursor for inline artifacts and READY-bound references."""
+
+    def __init__(self, value: Any, *, projection_digest: str, projection: Any) -> None:
+        self.value = value
+        self.inline: dict[str, Any] | None = None
+        self.reference: dict[str, Any] | None = None
+        self.kind: str
+        self._original_refs: list[dict[str, Any]] = []
+        # The canonical original lane publishes one small artifact reference
+        # whose five replicate references point at durable SQLite stores.  It
+        # is deliberately handled before the compatibility wrappers below so
+        # the scorer consumes the canonical handle without materializing the
+        # published artifact or its rankings.
+        if isinstance(value, Mapping) and value.get("schema") == "aerp7-original-product-artifact-reference-v1":
+            try:
+                from benchmarks import aerp7_original_product as original_product
+                checked = original_product.validate_original_public_artifact_reference(value)
+            except Exception as exc:
+                if isinstance(exc, CustodyError):
+                    raise
+                raise CustodyError("original_artifact_reference_invalid") from exc
+            if checked["candidate_reference"]["projection_canonical_sha256"] != projection_digest:
+                raise CustodyError("original_artifact_projection_binding_invalid")
+            self._original_refs = [self._check_original_reference(ref) for ref in checked["replicate_references"]]
+            self.arm_id = "original_public_product"
+            self.artifact_sha256 = checked["artifact_sha256"]
+            self.kind = "original"
+            return
+        if isinstance(value, list) and len(value) == 5 and all(isinstance(item, Mapping) and item.get("schema") == "aerp7-original-product-replicate-reference-v1" for item in value):
+            self._original_refs = [self._check_original_reference(item) for item in value]
+            self.arm_id = "original_public_product"
+            self.artifact_sha256 = _d({"replicates": self._original_refs})
+            self.kind = "original"
+            return
+        if isinstance(value, Mapping) and value.get("schema") == RANKING_ARTIFACT_REFERENCE_SCHEMA:
+            self.reference = validate_ranking_artifact_reference(value, expected_projection_sha256=projection_digest)
+            self.arm_id = self.reference["arm_id"]
+            self.artifact_sha256 = self.reference["artifact_sha256"]
+            self.kind = "current"
+            return
+        if isinstance(value, Mapping) and value.get("schema") == "aerp7-original-product-replicate-reference-v1":
+            self._original_refs = [self._check_original_reference(value)]
+            self.arm_id = "original_public_product"
+            self.artifact_sha256 = self._original_refs[0]["replicate_sha256"]
+            self.kind = "original"
+            return
+        if isinstance(value, Mapping) and value.get("arm_id") == "original_public_product":
+            refs = value.get("replicate_references")
+            if refs is None:
+                refs = value.get("replicate_refs")
+            if refs is None and isinstance(value.get("replicates"), list) and all(isinstance(item, Mapping) and item.get("schema") == "aerp7-original-product-replicate-reference-v1" for item in value["replicates"]):
+                refs = value["replicates"]
+            if refs is not None:
+                if not isinstance(refs, list) or len(refs) != 5:
+                    raise CustodyError("original_replicate_reference_schema_invalid")
+                self._original_refs = [self._check_original_reference(ref) for ref in refs]
+                self.arm_id = "original_public_product"
+                self.artifact_sha256 = value.get("artifact_sha256") or _d({"replicates": self._original_refs})
+                _h(self.artifact_sha256, "ranking_artifact_digest_invalid")
+                self.kind = "original"
+                return
+        self.inline = validate_frozen_ranking(value, projection=projection)
+        self.arm_id = self.inline["arm_id"]
+        self.artifact_sha256 = self.inline["artifact_sha256"]
+        self.kind = "original" if self.arm_id == "original_public_product" else "current"
+
+    def iter_rows(self) -> Iterator[dict[str, Any]]:
+        if self.inline is not None:
+            if self.kind == "current":
+                yield from (dict(row) for row in self.inline["rankings"])
+            else:
+                yield from _artifact_rows(self.inline)
+            return
+        if self.kind == "original":
+            from benchmarks import aerp7_original_product as original_product
+            with ExitStack() as stack:
+                stores = [stack.enter_context(original_product.OriginalReplicateStore.open(reference)) for reference in self._original_refs]
+                iterators = [store.iter_rankings() for store in stores]
+                while True:
+                    rows: list[dict[str, Any]] = []
+                    exhausted = []
+                    for iterator in iterators:
+                        try:
+                            rows.append(dict(next(iterator)))
+                        except StopIteration:
+                            exhausted.append(True)
+                    if exhausted:
+                        if rows:
+                            raise CustodyError("original_replicate_query_coverage_invalid")
+                        break
+                    first = rows[0]
+                    if any(row.get("item_id") != first.get("item_id") for row in rows[1:]):
+                        raise CustodyError("original_replicate_item_order_invalid")
+                    yield {**first, "replicate_ranked_message_ids": [list(row["ranked_message_ids"]) for row in rows], "replicate_retrieved_conversation_ids": [list(row["retrieved_conversation_ids"]) for row in rows]}
+            return
+        assert self.reference is not None
+        yield from _stream_json_array(Path(self.reference["artifact_path"]), "rankings.item")
+
+    def preflight(self, access: _ProjectionAccess, db: _ScoringDB) -> None:
+        """Validate streamed public rows before the custody loader is called."""
+        seen = 0
+        for source in self.iter_rows():
+            item_id = source.get("item_id")
+            if not isinstance(item_id, str):
+                raise CustodyError("ranking_artifact_stream_row_invalid")
+            item = access.item(item_id)
+            if item is None:
+                raise CustodyError("ranking_item_coverage_invalid")
+            corpus = access.corpus(str(item["corpus_id"]))
+            _validate_stream_row(source, arm_id=self.arm_id, item=item, corpus=corpus)
+            if self.kind == "current":
+                ids = source["ranked_message_ids"]
+                try:
+                    db.connection.execute(
+                        "INSERT INTO preflight_rank VALUES (?, ?, ?, ?, ?, ?)",
+                        (self.arm_id, item_id, source["query_sha256"], source["candidate_input_sha256"], len(ids), _d(ids)),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise CustodyError("ranking_item_duplicate") from exc
+            if self.kind == "original":
+                replica_ids = source.get("replicate_ranked_message_ids")
+                replica_conversations = source.get("replicate_retrieved_conversation_ids")
+                if not isinstance(replica_ids, list) or len(replica_ids) != 5 or not isinstance(replica_conversations, list) or len(replica_conversations) != 5:
+                    raise CustodyError("original_replicate_metric_invalid")
+                for replica_ranked, replica_retrieved in zip(replica_ids, replica_conversations, strict=True):
+                    _validate_stream_row({**source, "ranked_message_ids": replica_ranked, "retrieved_conversation_ids": replica_retrieved, "confidence": None, "confidence_receipt": None}, arm_id=self.arm_id, item=item, corpus=corpus)
+            seen += 1
+        if seen != access.query_count:
+            raise CustodyError("ranking_item_coverage_invalid")
+        if self.kind == "current":
+            if self.inline is not None:
+                trace_rows: Iterable[Mapping[str, Any]] = (dict(row) for row in self.inline["trace_receipt"])
+            else:
+                assert self.reference is not None
+                trace_rows = _stream_json_array(Path(self.reference["artifact_path"]), "trace_receipt.item")
+            trace_count = 0
+            trace_digest = hashlib.sha256(); trace_digest.update(b"["); first = True
+            for trace in trace_rows:
+                if not first:
+                    trace_digest.update(b",")
+                trace_digest.update(_json(dict(trace)).encode("utf-8")); first = False
+                required_trace = {"item_id", "query_sha256", "candidate_input_sha256", "ranked_count", "ranking_sha256", "ranker_trace_sha256", "ranking_trace"}
+                if set(trace) != required_trace or not isinstance(trace.get("item_id"), str):
+                    raise CustodyError("ranking_trace_schema_invalid")
+                matched = db.connection.execute("SELECT query_sha256, candidate_input_sha256, ranked_count, ranking_sha256 FROM preflight_rank WHERE arm_id=? AND item_id=?", (self.arm_id, trace["item_id"])).fetchone()
+                if matched is None or tuple(trace[key] for key in ("query_sha256", "candidate_input_sha256", "ranked_count", "ranking_sha256")) != tuple(matched):
+                    raise CustodyError("ranking_trace_binding_invalid")
+                if trace["ranker_trace_sha256"] != _d(trace["ranking_trace"]):
+                    raise CustodyError("ranking_trace_binding_invalid")
+                try:
+                    db.connection.execute("INSERT INTO preflight_trace VALUES (?, ?)", (self.arm_id, trace["item_id"]))
+                except sqlite3.IntegrityError as exc:
+                    raise CustodyError("ranking_trace_duplicate") from exc
+                trace_count += 1
+            trace_digest.update(b"]")
+            if trace_count != access.query_count or db.connection.execute("SELECT COUNT(*) FROM preflight_trace WHERE arm_id=?", (self.arm_id,)).fetchone()[0] != access.query_count:
+                raise CustodyError("ranking_trace_coverage_invalid")
+            if self.reference is not None and trace_digest.hexdigest() != self.reference["trace_sha256"]:
+                raise CustodyError("ranking_trace_digest_invalid")
+
+    def original_replicates(self) -> list[Mapping[str, Any]]:
+        if self.kind != "original":
+            return []
+        if self.inline is not None:
+            return list(self.inline["replicates"])
+        return [{"build_id": reference["build_id"], "index_sha256": reference["index_sha256"]} for reference in self._original_refs]
+
+    @staticmethod
+    def _check_original_reference(value: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            from benchmarks import aerp7_original_product as original_product
+            return original_product.validate_original_replicate_reference(value)
+        except Exception as exc:
+            if isinstance(exc, CustodyError):
+                raise
+            raise CustodyError("original_replicate_reference_invalid") from exc
 
 
 def validate_ranking_artifact(value: Any, *, projection: Mapping[str, Any], manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -247,6 +997,247 @@ def _confidence(rows: Sequence[Mapping[str, Any]], *, available: bool) -> dict[s
     return {"available": True, "reason": None, "by_declared_context": detail}
 
 
+class _MetricAccumulator:
+    def __init__(self) -> None:
+        self.count = 0
+        self.metric_sums = {key: 0.0 for key in _METRIC_KEYS}
+        self.evidence_item_count = 0
+        self.resolved_evidence_item_count = 0
+        self.unresolved_evidence_item_count = 0
+        self.retrieved_evidence_count_at_10 = 0.0
+
+    def add(self, metrics: Mapping[str, Any]) -> None:
+        self.count += 1
+        for key in _METRIC_KEYS:
+            self.metric_sums[key] += float(metrics[key])
+        self.evidence_item_count += int(metrics["evidence_item_count"])
+        self.resolved_evidence_item_count += int(metrics["resolved_evidence_item_count"])
+        self.unresolved_evidence_item_count += int(metrics["unresolved_evidence_item_count"])
+        self.retrieved_evidence_count_at_10 += float(metrics["retrieved_evidence_count_at_10"])
+
+    def metric_summary(self) -> dict[str, Any]:
+        if not self.count:
+            raise CustodyError("metric_denominator_zero")
+        result = {
+            "item_count": self.count,
+            **{key: self.metric_sums[key] / self.count for key in _METRIC_KEYS},
+            "evidence_item_count": self.evidence_item_count,
+            "resolved_evidence_item_count": self.resolved_evidence_item_count,
+            "unresolved_evidence_item_count": self.unresolved_evidence_item_count,
+            "retrieved_evidence_count_at_10": self.retrieved_evidence_count_at_10,
+        }
+        if result["evidence_item_count"] != result["resolved_evidence_item_count"] + result["unresolved_evidence_item_count"]:
+            raise CustodyError("metric_denominator_identity_invalid")
+        result["evidence_micro_recall_at_10"] = result["retrieved_evidence_count_at_10"] / result["evidence_item_count"]
+        return result
+
+
+class _SplitAccumulator:
+    def __init__(self) -> None:
+        self.metrics = _MetricAccumulator()
+        self.personas: dict[str, _MetricAccumulator] = {}
+
+    def add(self, row: Mapping[str, Any]) -> None:
+        metrics = row["metrics"]
+        self.metrics.add(metrics)
+        persona = row["persona_id"]
+        self.personas.setdefault(persona, _MetricAccumulator()).add(metrics)
+
+    def summary(self) -> dict[str, Any]:
+        if not self.metrics.count or not self.personas:
+            raise CustodyError("metric_denominator_zero")
+        persona_macro = {
+            key: _mean([acc.metric_sums[key] / acc.count for acc in self.personas.values()])
+            for key in _METRIC_KEYS
+        }
+        return {"question_macro": self.metrics.metric_summary(), "persona_macro": {"persona_count": len(self.personas), **persona_macro}}
+
+
+class _ReplicaAccumulator:
+    def __init__(self) -> None:
+        self.positive = _SplitAccumulator()
+        self.exact: dict[str, _SplitAccumulator] = {
+            group: _SplitAccumulator() for group, endpoint in UPSTREAM_GROUPS.items() if endpoint == "positive"
+        }
+        self.derived = _SplitAccumulator()
+        self.hits = 0
+        self.count = 0
+
+    def add(self, row: Mapping[str, Any]) -> None:
+        if row["endpoint"] != "positive":
+            return
+        self.positive.add(row); self.exact[row["directory_group"]].add(row); self.count += 1
+        self.hits += int(bool(row["evidence_conversation_hit"]))
+        if row["directory_group"] in {"changing_evidence", "implicit_connection_evidence"}:
+            self.derived.add(row)
+
+
+class _ArmAccumulator:
+    """Compact result state; no query rows are retained in Python."""
+
+    def __init__(self, arm_id: str, *, original_replicates: Sequence[Mapping[str, Any]] = ()) -> None:
+        self.arm_id = arm_id
+        self.original_replicates = list(original_replicates)
+        self.positive = _SplitAccumulator()
+        self.exact: dict[str, _SplitAccumulator] = {
+            group: _SplitAccumulator() for group, endpoint in UPSTREAM_GROUPS.items() if endpoint == "positive"
+        }
+        self.contexts: dict[int, tuple[_SplitAccumulator, dict[str, int], dict[str, int]]] = {}
+        self.derived = _SplitAccumulator()
+        self.persona_recall: dict[str, dict[str, list[float | int]]] = {"overall_positive": {}, "derived_hard_changing_and_implicit": {}}
+        self.persona_replica_recall: dict[str, dict[str, list[list[float | int]]]] = {"overall_positive": {}, "derived_hard_changing_and_implicit": {}}
+        self.replica_accumulators = [_ReplicaAccumulator() for _ in range(5)] if self.arm_id == "original_public_product" else []
+        self.positive_item_count = 0
+        self.retrieved_relevant_conversation_count = 0
+
+    def _add_persona_recall(self, subset: str, row: Mapping[str, Any]) -> None:
+        entry = self.persona_recall[subset].setdefault(row["persona_id"], [0.0, 0])
+        entry[0] += float(row["metrics"]["recall_at_10"]); entry[1] += 1
+        if self.arm_id == "original_public_product":
+            replicas = row.get("replicate_metrics")
+            if not isinstance(replicas, list) or len(replicas) != 5:
+                raise CustodyError("original_replicate_metric_invalid")
+            replica_entries = self.persona_replica_recall[subset].setdefault(row["persona_id"], [[0.0, 0] for _ in range(5)])
+            for number, metrics in enumerate(replicas):
+                replica_entries[number][0] += float(metrics["recall_at_10"])
+                replica_entries[number][1] += 1
+
+    def add(self, row: Mapping[str, Any], *, confidence: float | None, confidence_db: _ScoringDB) -> None:
+        if confidence is None:
+            confidence_db.connection.execute(
+                "INSERT INTO confidence VALUES (?, ?, ?, ?, ?)",
+                (self.arm_id, row["persona_id"], int(row["declared_context_size"]), 0.0, 0),
+            )
+        else:
+            confidence_db.connection.execute(
+                "INSERT INTO confidence VALUES (?, ?, ?, ?, ?)",
+                (self.arm_id, row["persona_id"], int(row["declared_context_size"]), float(confidence), 1 if row["endpoint"] == "positive" else 0),
+            )
+        if row["endpoint"] != "positive":
+            return
+        self.positive_item_count += 1
+        self.retrieved_relevant_conversation_count += int(bool(row["evidence_conversation_hit"]))
+        self.positive.add(row); self.exact[row["directory_group"]].add(row)
+        self._add_persona_recall("overall_positive", row)
+        context = int(row["declared_context_size"])
+        context_acc, conv_dist, msg_dist = self.contexts.setdefault(context, (_SplitAccumulator(), {"min": 10**18, "max": 0, "sum": 0, "count": 0}, {"min": 10**18, "max": 0, "sum": 0, "count": 0}))
+        context_acc.add(row)
+        for key, name in (("actual_conversation_count", "conv"), ("actual_message_count", "msg")):
+            target = conv_dist if name == "conv" else msg_dist
+            value = int(row[key]); target["min"] = min(target["min"], value); target["max"] = max(target["max"], value); target["sum"] += value; target["count"] += 1
+        if row["directory_group"] in {"changing_evidence", "implicit_connection_evidence"}:
+            self.derived.add(row); self._add_persona_recall("derived_hard_changing_and_implicit", row)
+
+    def _distribution(self, values: Mapping[str, int]) -> dict[str, float | int]:
+        if values["count"] <= 0: raise CustodyError("metric_denominator_zero")
+        return {"min": values["min"], "max": values["max"], "mean": values["sum"] / values["count"]}
+
+    def result(self) -> dict[str, Any]:
+        contexts = {}
+        for context in sorted(self.contexts):
+            acc, conv_dist, msg_dist = self.contexts[context]
+            summary = acc.summary()
+            contexts[str(context)] = {"declared_context_size": context, "actual_conversation_count": self._distribution(conv_dist), "actual_message_count": self._distribution(msg_dist), **summary}
+        diagnostic = {
+            "not_official_primary": True,
+            "positive_item_count": self.positive_item_count,
+            "retrieved_relevant_conversation_count": self.retrieved_relevant_conversation_count,
+            "total_relevant_conversation_item_count": self.positive_item_count,
+            "recall": self.retrieved_relevant_conversation_count / self.positive_item_count,
+        }
+        result = {
+            "positive": {
+                "overall": self.positive.summary(),
+                "by_exact_group": {group: self.exact[group].summary() for group in self.exact},
+                "by_declared_context": contexts,
+                "derived_hard_changing_and_implicit": {"derived": True, **self.derived.summary()},
+            },
+            "confidence_separability": None,
+            "official_style_evidence_conversation_diagnostic": diagnostic,
+        }
+        if self.arm_id == "original_public_product":
+            replica_stats = []
+            for number, receipt in enumerate(self.original_replicates):
+                # Replica summaries are populated by the per-replica accumulators
+                # in ``score_frozen`` and attached after this compact result.
+                replica_stats.append({"replicate_index": number, "build_id": receipt["build_id"], "index_sha256": receipt["index_sha256"]})
+            result["original_replicates"] = replica_stats
+        return result
+
+
+def _confidence_query(arm_id: str, persona: str | None, context: int, *, order: str = "") -> tuple[str, tuple[Any, ...]]:
+    clauses = ["arm_id=?", "declared_context_size=?"]
+    params: list[Any] = [arm_id, context]
+    if persona is not None:
+        clauses.insert(1, "persona_id=?"); params.insert(1, persona)
+    return f"SELECT confidence, label FROM confidence WHERE {' AND '.join(clauses)}{order}", tuple(params)
+
+
+def _stream_auroc_ap(connection: sqlite3.Connection, arm_id: str, persona: str | None, context: int) -> tuple[float, float]:
+    query, params = _confidence_query(arm_id, persona, context, order=" ORDER BY confidence ASC")
+    rows = connection.execute(query, params)
+    total = positives = negatives = 0
+    auroc_wins = 0.0
+    # Ascending score groups permit exact tie handling with O(1) Python memory.
+    pending_score: float | None = None; pending_positive = pending_negative = 0
+    negatives_before = 0
+    for confidence, label in rows:
+        confidence = float(confidence); label = int(label)
+        if pending_score is None or confidence == pending_score:
+            pending_score = confidence; pending_positive += label; pending_negative += 1 - label
+            continue
+        auroc_wins += pending_positive * (negatives_before + 0.5 * pending_negative)
+        negatives_before += pending_negative; positives += pending_positive; negatives += pending_negative; total += pending_positive + pending_negative
+        pending_score = confidence; pending_positive = label; pending_negative = 1 - label
+    if pending_score is not None:
+        auroc_wins += pending_positive * (negatives_before + 0.5 * pending_negative)
+        positives += pending_positive; negatives += pending_negative; total += pending_positive + pending_negative
+    if not total or positives <= 0 or negatives <= 0:
+        raise CustodyError("confidence_stratum_class_missing")
+    # AP follows the legacy tie-group denominator exactly, with descending scores.
+    query, params = _confidence_query(arm_id, persona, context, order=" ORDER BY confidence DESC")
+    ap_rows = connection.execute(query, params)
+    positive_total = sum(int(label) for _confidence, label in ap_rows)
+    if positive_total <= 0 or positive_total >= total:
+        raise CustodyError("confidence_stratum_class_missing")
+    ap_rows = connection.execute(query, params)
+    index = hit = 0; ap = 0.0; pending_score = None; group_positive = group_size = 0
+    for confidence, label in ap_rows:
+        confidence = float(confidence); label = int(label)
+        if pending_score is None or confidence == pending_score:
+            pending_score = confidence; group_positive += label; group_size += 1
+            continue
+        index += group_size; hit += group_positive; ap += (group_positive / positive_total) * (hit / index)
+        pending_score = confidence; group_positive = label; group_size = 1
+    if pending_score is not None:
+        index += group_size; hit += group_positive; ap += (group_positive / positive_total) * (hit / index)
+    return auroc_wins / (positives * negatives), ap
+
+
+def _confidence_from_db(connection: sqlite3.Connection, arm_id: str, *, available: bool) -> dict[str, Any]:
+    if not available:
+        return {"available": False, "reason": "arm_has_no_frozen_comparable_confidence_contract", "by_declared_context": {}}
+    strata = connection.execute(
+        "SELECT DISTINCT persona_id, declared_context_size FROM confidence WHERE arm_id=? ORDER BY persona_id, declared_context_size",
+        (arm_id,),
+    )
+    detail: dict[str, list[tuple[str, float, float, int, int]]] = defaultdict(list)
+    for persona, context in strata:
+        auroc, ap = _stream_auroc_ap(connection, arm_id, str(persona), int(context))
+        item_count, positive_count = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(label), 0) FROM confidence WHERE arm_id=? AND persona_id=? AND declared_context_size=?",
+            (arm_id, persona, context),
+        ).fetchone()
+        detail[str(context)].append((str(persona), auroc, ap, int(item_count), int(positive_count)))
+    output = {}
+    for context, entries in sorted(detail.items(), key=lambda row: int(row[0])):
+        item_count = sum(entry[3] for entry in entries); positive_count = sum(entry[4] for entry in entries)
+        # The legacy report is context-level, pooling all persona/context rows.
+        auroc, ap = _stream_auroc_ap(connection, arm_id, None, int(context))
+        output[context] = {"item_count": item_count, "positive_count": positive_count, "negative_count": item_count - positive_count, "auroc": auroc, "average_precision": ap}
+    return {"available": True, "reason": None, "by_declared_context": output}
+
+
 def _percentile(values: Sequence[float], point: float) -> float:
     values = sorted(values); position = (len(values) - 1) * point; lower = int(math.floor(position)); upper = int(math.ceil(position))
     return values[lower] + (values[upper] - values[lower]) * (position - lower)
@@ -290,6 +1281,68 @@ def _bootstrap(arm_rows: Mapping[str, Sequence[Mapping[str, Any]]], manifest: Ma
     return {"subset": subset, "metric": "positive_persona_macro_recall_at_10", "reference_arm": reference, "original_replicate_rule": manifest["bootstrap"]["original_replicate_rule"], "original_replicate_count": 5, "bootstrap_plan_sha256": plan_digest, "resamples": manifest["bootstrap"]["resamples"], "seed": manifest["bootstrap"]["seed"], "percentile_rule": "linear", "paired_deltas": output}
 
 
+def _state_persona_value(state: _ArmAccumulator, persona: str, subset: str, replicas: Sequence[int]) -> float:
+    if state.arm_id == "original_public_product":
+        entries = state.persona_replica_recall[subset].get(persona)
+        if entries is None:
+            raise CustodyError("bootstrap_persona_positive_missing")
+        values = [entries[index][0] / entries[index][1] for index in replicas if entries[index][1]]
+        if len(values) != len(replicas):
+            raise CustodyError("bootstrap_persona_positive_missing")
+        return _mean(values)
+    entry = state.persona_recall[subset].get(persona)
+    if entry is None or not entry[1]:
+        raise CustodyError("bootstrap_persona_positive_missing")
+    return float(entry[0]) / int(entry[1])
+
+
+def _bootstrap_states(states: Mapping[str, _ArmAccumulator], manifest: Mapping[str, Any], *, subset: str) -> dict[str, Any]:
+    positives = sorted({persona for state in states.values() for persona, entry in state.persona_recall[subset].items() if entry[1]})
+    if not positives:
+        raise CustodyError("positive_endpoint_missing")
+    reference = manifest["reference_arm"]; original = "original_public_product"; rng = random.Random(manifest["bootstrap"]["seed"])
+    plans = [([positives[rng.randrange(len(positives))] for _ in positives], [rng.randrange(5) for _ in range(5)]) for _ in range(manifest["bootstrap"]["resamples"])]
+    def macro(state: _ArmAccumulator, sample: Sequence[str], replicas: Sequence[int]) -> float:
+        return _mean([_state_persona_value(state, persona, subset, replicas if state.arm_id == original else ()) for persona in sample])
+    output: dict[str, Any] = {}
+    for challenger in sorted(states):
+        if challenger == original:
+            continue
+        comparison: dict[str, Any] = {}
+        for name, baseline in (("vs_original_public_product", original), ("vs_reference", reference)):
+            if challenger == baseline:
+                continue
+            deltas = [macro(states[challenger], sample, replicas) - macro(states[baseline], sample, replicas) for sample, replicas in plans]
+            replicas = list(range(5))
+            estimate = macro(states[challenger], positives, replicas) - macro(states[baseline], positives, replicas)
+            comparison[name] = {"estimate": estimate, "ci_lower": _percentile(deltas, manifest["bootstrap"]["percentile_lower"]), "ci_upper": _percentile(deltas, manifest["bootstrap"]["percentile_upper"]), "resample_count": len(deltas)}
+        if comparison:
+            output[challenger] = comparison
+    plan_digest = _d([{"persona_clusters": sample, "original_replicate_indices": replicas} for sample, replicas in plans])
+    return {"subset": subset, "metric": "positive_persona_macro_recall_at_10", "reference_arm": reference, "original_replicate_rule": manifest["bootstrap"]["original_replicate_rule"], "original_replicate_count": 5, "bootstrap_plan_sha256": plan_digest, "resamples": manifest["bootstrap"]["resamples"], "seed": manifest["bootstrap"]["seed"], "percentile_rule": "linear", "paired_deltas": output}
+
+
+def _confidence_nonregression_states(states: Mapping[str, _ArmAccumulator], manifest: Mapping[str, Any], db: _ScoringDB) -> dict[str, Any]:
+    raw, p5 = states["strong_raw"], states["static_p5"]
+    def strata(arm_id: str) -> dict[tuple[str, int], tuple[float, float]]:
+        output: dict[tuple[str, int], tuple[float, float]] = {}
+        for persona, context in db.connection.execute("SELECT DISTINCT persona_id, declared_context_size FROM confidence WHERE arm_id=? ORDER BY persona_id, declared_context_size", (arm_id,)):
+            output[(str(persona), int(context))] = _stream_auroc_ap(db.connection, arm_id, str(persona), int(context))
+        return output
+    raw_values, p5_values = strata("strong_raw"), strata("static_p5")
+    if set(raw_values) != set(p5_values) or not raw_values:
+        raise CustodyError("confidence_pairing_invalid")
+    personas = sorted({persona for persona, _context in raw_values}); rng = random.Random(manifest["bootstrap"]["seed"])
+    def macro(values: Mapping[tuple[str, int], tuple[float, float]], sampled: Sequence[str], index: int) -> float:
+        return _mean([_mean([pair[index] for (persona, _), pair in values.items() if persona == sample]) for sample in sampled])
+    result = {}
+    for index, name in enumerate(("auroc", "average_precision")):
+        draws = [[personas[rng.randrange(len(personas))] for _ in personas] for _ in range(manifest["bootstrap"]["resamples"])]
+        deltas = [macro(p5_values, draw, index) - macro(raw_values, draw, index) for draw in draws]
+        result[name] = {"pre_registered_scalar": name, "estimate": macro(p5_values, personas, index) - macro(raw_values, personas, index), "ci_lower": _percentile(deltas, manifest["bootstrap"]["percentile_lower"]), "ci_upper": _percentile(deltas, manifest["bootstrap"]["percentile_upper"]), "resample_count": len(deltas)}
+    return {"comparison": "static_p5_vs_strong_raw", "unit": "paired_persona_by_declared_context", "metrics": result}
+
+
 def _confidence_nonregression(arm_rows: Mapping[str, Sequence[Mapping[str, Any]]], manifest: Mapping[str, Any]) -> dict[str, Any]:
     raw, p5 = arm_rows["strong_raw"], arm_rows["static_p5"]
     def strata(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, int], tuple[float, float]]:
@@ -321,64 +1374,224 @@ def _artifact_rows(artifact: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def score_frozen(*, projection: Any, endpoint_manifest: Any, ranking_artifacts: Sequence[Any], custody_loader: Callable[[], Any], evidence_token_secret: bytes, formal_live: bool | None = None) -> dict[str, Any]:
-    projection = validate_candidate_projection(projection); manifest = validate_endpoint_manifest(endpoint_manifest, projection_sha256=_d(projection))
-    # This complete public validation is intentionally before the first custody call.
-    artifacts = [validate_ranking_artifact(artifact, projection=projection, manifest=manifest) for artifact in ranking_artifacts]
-    if len(artifacts) != len(manifest["arms"]) or {artifact["arm_id"] for artifact in artifacts} != {arm["arm_id"] for arm in manifest["arms"]}: raise CustodyError("ranking_arm_set_invalid")
-    # Execution mode is supplied by the custody boundary when available.  The
-    # endpoint manifest is a public scientific artifact, not authorization to
-    # reinterpret a rehearsal process as a live formal run.
+def _validate_stream_row(row: Mapping[str, Any], *, arm_id: str, item: Mapping[str, Any], corpus: Mapping[str, Any]) -> tuple[list[str], list[str], float | None]:
+    required = {"item_id", "query_sha256", "candidate_input_sha256", "ranked_message_ids", "retrieved_conversation_ids", "confidence", "confidence_receipt"}
+    if not required <= set(row) or (arm_id != "original_public_product" and set(row) != required) or row.get("item_id") != item.get("item_id"):
+        raise CustodyError("ranking_artifact_stream_row_invalid")
+    if row.get("query_sha256") != hashlib.sha256(str(item["query_text"]).encode("utf-8")).hexdigest():
+        raise CustodyError("ranking_query_digest_invalid")
+    expected_serializer = ORIGINAL_MEMPALACE_SERIALIZER if arm_id == "original_public_product" else CURRENT_SERIALIZER
+    expected_candidate = _d({"serializer": expected_serializer, "corpus_id": corpus["corpus_id"], "candidates": corpus["candidates"]})
+    if row.get("candidate_input_sha256") != expected_candidate:
+        raise CustodyError("ranking_candidate_input_digest_invalid")
+    ids = row.get("ranked_message_ids"); conversations = row.get("retrieved_conversation_ids")
+    if not isinstance(ids, list) or not isinstance(conversations, list) or len(ids) != len(set(ids)) or len(ids) > 10 or len(conversations) != len(set(conversations)):
+        raise CustodyError("ranking_top10_invalid")
+    allowed = {candidate["message_id"]: candidate["opaque_conversation_id"] for candidate in corpus["candidates"]}
+    if any(not isinstance(value, str) or value not in allowed for value in ids):
+        raise CustodyError("ranking_top10_invalid")
+    expected_conversations = list(dict.fromkeys(allowed[value] for value in ids))
+    if conversations != expected_conversations:
+        raise CustodyError("ranking_conversations_invalid")
+    confidence = row.get("confidence")
+    if arm_id == "original_public_product":
+        if confidence is not None or row.get("confidence_receipt") is not None:
+            raise CustodyError("ranking_confidence_contract_invalid")
+        return ids, conversations, None
+    if confidence is None or not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= float(confidence) <= 1:
+        raise CustodyError("ranking_confidence_invalid")
+    receipt = row.get("confidence_receipt")
+    if not isinstance(receipt, Mapping) or set(receipt) != {"contract", "top_two_scores"} or receipt.get("contract") != CONFIDENCE_CONTRACT:
+        raise CustodyError("ranking_confidence_receipt_invalid")
+    return ids, conversations, float(confidence)
+
+
+def score_frozen(
+    *, projection: Any, endpoint_manifest: Any, ranking_artifacts: Sequence[Any],
+    evidence_token_secret: bytes, custody_loader: Callable[[], Any] | None = None,
+    formal_live: bool | None = None, custody_store: Any = None,
+    mapping_ledger_path: Path | str | None = None,
+) -> dict[str, Any]:
+    formal_hint = formal_live is True or (
+        formal_live is None and isinstance(endpoint_manifest, Mapping)
+        and endpoint_manifest.get("synthetic_test_mode") is False
+    )
+    if formal_hint and not isinstance(projection, CandidateProjectionStore):
+        raise CustodyError("scoring_formal_projection_store_required")
+    if custody_loader is not None and custody_store is not None:
+        raise CustodyError("scoring_custody_source_ambiguous")
+    access = _ProjectionAccess(projection)
+    manifest = validate_endpoint_manifest(endpoint_manifest, projection_sha256=access.digest)
     if formal_live is None:
         formal_live = manifest["synthetic_test_mode"] is False
     if not isinstance(formal_live, bool):
         raise CustodyError("scoring_execution_mode_invalid")
-    mappings, ledger, groups, evidence_conversations = _map(
-        projection, custody_loader(), evidence_token_secret,
-        formal_live=formal_live,
-    )
-    corpora = {row["corpus_id"]: row for row in projection["corpora"]}; items = {row["item_id"]: row for row in projection["items"]}; arms = {}; rows_by_arm = {}
-    for artifact in artifacts:
-        arm_id = artifact["arm_id"]; ranked = {row["item_id"]: row for row in _artifact_rows(artifact)}; rows = []
-        for item_id, item in items.items():
-            source = ranked[item_id]; corpus = corpora[item["corpus_id"]]; group = groups[item_id]; endpoint = UPSTREAM_GROUPS[group]
-            row = {"item_id": item_id, "persona_id": item["persona_id"], "declared_context_size": corpus["declared_context_size"], "actual_conversation_count": corpus["actual_conversation_count"], "actual_message_count": corpus["actual_message_count"], "directory_group": group, "endpoint": endpoint, "confidence": source["confidence"], "evidence_conversation_hit": bool(set(source["retrieved_conversation_ids"]) & set(evidence_conversations[item_id]))}
-            if endpoint == "positive":
-                if arm_id == "original_public_product":
-                    replicas = source["replicate_ranked_message_ids"]; metric_rows = [question_metrics(ids, mappings[item_id]) for ids in replicas]
-                    row["metrics"] = {key: _mean([float(metrics[key]) for metrics in metric_rows]) for key in _METRIC_KEYS}
-                    for key in ("evidence_item_count", "resolved_evidence_item_count", "unresolved_evidence_item_count"):
-                        row["metrics"][key] = metric_rows[0][key]
-                    row["metrics"]["retrieved_evidence_count_at_10"] = _mean([float(metrics["retrieved_evidence_count_at_10"]) for metrics in metric_rows])
-                    row["replicate_metrics"] = metric_rows
-                    row["replicate_evidence_conversation_hits"] = [bool(set(conversations) & set(evidence_conversations[item_id])) for conversations in source["replicate_retrieved_conversation_ids"]]
-                else: row["metrics"] = question_metrics(source["ranked_message_ids"], mappings[item_id])
-            rows.append(row)
-        positives = [row for row in rows if row["endpoint"] == "positive"]
-        if not positives: raise CustodyError("positive_endpoint_missing")
-        exact = {group: _summary([row for row in positives if row["directory_group"] == group]) for group in UPSTREAM_GROUPS if UPSTREAM_GROUPS[group] == "positive"}
-        contexts = {str(context): _context_summary(context, [row for row in positives if row["declared_context_size"] == context]) for context in sorted({row["declared_context_size"] for row in positives})}
-        derived_rows = [row for row in positives if row["directory_group"] in {"changing_evidence", "implicit_connection_evidence"}]
-        arm_contract = next(item["confidence_contract"] for item in manifest["arms"] if item["arm_id"] == arm_id)
-        diagnostic_rows = positives
-        diagnostic_value = {"not_official_primary": True, "positive_item_count": len(diagnostic_rows), "retrieved_relevant_conversation_count": sum(row["evidence_conversation_hit"] for row in diagnostic_rows), "total_relevant_conversation_item_count": len(diagnostic_rows), "recall": _mean([float(row["evidence_conversation_hit"]) for row in diagnostic_rows])}
-        arm_result = {"positive": {"overall": _summary(positives), "by_exact_group": exact, "by_declared_context": contexts, "derived_hard_changing_and_implicit": {"derived": True, **_summary(derived_rows)}}, "confidence_separability": _confidence(rows, available=arm_contract == CONFIDENCE_CONTRACT), "official_style_evidence_conversation_diagnostic": diagnostic_value}
-        if arm_id == "original_public_product":
-            replicate_stats = []
-            for number in range(5):
-                replica_rows = [{**row, "metrics": row["replicate_metrics"][number], "evidence_conversation_hit": row["replicate_evidence_conversation_hits"][number]} for row in positives]
-                replica_hard = [row for row in replica_rows if row["directory_group"] in {"changing_evidence", "implicit_connection_evidence"}]
-                receipt = artifact["replicates"][number]
-                replicate_stats.append({"replicate_index": number, "build_id": receipt["build_id"], "index_sha256": receipt["index_sha256"], "overall_positive": _summary(replica_rows), "by_exact_group": {group: _summary([row for row in replica_rows if row["directory_group"] == group]) for group in UPSTREAM_GROUPS if UPSTREAM_GROUPS[group] == "positive"}, "derived_hard_changing_and_implicit": _summary(replica_hard), "official_style_evidence_conversation_diagnostic": {"positive_item_count": len(replica_rows), "retrieved_relevant_conversation_count": sum(row["evidence_conversation_hit"] for row in replica_rows), "total_relevant_conversation_item_count": len(replica_rows), "recall": _mean([float(row["evidence_conversation_hit"]) for row in replica_rows])}})
-            # The public aggregate is over all 5 frozen outputs, never replica 0.
-            all_replica_rows = [{**row, "evidence_conversation_hit": row["replicate_evidence_conversation_hits"][number]} for number in range(5) for row in positives]
-            arm_result["official_style_evidence_conversation_diagnostic"] = {"not_official_primary": True, "positive_item_count": len(all_replica_rows), "retrieved_relevant_conversation_count": sum(row["evidence_conversation_hit"] for row in all_replica_rows), "total_relevant_conversation_item_count": len(all_replica_rows), "recall": _mean([float(row["evidence_conversation_hit"]) for row in all_replica_rows])}
-            arm_result["original_replicates"] = replicate_stats
-        arms[arm_id] = arm_result
-        rows_by_arm[arm_id] = rows
-    hard_rows = {arm: [row for row in rows if row["endpoint"] == "positive" and row["directory_group"] in {"changing_evidence", "implicit_connection_evidence"}] for arm, rows in rows_by_arm.items()}
-    report = {"schema": SCHEMA, "projection_sha256": _d(projection), "endpoint_manifest_sha256": manifest["manifest_sha256"], "endpoint_manifest": manifest, "protocol": {"synthetic_test_mode": manifest["synthetic_test_mode"], "arm_registry": [arm["arm_id"] for arm in manifest["arms"]], "reference_arm": manifest["reference_arm"], "bootstrap": manifest["bootstrap"]}, "ranking_artifact_sha256": {artifact["arm_id"]: artifact["artifact_sha256"] for artifact in artifacts}, "mapping_ledger": ledger, "arms": arms, "paired_bootstrap": {"overall_positive": _bootstrap(rows_by_arm, manifest, subset="overall_positive"), "derived_hard_changing_and_implicit": _bootstrap(hard_rows, manifest, subset="derived_hard_changing_and_implicit"), "static_p5_vs_strong_raw_abstention_confidence": _confidence_nonregression(rows_by_arm, manifest)}}
-    report["report_sha256"] = report_digest(report); return validate_report(report)
+    if formal_live and access.store is None:
+        raise CustodyError("scoring_formal_projection_store_required")
+    if formal_live:
+        for artifact in ranking_artifacts:
+            if not isinstance(artifact, Mapping) or artifact.get("schema") not in {
+                RANKING_ARTIFACT_REFERENCE_SCHEMA,
+                "aerp7-original-product-artifact-reference-v1",
+            }:
+                raise CustodyError("scoring_formal_artifact_reference_required")
+    # Validate every public artifact/reference before custody is opened.
+    readers = [_ArtifactReader(artifact, projection_digest=access.digest, projection=access.inline) for artifact in ranking_artifacts]
+    if len(readers) != len(manifest["arms"]) or {reader.arm_id for reader in readers} != {arm["arm_id"] for arm in manifest["arms"]}:
+        raise CustodyError("ranking_arm_set_invalid")
+    for reader in readers:
+        arm = next(item for item in manifest["arms"] if item["arm_id"] == reader.arm_id)
+        if arm["ranking_artifact_sha256"] != reader.artifact_sha256:
+            raise CustodyError("ranking_arm_manifest_binding_invalid")
+        if access.reference is not None:
+            if reader.reference is not None and reader.reference.get("generation_id") != access.reference["generation_id"]:
+                raise CustodyError("ranking_artifact_generation_invalid")
+            if reader._original_refs and any(ref.get("candidate_reference") != access.reference for ref in reader._original_refs):
+                raise CustodyError("original_replicate_candidate_binding_invalid")
+        elif reader._original_refs and any(
+            ref.get("candidate_reference", {}).get("projection_canonical_sha256") != access.digest
+            for ref in reader._original_refs
+        ):
+            raise CustodyError("original_replicate_projection_binding_invalid")
+        expected = CONFIDENCE_CONTRACT if reader.arm_id in CURRENT_ARMS else None
+        if arm["confidence_contract"] != expected:
+            raise CustodyError("ranking_confidence_manifest_invalid")
+    store_active = False
+    if access.store is not None:
+        access.store.begin_run(); store_active = True
+    ledger_sidecar_created = False
+    ledger_sidecar_path: Path | None = None
+    ledger_sidecar_ready_path: Path | None = None
+    try:
+        with _ScoringDB() as db:
+            _prepare_projection_items(access, db)
+            for reader in readers:
+                reader.preflight(access, db)
+            if formal_live and custody_store is None:
+                # Formal scoring receives the already-authorized capability
+                # explicitly.  A loader callback is retained only for the
+                # small legacy fixtures; allowing it in the formal lane would
+                # make it too easy to reintroduce the full JSON custody path.
+                raise CustodyError("scoring_formal_custody_store_required")
+            if formal_live and custody_loader is not None:
+                raise CustodyError("scoring_formal_custody_store_required")
+            if custody_store is not None:
+                custody_source = custody_store
+            elif custody_loader is not None:
+                custody_source = custody_loader()
+            else:
+                raise CustodyError("scoring_custody_source_missing")
+            if formal_live and not _is_custody_store(custody_source):
+                raise CustodyError("scoring_formal_custody_store_required")
+            custody_index = _prepare_custody(access, custody_source, evidence_token_secret, formal_live=formal_live, db=db)
+            states: dict[str, _ArmAccumulator] = {}
+            for reader in readers:
+                state = _ArmAccumulator(reader.arm_id, original_replicates=reader.original_replicates())
+                seen = 0
+                for source in reader.iter_rows():
+                    item_id = source.get("item_id")
+                    if not isinstance(item_id, str):
+                        raise CustodyError("ranking_artifact_stream_row_invalid")
+                    try:
+                        db.connection.execute("INSERT INTO artifact_seen VALUES (?, ?)", (reader.arm_id, item_id))
+                    except sqlite3.IntegrityError as exc:
+                        raise CustodyError("ranking_item_duplicate") from exc
+                    item_row = db.connection.execute("SELECT persona_id, corpus_id, declared_context_size, actual_conversation_count, actual_message_count, query_text FROM projection_items WHERE item_id=?", (item_id,)).fetchone()
+                    if item_row is None:
+                        raise CustodyError("ranking_item_coverage_invalid")
+                    item = {"item_id": item_id, "persona_id": str(item_row[0]), "corpus_id": str(item_row[1]), "query_text": str(item_row[5])}
+                    corpus = access.corpus(str(item_row[1]))
+                    group, evidence_conversations, mappings = custody_index.get(item_id)
+                    endpoint = UPSTREAM_GROUPS[group]
+                    ids, retrieved_conversations, confidence = _validate_stream_row(source, arm_id=reader.arm_id, item=item, corpus=corpus)
+                    row = {"item_id": item_id, "persona_id": str(item_row[0]), "declared_context_size": int(item_row[2]), "actual_conversation_count": int(item_row[3]), "actual_message_count": int(item_row[4]), "directory_group": group, "endpoint": endpoint, "confidence": confidence, "evidence_conversation_hit": bool(set(retrieved_conversations) & set(evidence_conversations))}
+                    if endpoint == "positive":
+                        if reader.arm_id == "original_public_product":
+                            replica_ids = source.get("replicate_ranked_message_ids")
+                            replica_conversations = source.get("replicate_retrieved_conversation_ids")
+                            if not isinstance(replica_ids, list) or len(replica_ids) != 5 or not isinstance(replica_conversations, list) or len(replica_conversations) != 5:
+                                raise CustodyError("original_replicate_metric_invalid")
+                            for replica_number, (replica_ranked, replica_retrieved) in enumerate(zip(replica_ids, replica_conversations, strict=True)):
+                                replica_source = {**source, "ranked_message_ids": replica_ranked, "retrieved_conversation_ids": replica_retrieved, "confidence": None, "confidence_receipt": None}
+                                _validate_stream_row(replica_source, arm_id=reader.arm_id, item=item, corpus=corpus)
+                            metric_rows = [question_metrics(replica, mappings) for replica in replica_ids]
+                            row["metrics"] = {key: _mean([float(metrics[key]) for metrics in metric_rows]) for key in _METRIC_KEYS}
+                            for key in ("evidence_item_count", "resolved_evidence_item_count", "unresolved_evidence_item_count"):
+                                row["metrics"][key] = metric_rows[0][key]
+                            row["metrics"]["retrieved_evidence_count_at_10"] = _mean([float(metrics["retrieved_evidence_count_at_10"]) for metrics in metric_rows])
+                            row["replicate_metrics"] = metric_rows
+                            row["replicate_evidence_conversation_hits"] = [bool(set(conversations) & set(evidence_conversations)) for conversations in replica_conversations]
+                            for number, metrics in enumerate(metric_rows):
+                                replica_row = {**row, "metrics": metrics, "evidence_conversation_hit": row["replicate_evidence_conversation_hits"][number]}
+                                state.replica_accumulators[number].add(replica_row)
+                        else:
+                            row["metrics"] = question_metrics(ids, mappings)
+                    state.add(row, confidence=confidence, confidence_db=db)
+                    seen += 1
+                count = db.connection.execute("SELECT COUNT(*) FROM artifact_seen WHERE arm_id=?", (reader.arm_id,)).fetchone()[0]
+                if count != access.query_count or seen != access.query_count:
+                    raise CustodyError("ranking_item_coverage_invalid")
+                states[reader.arm_id] = state
+            db.connection.commit()
+            arms: dict[str, Any] = {}
+            for reader in readers:
+                state = states[reader.arm_id]
+                arm_contract = next(item["confidence_contract"] for item in manifest["arms"] if item["arm_id"] == reader.arm_id)
+                arm_result = state.result()
+                arm_result["confidence_separability"] = _confidence_from_db(db.connection, reader.arm_id, available=arm_contract == CONFIDENCE_CONTRACT)
+                if reader.arm_id == "original_public_product":
+                    replica_stats = []
+                    for number, receipt in enumerate(state.original_replicates):
+                        replica = state.replica_accumulators[number]
+                        replica_stats.append({"replicate_index": number, "build_id": receipt["build_id"], "index_sha256": receipt["index_sha256"], "overall_positive": replica.positive.summary(), "by_exact_group": {group: replica.exact[group].summary() for group in replica.exact}, "derived_hard_changing_and_implicit": replica.derived.summary(), "official_style_evidence_conversation_diagnostic": {"positive_item_count": replica.count, "retrieved_relevant_conversation_count": replica.hits, "total_relevant_conversation_item_count": replica.count, "recall": replica.hits / replica.count}})
+                    arm_result["original_replicates"] = replica_stats
+                    total = sum(replica.count for replica in state.replica_accumulators); hits = sum(replica.hits for replica in state.replica_accumulators)
+                    arm_result["official_style_evidence_conversation_diagnostic"] = {"not_official_primary": True, "positive_item_count": total, "retrieved_relevant_conversation_count": hits, "total_relevant_conversation_item_count": total, "recall": hits / total}
+                arms[reader.arm_id] = arm_result
+            # A CustodyStore opened for a legacy inline/rehearsal projection
+            # owns an ephemeral directory which the caller is allowed to
+            # close immediately after scoring.  Keeping a report reference to
+            # that directory would make the just-produced report unverifiable
+            # at the next gate.  Persist a sidecar only for the formal/store
+            # projection lane; the small inline compatibility lane retains its
+            # legacy in-report ledger.
+            external_ledger = formal_live or access.store is not None
+            if external_ledger:
+                if mapping_ledger_path is not None:
+                    requested_ledger_path = Path(mapping_ledger_path)
+                    if not requested_ledger_path.is_absolute():
+                        raise CustodyError("scoring_mapping_ledger_output_invalid")
+                    ledger_sidecar_path = requested_ledger_path.resolve()
+                elif access.store is not None:
+                    ledger_sidecar_path = access.store.database.with_name(access.store.database.stem + ".mapping-ledger.json")
+                else:
+                    ledger_sidecar_path = Path(custody_source.directory).resolve() / "mapping-ledger.json"
+                existed = ledger_sidecar_path.exists()
+                ledger_value = _write_mapping_ledger_reference(
+                    custody_index, path=ledger_sidecar_path, projection_digest=access.digest,
+                )
+                ledger_sidecar_created = not existed
+                ledger_sidecar_ready_path = Path(ledger_value["ready_path"])
+            else:
+                ledger_value = custody_index.legacy_ledger()
+            report = {"schema": SCHEMA, "projection_sha256": access.digest, "endpoint_manifest_sha256": manifest["manifest_sha256"], "endpoint_manifest": manifest, "protocol": {"synthetic_test_mode": manifest["synthetic_test_mode"], "arm_registry": [arm["arm_id"] for arm in manifest["arms"]], "reference_arm": manifest["reference_arm"], "bootstrap": manifest["bootstrap"]}, "ranking_artifact_sha256": {reader.arm_id: reader.artifact_sha256 for reader in readers}, "mapping_ledger": ledger_value, "arms": arms, "paired_bootstrap": {"overall_positive": _bootstrap_states(states, manifest, subset="overall_positive"), "derived_hard_changing_and_implicit": _bootstrap_states(states, manifest, subset="derived_hard_changing_and_implicit"), "static_p5_vs_strong_raw_abstention_confidence": _confidence_nonregression_states(states, manifest, db)}}
+            report["report_sha256"] = report_digest(report)
+            return validate_report(report)
+    except BaseException:
+        if ledger_sidecar_created and ledger_sidecar_path is not None:
+            try:
+                ledger_sidecar_path.unlink()
+            except FileNotFoundError:
+                pass
+        if ledger_sidecar_created and ledger_sidecar_ready_path is not None:
+            try:
+                ledger_sidecar_ready_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if store_active:
+            access.store.end_run()
 
 
 def validate_report(value: Any) -> dict[str, Any]:
@@ -406,11 +1619,13 @@ def validate_report(value: Any) -> dict[str, Any]:
     if protocol != {"synthetic_test_mode": manifest["synthetic_test_mode"], "arm_registry": [arm["arm_id"] for arm in manifest["arms"]], "reference_arm": manifest["reference_arm"], "bootstrap": manifest["bootstrap"]}: raise CustodyError("scoring_report_protocol_invalid")
     if not isinstance(row["ranking_artifact_sha256"], Mapping) or not row["ranking_artifact_sha256"] or not isinstance(row["arms"], Mapping) or set(row["ranking_artifact_sha256"]) != set(row["arms"]) or set(protocol["arm_registry"]) != set(row["arms"]): raise CustodyError("scoring_report_arm_schema_invalid")
     for digest in row["ranking_artifact_sha256"].values(): _h(digest, "scoring_report_digest_invalid")
-    for entry in _l(row["mapping_ledger"], "scoring_report_ledger_invalid"):
-        entry = _o(entry, "scoring_report_ledger_invalid")
-        if set(entry) != {"item_id", "evidence_token", "status"} or entry["status"] not in {"mapped", "unmatched", "ambiguous"}: raise CustodyError("scoring_report_ledger_invalid")
-        _h(entry["item_id"], "scoring_report_ledger_invalid"); _h(entry["evidence_token"], "scoring_report_ledger_invalid")
-    if len({(entry["item_id"], entry["evidence_token"]) for entry in row["mapping_ledger"]}) != len(row["mapping_ledger"]): raise CustodyError("scoring_report_ledger_duplicate")
+    ledger = row["mapping_ledger"]
+    if isinstance(ledger, Mapping) and ledger.get("schema") == MAPPING_LEDGER_REFERENCE_SCHEMA:
+        _validate_mapping_ledger_reference(ledger, projection_digest=row["projection_sha256"])
+    elif isinstance(ledger, list):
+        _validate_ledger_entries(ledger)
+    else:
+        raise CustodyError("scoring_report_ledger_invalid")
     metric_keys = {"item_count", "evidence_item_count", "resolved_evidence_item_count", "unresolved_evidence_item_count", "retrieved_evidence_count_at_10", "evidence_micro_recall_at_10", *_METRIC_KEYS}
     def metric_summary(summary: Any) -> None:
         summary = _o(summary, "scoring_report_metric_schema_invalid")

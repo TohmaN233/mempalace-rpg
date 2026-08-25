@@ -1,10 +1,12 @@
 import hashlib
 import hmac
+import json
 import os
 import time
 import runpy
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -35,7 +37,7 @@ def _authorization(protocol, output, receipt, capability=b"x" * 32, *, expires_a
 
 def _coordinator_inputs(tmp_path, monkeypatch):
     """Build a label-free synthetic execution only; never a custody fixture."""
-    fixture = runpy.run_path("tests/test_aerp7_convomem_formal.py")
+    fixture = runpy.run_path(str(Path(__file__).with_name("test_aerp7_convomem_formal.py")))
     projection = fixture["projection"]()
     candidate_root, _staging, candidate = fixture["bundle"](tmp_path, projection)
     protocol = fixture["protocol"](projection, candidate)
@@ -182,6 +184,149 @@ def test_exact_original_worker_packet_requires_cross_process_draft_and_coordinat
         )
 
 
+def test_original_coordinator_routes_stream_draft_to_persistent_reference_without_projection(tmp_path, monkeypatch):
+    """The formal original handoff must use the frozen stream API, not arrays."""
+    fixture = runpy.run_path(str(Path(__file__).with_name("test_aerp7_original_product.py")))
+    reference = fixture["candidate_reference_bundle"](tmp_path)
+    seams, _palace, _state = fixture["seams"]()
+    palace_path = tmp_path / "stream-palace"
+    draft = executor.original_product.run_original_public_replicate_streaming(
+        candidate_reference=reference, build_id="executor-stream-build",
+        collection_identity="executor-stream-collection", palace_path=palace_path,
+        observer=fixture["Observer"](), seams=seams, staging_parent=tmp_path,
+    )
+    real_stream_audit = executor.original_product.coordinator_reaudit_streaming_replicate
+    monkeypatch.setattr(
+        executor.original_product, "coordinator_reaudit_streaming_replicate",
+        lambda **kwargs: real_stream_audit(**kwargs, auditor=fixture["fake_auditor"]),
+    )
+    draft_path = tmp_path / "stream-draft.json"
+    draft_bytes = executor.original_product.serialize_worker_draft(draft)
+    draft_path.write_bytes(draft_bytes)
+    worker_ref = draft.replicate_without_coordinator_audit.as_reference()
+    packet = {
+        "schema": executor.FORMAL_ORIGINAL_PACKET_SCHEMA,
+        "execution_mode": "exact_public_product_worker_draft",
+        "draft_file_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+        "palace_path": str(palace_path.resolve()),
+        "resource_receipt": {"build_id": worker_ref["build_id"], "index_sha256": worker_ref["index_sha256"], "resource_sha256": _digest("worker-resource")},
+        "worker_execution_identity": {"original_python": str(Path(sys.executable).resolve()), "original_execution_policy_sha256": _digest("policy")},
+        "process_id": 123,
+        "packet_sha256": "",
+    }
+    packet["packet_sha256"] = _digest({key: item for key, item in packet.items() if key != "packet_sha256"})
+    completed, resource = executor.coordinator_reaudit_original_worker_packet(
+        packet=packet, draft_path=draft_path, palace_path=palace_path,
+        projection=None,
+    )
+    assert completed["schema"] == executor.original_product.ORIGINAL_REPLICATE_REFERENCE_SCHEMA
+    assert completed["state"] == "coordinator_complete"
+    assert completed["candidate_reference"] == reference
+    assert resource["index_sha256"] == completed["index_sha256"]
+    assert resource["resource_sha256"] == executor.formal.resource_digest(resource)
+
+
+def test_executor_publishes_five_persistent_original_refs_without_embedded_payload(tmp_path, monkeypatch):
+    """The executor artifact handoff must remain reference-only end to end."""
+    formal_fixture = runpy.run_path(str(Path(__file__).with_name("test_aerp7_convomem_formal.py")))
+    projection = formal_fixture["projection"]()
+    candidate_root, _staging, candidate = formal_fixture["bundle"](tmp_path, projection)
+    protocol = formal_fixture["protocol"](projection, candidate)
+    original_fixture = runpy.run_path(str(Path(__file__).with_name("test_aerp7_original_product.py")))
+    real_stream_audit = executor.original_product.coordinator_reaudit_streaming_replicate
+
+    def audit_with_fixture(**kwargs):
+        return real_stream_audit(**kwargs, auditor=original_fixture["fake_auditor"])
+
+    monkeypatch.setattr(
+        executor.original_product,
+        "coordinator_reaudit_streaming_replicate",
+        audit_with_fixture,
+    )
+    completed_refs = []
+    packets = []
+    for number in range(5):
+        seams, _palace, _state = original_fixture["seams"]()
+        palace_path = tmp_path / f"executor-original-palace-{number}"
+        draft = executor.original_product.run_original_public_replicate_streaming(
+            candidate_reference=candidate["candidate_reference"],
+            build_id=f"executor-persistent-build-{number}",
+            collection_identity=f"executor-persistent-collection-{number}",
+            palace_path=palace_path,
+            observer=original_fixture["Observer"](),
+            seams=seams,
+            staging_parent=tmp_path,
+        )
+        draft_path = tmp_path / f"executor-original-draft-{number}.json"
+        draft_bytes = executor.original_product.serialize_worker_draft(draft)
+        draft_path.write_bytes(draft_bytes)
+        worker_ref = draft.replicate_without_coordinator_audit.as_reference()
+        packet = {
+            "schema": executor.FORMAL_ORIGINAL_PACKET_SCHEMA,
+            "execution_mode": "exact_public_product_worker_draft",
+            "draft_file_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+            "palace_path": str(palace_path.resolve()),
+            "resource_receipt": {
+                "build_id": worker_ref["build_id"],
+                "index_sha256": worker_ref["index_sha256"],
+                "resource_sha256": _digest(["executor-persistent-resource", number]),
+            },
+            "worker_execution_identity": {
+                "original_python": str(Path(sys.executable).resolve()),
+                "original_execution_policy_sha256": _digest("executor-persistent-policy"),
+            },
+            "process_id": 10_000 + number,
+            "packet_sha256": "",
+        }
+        packet["packet_sha256"] = _digest({key: value for key, value in packet.items() if key != "packet_sha256"})
+        completed, resource = executor.coordinator_reaudit_original_worker_packet(
+            packet=packet,
+            draft_path=draft_path,
+            palace_path=palace_path,
+            projection=None,
+        )
+        assert resource["index_sha256"] == completed["index_sha256"]
+        completed_refs.append(completed)
+        packets.append({"packet": packet, "draft": json.loads(draft_bytes.decode("utf-8"))})
+
+    artifact = executor._publish_original_artifact_reference(
+        candidate_reference=candidate["candidate_reference"],
+        replicate_references=completed_refs,
+        model_receipt=protocol["model_receipt"],
+        code_receipt=protocol["original_code_receipt"],
+        artifact_path=tmp_path / "executor-original-artifact.json",
+        ready_path=tmp_path / "executor-original-artifact.READY.json",
+        projection=projection,
+        protocol=protocol,
+    )
+    assert artifact["schema"] == executor.original_product.ORIGINAL_ARTIFACT_REFERENCE_SCHEMA
+    assert artifact["replicate_count"] == 5
+    assert len(artifact["replicate_references"]) == 5
+    assert len({ref["build_id"] for ref in artifact["replicate_references"]}) == 5
+    assert all(ref["state"] == "coordinator_complete" for ref in artifact["replicate_references"])
+
+    forbidden = {"replicates", "rankings", "traces", "trace_receipt", "ledger"}
+
+    def assert_no_embedded_sequences(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                # A reference object under one of these names is allowed; a
+                # materialized list would be an embedded payload regression.
+                assert not (key in forbidden and isinstance(child, list))
+                assert_no_embedded_sequences(child)
+        elif isinstance(value, list):
+            for child in value:
+                assert_no_embedded_sequences(child)
+
+    artifact_payload = json.loads((tmp_path / "executor-original-artifact.json").read_text(encoding="utf-8"))
+    ready_payload = json.loads((tmp_path / "executor-original-artifact.READY.json").read_text(encoding="utf-8"))
+    assert_no_embedded_sequences(artifact_payload)
+    assert_no_embedded_sequences(ready_payload)
+    assert_no_embedded_sequences(packets)
+    assert all(set(ref) == executor.original_product._ORIGINAL_REPLICATE_REFERENCE_KEYS for ref in completed_refs)
+    assert all("rankings" not in ref and "trace_receipt" not in ref and "ledger" not in ref for ref in completed_refs)
+
+
 def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, monkeypatch):
     # Reuse the established candidate/protocol fixture without importing any
     # canonical or custody source; this test creates only label-free synthetic
@@ -205,6 +350,9 @@ def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, m
     assert execution[1]["artifact_file_sha256"] == execution[2]["artifact_file_sha256"]
     projection = runpy.run_path("tests/test_aerp7_convomem_formal.py")["projection"]()
     current_artifacts = [row for row in packet["ranking_artifacts"] if row["arm_id"] != "original_public_product"]
+    assert all(Path(row["artifact_path"]).parent == output.resolve() for row in current_artifacts)
+    assert all(Path(row["artifact_path"]).is_file() and Path(row["ready_path"]).is_file() for row in current_artifacts)
+    assert not (output / "public-candidate").exists()
     assert executor.formal.validate_current_execution_receipts(execution, current_worker_receipt=packet["current_worker_receipt"], protocol=packet["protocol"], projection=projection, resources=packet["resource_receipts"], ranking_artifacts=current_artifacts, supervisors=packet["supervisors"], allow_synthetic=True) == execution
     tampered = [dict(row) for row in execution]; tampered[0]["supervisor_sha256"] = "0" * 64; tampered[0]["execution_sha256"] = executor._digest({key: value for key, value in tampered[0].items() if key != "execution_sha256"})
     with pytest.raises(CustodyError, match="receipt_coverage_invalid"):
@@ -246,6 +394,10 @@ def test_formal_current_worker_uses_live_runner_without_synthetic_fallback(tmp_p
 
 def test_formal_public_config_omits_and_rejects_worker_isolation_attestation():
     assert "worker_isolation_attestation" not in executor.FORMAL_PUBLIC_CONFIG_KEYS
+    for keys in (executor.FORMAL_PUBLIC_CONFIG_KEYS, executor.FORMAL_CURRENT_CONFIG_KEYS, executor.FORMAL_ORIGINAL_CONFIG_KEYS):
+        assert "disk_preflight" not in keys
+        assert "disk_preflight_calibration" not in keys
+        assert "original_chroma_peak_bytes" not in keys
     config = {
         "schema": executor.FORMAL_SCHEMA, "synthetic_test_mode": False,
         "protocol_path": "protocol.json", "candidate_bundle": "candidate", "output_dir": "output",

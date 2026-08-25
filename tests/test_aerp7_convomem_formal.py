@@ -10,6 +10,7 @@ from benchmarks import aerp7_convomem_formal as formal
 from benchmarks import aerp7_convomem_rank as rank
 from benchmarks import aerp7_convomem_scoring as score
 from benchmarks import aerp7_convomem_confirmation as confirmation
+from benchmarks import aerp7_original_product as original_product
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256
 
 
@@ -40,10 +41,22 @@ def projection():
 
 def protocol(p, candidate=None):
     model, code = receipts()
-    candidate = candidate or {"generation_id": h("generation"), "ready_sha256": h("ready"), "projection_raw_sha256": h("raw"), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}
+    candidate = candidate or {
+        "generation_id": h("generation"), "ready_sha256": h("ready"),
+        "projection_raw_sha256": h("raw"), "projection_canonical_sha256": canonical_sha256(p),
+        "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"]),
+        "candidate_reference": {
+            "schema": confirmation.CANDIDATE_PROJECTION_REFERENCE_SCHEMA,
+            "bundle_path": str((Path.cwd() / "formal-protocol-candidate").resolve()),
+            "projection_path": "projection.json", "ready_path": "READY.json",
+            "generation_id": h("generation"), "projection_raw_sha256": h("raw"),
+            "projection_canonical_sha256": canonical_sha256(p), "dataset": dict(p["dataset"]),
+            "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"]),
+        },
+    }
     checkpoint = {"schema": "aerp7-execution-checkpoint-binding-v1", "expected_checkpoint_path": str((Path.cwd() / "synthetic-aerp8-checkpoint.json").resolve()), "checkpoint_sha256": h("checkpoint"), "driver_code_receipt": {"synthetic": True}, "original_execution_policy": {"synthetic": True}, "original_execution_policy_sha256": h("policy"), "current_code_receipt": code, "aerp8_validation_scope": "immutable_driver_sources_and_live_original_policy"}
     checkpoint["binding_sha256"] = formal._digest(checkpoint)
-    row = {"schema": formal.FORMAL_PROTOCOL_SCHEMA, "synthetic_test_mode": False, "candidate": candidate, "current_code_receipt": code, "original_code_receipt": code, "execution_checkpoint": checkpoint, "source_receipt": rank.PROTOCOL_SOURCE, "model_receipt": model, "arms": list(rank_score_arms()), "primary_current_arm": {"arm_id": "six_view_secondary", "config_sha256": formal._digest(rank._arm_method("six_view_secondary")), "ranker_code_sha256": formal._ranker_code_sha256()}, "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}, "top_k": 10, "tie_break": "stable_ranking_key_ascending", "original_build_count": 5, "p5_repeat_required": True, "bootstrap": score.FORMAL_BOOTSTRAP, "gates": {"primary_delta_min": .01, "primary_ci_lower_gt_zero": 0.0}, "resource_thresholds": {"resource_comparability": "unavailable", "peak_rss_bytes_max": None, "storage_bytes_max": None, "ingest_seconds_max": None, "index_seconds_max": None, "query_p95_ns_max": None}}
+    row = {"schema": formal.FORMAL_PROTOCOL_SCHEMA, "synthetic_test_mode": False, "candidate": candidate, "current_code_receipt": code, "original_code_receipt": code, "execution_checkpoint": checkpoint, "source_receipt": rank.PROTOCOL_SOURCE, "model_receipt": model, "candidate_transport": formal.CANDIDATE_TRANSPORT, "arms": list(rank_score_arms()), "primary_current_arm": {"arm_id": "six_view_secondary", "config_sha256": formal._digest(rank._arm_method("six_view_secondary")), "ranker_code_sha256": formal._ranker_code_sha256()}, "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER}, "top_k": 10, "tie_break": "stable_ranking_key_ascending", "original_build_count": 5, "p5_repeat_required": True, "bootstrap": score.FORMAL_BOOTSTRAP, "gates": {"primary_delta_min": .01, "primary_ci_lower_gt_zero": 0.0}, "resource_thresholds": {"resource_comparability": "unavailable", "peak_rss_bytes_max": None, "storage_bytes_max": None, "ingest_seconds_max": None, "index_seconds_max": None, "query_p95_ns_max": None}}
     row["protocol_sha256"] = formal.protocol_digest(row)
     return row
 
@@ -53,7 +66,7 @@ def rank_score_arms():
 
 
 def worker_config(p, protocol_row):
-    return {"role": "candidate_ranker", "projection_sha256": canonical_sha256(p), "projection_raw_sha256": protocol_row["candidate"]["projection_raw_sha256"], "projection_path": "projection.json", "model_receipt": protocol_row["model_receipt"], "code_receipt": protocol_row["current_code_receipt"], "staging_root": "staging", "arms": ["strong_raw", "static_p5", "six_view_secondary"], "top_k": 10, "tie_break": "stable_ranking_key_ascending", "serializer_contract": protocol_row["serializer_contract"]}
+    return {"role": "candidate_ranker", "projection_sha256": canonical_sha256(p), "projection_raw_sha256": protocol_row["candidate"]["projection_raw_sha256"], "candidate_reference_sha256": formal._digest(protocol_row["candidate"]["candidate_reference"]), "projection_path": "projection.json", "model_receipt": protocol_row["model_receipt"], "code_receipt": protocol_row["current_code_receipt"], "staging_root": "staging", "arms": ["strong_raw", "static_p5", "six_view_secondary"], "top_k": 10, "tie_break": "stable_ranking_key_ascending", "serializer_contract": protocol_row["serializer_contract"]}
 
 
 def bundle(tmp_path, p):
@@ -62,7 +75,99 @@ def bundle(tmp_path, p):
     generation = h("generation")
     ready = {"schema": "aerp7-convomem-candidate-ready-v3", "generation_id": generation, "projection": {"raw_sha256": hashlib.sha256(raw).hexdigest(), "canonical_sha256": canonical_sha256(p)}, "durability": {"platform": "synthetic", "directory_fsync_guaranteed": False, "steps": []}}
     ready_raw = json.dumps(ready, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(); (root / "READY.json").write_bytes(ready_raw)
-    return root, staging, {"generation_id": generation, "ready_sha256": hashlib.sha256(ready_raw).hexdigest(), "projection_raw_sha256": hashlib.sha256(raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}
+    return root, staging, {"generation_id": generation, "ready_sha256": hashlib.sha256(ready_raw).hexdigest(), "projection_raw_sha256": hashlib.sha256(raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"]), "candidate_reference": {"schema": confirmation.CANDIDATE_PROJECTION_REFERENCE_SCHEMA, "bundle_path": str(root.resolve()), "projection_path": "projection.json", "ready_path": "READY.json", "generation_id": generation, "projection_raw_sha256": hashlib.sha256(raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "dataset": dict(p["dataset"]), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}}
+
+
+def test_protocol_requires_a_reference_bound_to_candidate_receipt():
+    p = projection(); candidate = {"generation_id": h("generation"), "ready_sha256": h("ready"), "projection_raw_sha256": h("raw"), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}
+    with pytest.raises(CustodyError, match="formal_candidate_receipt_invalid"):
+        formal.validate_formal_protocol(protocol(p, candidate))
+
+
+def test_endpoint_accepts_ready_bound_streaming_current_artifact_references(tmp_path):
+    p = projection(); root, _staging, candidate = bundle(tmp_path, p); proto = protocol(p, candidate)
+    artifacts = []
+    with rank.CandidateProjectionStore.open(candidate["candidate_reference"], tmp_path, expected_bundle_root=root) as store:
+        for arm in ("strong_raw", "static_p5", "six_view_secondary"):
+            artifacts.append(rank.rank_projection_stream(store=store, encoder=Encoder(), arm_id=arm, artifact_path=tmp_path / (arm + ".json"), ready_path=tmp_path / (arm + ".READY.json"), model_receipt=proto["model_receipt"], code_receipt=proto["current_code_receipt"]))
+    original = original_replicates(p); sealed = {"replicates": original, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": proto["original_code_receipt"], "original_code_after": proto["original_code_receipt"]}; sealed["worker_sha256"] = formal._digest({key: sealed[key] for key in ("replicates", "lifecycle", "original_code_before", "original_code_after")})
+    original_artifact = formal.validate_original_worker_receipt(sealed, projection=p, protocol=proto)["artifact"]
+    endpoint = formal.freeze_endpoint_manifest(projection=p, protocol=proto, ranking_artifacts=[original_artifact, *artifacts])
+    assert {row["arm_id"] for row in endpoint["arms"]} == set(rank_score_arms())
+
+
+def test_endpoint_reference_mode_never_materializes_candidate_projection(tmp_path, monkeypatch):
+    """The formal coordinator must validate only persisted public references."""
+    p = projection(); root, _staging, candidate = bundle(tmp_path, p); proto = protocol(p, candidate)
+    current = []
+    with rank.CandidateProjectionStore.open(candidate["candidate_reference"], tmp_path, expected_bundle_root=root) as store:
+        for arm in ("strong_raw", "static_p5", "six_view_secondary"):
+            current.append(rank.rank_projection_stream(
+                store=store, encoder=Encoder(), arm_id=arm,
+                artifact_path=tmp_path / (arm + ".json"), ready_path=tmp_path / (arm + ".READY.json"),
+                model_receipt=proto["model_receipt"], code_receipt=proto["current_code_receipt"],
+            ))
+    refs = [{"build_id": "reference-build-" + str(number), "index_sha256": h("reference-index-" + str(number))} for number in range(5)]
+    original = {
+        "schema": original_product.ORIGINAL_ARTIFACT_REFERENCE_SCHEMA,
+        "arm_id": "original_public_product", "candidate_reference": proto["candidate"]["candidate_reference"],
+        "candidate_reference_sha256": formal._digest(proto["candidate"]["candidate_reference"]),
+        "generation_id": proto["candidate"]["generation_id"], "replicate_count": 5,
+        "replicate_references": refs, "model_receipt": proto["model_receipt"],
+        "model_sha256": formal._digest(proto["model_receipt"]), "method_receipt": rank.ORIGINAL_METHOD,
+        "method_sha256": formal._digest(rank.ORIGINAL_METHOD), "source_receipt": rank.PROTOCOL_SOURCE,
+        "source_commit_sha256": formal._digest(rank.PROTOCOL_SOURCE), "serializer_receipt": rank.ORIGINAL_MEMPALACE_SERIALIZER,
+        "serializer_sha256": formal._digest(rank.ORIGINAL_MEMPALACE_SERIALIZER), "code_receipt": proto["original_code_receipt"],
+        "code_sha256": formal._digest(proto["original_code_receipt"]), "artifact_sha256": h("original-artifact-reference"),
+    }
+    monkeypatch.setattr(original_product, "validate_original_public_artifact_reference", lambda value: dict(value))
+    monkeypatch.setattr(formal.confirmation, "_candidate_snapshot", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("formal endpoint must not snapshot candidate")))
+    monkeypatch.setattr(formal, "load_candidate_worker_projection", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("formal endpoint must not load projection")))
+    endpoint = formal.freeze_endpoint_manifest(
+        candidate_reference=candidate["candidate_reference"], protocol=proto,
+        ranking_artifacts=[original, *current],
+    )
+    assert endpoint["projection_sha256"] == candidate["projection_canonical_sha256"]
+
+
+def test_endpoint_accepts_protocol_bound_original_artifact_reference(monkeypatch):
+    """The formal endpoint must consume the sealed five-build reference, not arrays."""
+    p = projection(); proto = protocol(p)
+    refs = [{"build_id": "reference-build-" + str(number), "index_sha256": h("reference-index-" + str(number))} for number in range(5)]
+    original_reference = {
+        "schema": original_product.ORIGINAL_ARTIFACT_REFERENCE_SCHEMA,
+        "arm_id": "original_public_product",
+        "candidate_reference": proto["candidate"]["candidate_reference"],
+        "candidate_reference_sha256": formal._digest(proto["candidate"]["candidate_reference"]),
+        "generation_id": proto["candidate"]["generation_id"],
+        "replicate_count": 5,
+        "replicate_references": refs,
+        "model_receipt": proto["model_receipt"],
+        "model_sha256": formal._digest(proto["model_receipt"]),
+        "method_receipt": rank.ORIGINAL_METHOD,
+        "method_sha256": formal._digest(rank.ORIGINAL_METHOD),
+        "source_receipt": rank.PROTOCOL_SOURCE,
+        "source_commit_sha256": formal._digest(rank.PROTOCOL_SOURCE),
+        "serializer_receipt": rank.ORIGINAL_MEMPALACE_SERIALIZER,
+        "serializer_sha256": formal._digest(rank.ORIGINAL_MEMPALACE_SERIALIZER),
+        "code_receipt": proto["original_code_receipt"],
+        "code_sha256": formal._digest(proto["original_code_receipt"]),
+        "artifact_sha256": h("original-artifact-reference"),
+    }
+    monkeypatch.setattr(original_product, "validate_original_public_artifact_reference", lambda value: dict(value))
+    checked = formal._validate_public_ranking_artifact(original_reference, projection=p, protocol=proto)
+    assert checked == original_reference
+    current = [
+        rank.rank_projection(
+            projection=p, encoder=Encoder(), arm_id=arm,
+            model_receipt=proto["model_receipt"], code_receipt=proto["current_code_receipt"],
+        )
+        for arm in ("strong_raw", "static_p5", "six_view_secondary")
+    ]
+    endpoint = formal.freeze_endpoint_manifest(
+        projection=p, protocol=proto, ranking_artifacts=[original_reference, *current],
+    )
+    assert {row["arm_id"] for row in endpoint["arms"]} == set(rank_score_arms())
 
 
 def original_replicates(p):
@@ -199,7 +304,7 @@ def test_formal_protocol_candidate_boundary_and_current_repeat_are_fail_closed(t
         bad = copy.deepcopy(config); mutate(bad)
         with pytest.raises(CustodyError): formal.validate_candidate_worker_config(bad, protocol=proto)
     forged_candidate = {**candidate, "query_count": 1, "candidate_text_count": 1}; forged_protocol = protocol(p, forged_candidate)
-    with pytest.raises(CustodyError, match="candidate_projection_denominator_binding_invalid"):
+    with pytest.raises(CustodyError, match="formal_candidate_reference_binding_invalid"):
         formal.load_candidate_worker_projection(worker_config=worker_config(p, forged_protocol), protocol=forged_protocol, candidate_bundle_root=root, staging_parent=tmp_path)
 
 
@@ -328,7 +433,8 @@ def test_audit_envelope_requires_fresh_post_score_attestation_for_a_valid_scored
     custody_ready, custody_bundle, release_secret, scorer_secret = h("custody-ready"), h("custody-bundle"), b"r" * 32, b"s" * 32
     release = {"schema": formal.RELEASE_SCHEMA, "protocol_sha256": proto["protocol_sha256"], "endpoint_manifest_sha256": endpoint["manifest_sha256"], "candidate_ready_sha256": candidate["ready_sha256"], "projection_raw_sha256": candidate["projection_raw_sha256"], "projection_canonical_sha256": candidate["projection_canonical_sha256"], "custody_ready_sha256": custody_ready, "custody_bundle_sha256": custody_bundle, "ranking_artifact_sha256": {arm["arm_id"]: arm["ranking_artifact_sha256"] for arm in endpoint["arms"]}, "resource_sha256": resource_map(resources), "original_build_index_sha256": {row["build_id"]: row["index_sha256"] for row in original}, "current_worker_sha256": current_receipt["worker_sha256"]}
     release = formal.sign_release_authorization(release, custody_capability_secret=release_secret)
-    report = score.score_frozen(projection=p, endpoint_manifest=endpoint, ranking_artifacts=artifacts, custody_loader=lambda: scoring_custody(p), evidence_token_secret=b"e" * 32)
+    with rank.CandidateProjectionStore.open(candidate["candidate_reference"], tmp_path, expected_bundle_root=root) as store:
+        report = score.score_frozen(projection=p, endpoint_manifest=endpoint, ranking_artifacts=artifacts, custody_loader=lambda: scoring_custody(p), evidence_token_secret=b"e" * 32, formal_live=False)
     unsigned = {"schema": formal.POST_SCORE_ATTESTATION_SCHEMA, "release_sha256": release["release_sha256"], "report_sha256": report["report_sha256"], "protocol_sha256": proto["protocol_sha256"], "endpoint_manifest_sha256": endpoint["manifest_sha256"], "ranking_artifact_sha256": report["ranking_artifact_sha256"], "resource_sha256": release["resource_sha256"]}
     attestation = formal.sign_post_score_attestation(unsigned, scorer_attestation_secret=scorer_secret)
     envelope = formal.audit_envelope(report=report, post_score_attestation=attestation, scorer_attestation_secret=scorer_secret, release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_bundle, custody_capability_secret=release_secret)
@@ -392,7 +498,7 @@ def _published_confirmation_bundle(tmp_path, name):
 def test_open_custody_after_release_uses_actual_confirmation_bundles(tmp_path, monkeypatch):
     candidate, custody, binding_secret = _published_confirmation_bundle(tmp_path, "A"); p = confirmation.load_candidate_projection(candidate)
     ready_raw = (candidate / "READY.json").read_bytes(); projection_raw = (candidate / "projection.json").read_bytes(); ready = json.loads(ready_raw)
-    candidate_receipt = {"generation_id": ready["generation_id"], "ready_sha256": hashlib.sha256(ready_raw).hexdigest(), "projection_raw_sha256": hashlib.sha256(projection_raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}
+    candidate_receipt = {"generation_id": ready["generation_id"], "ready_sha256": hashlib.sha256(ready_raw).hexdigest(), "projection_raw_sha256": hashlib.sha256(projection_raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"]), "candidate_reference": {"schema": confirmation.CANDIDATE_PROJECTION_REFERENCE_SCHEMA, "bundle_path": str(candidate.resolve()), "projection_path": "projection.json", "ready_path": "READY.json", "generation_id": ready["generation_id"], "projection_raw_sha256": hashlib.sha256(projection_raw).hexdigest(), "projection_canonical_sha256": canonical_sha256(p), "dataset": dict(p["dataset"]), "query_count": len(p["items"]), "candidate_text_count": sum(len(corpus["candidates"]) for corpus in p["corpora"])}}
     (tmp_path / "staging").mkdir(); proto = protocol(p, candidate_receipt); config = worker_config(p, proto); current, current_receipt = formal.freeze_current_worker(encoder=Encoder(), protocol=proto, worker_config=config, candidate_bundle_root=candidate, staging_parent=tmp_path)
     original = original_replicates(p); sealed = {"replicates": original, "lifecycle": list(formal.ORIGINAL_LIFECYCLE), "original_code_before": proto["original_code_receipt"], "original_code_after": proto["original_code_receipt"]}; sealed["worker_sha256"] = formal._digest({key: sealed[key] for key in ("replicates", "lifecycle", "original_code_before", "original_code_after")}); original_artifact = formal.validate_original_worker_receipt(sealed, projection=p, protocol=proto)["artifact"]
     artifacts = [original_artifact, *current]; endpoint = formal.freeze_endpoint_manifest(projection=p, protocol=proto, ranking_artifacts=artifacts)
@@ -401,8 +507,10 @@ def test_open_custody_after_release_uses_actual_confirmation_bundles(tmp_path, m
     custody_ready = hashlib.sha256((custody / "READY.json").read_bytes()).hexdigest(); custody_raw = hashlib.sha256((custody / "sealed-custody.json").read_bytes()).hexdigest(); resource_digests = resource_map(resources)
     release = {"schema": formal.RELEASE_SCHEMA, "protocol_sha256": proto["protocol_sha256"], "endpoint_manifest_sha256": endpoint["manifest_sha256"], "candidate_ready_sha256": candidate_receipt["ready_sha256"], "projection_raw_sha256": candidate_receipt["projection_raw_sha256"], "projection_canonical_sha256": candidate_receipt["projection_canonical_sha256"], "custody_ready_sha256": custody_ready, "custody_bundle_sha256": custody_raw, "ranking_artifact_sha256": {arm["arm_id"]: arm["ranking_artifact_sha256"] for arm in endpoint["arms"]}, "resource_sha256": resource_digests, "original_build_index_sha256": {row["build_id"]: row["index_sha256"] for row in original}, "current_worker_sha256": current_receipt["worker_sha256"]}
     release = formal.sign_release_authorization(release, custody_capability_secret=b"c" * 32)
-    assert formal.open_custody_after_release(release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_raw, custody_capability_secret=b"c" * 32, candidate_bundle_root=candidate, custody_bundle_root=custody, binding_secret=binding_secret)["projection_sha256"] == canonical_sha256(p)
-    original_loader = confirmation.load_custody_for_scoring
+    store = formal.open_custody_after_release(release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_raw, custody_capability_secret=b"c" * 32, candidate_bundle_root=candidate, custody_bundle_root=custody, binding_secret=binding_secret)
+    assert store.reference["candidate_reference"]["projection_canonical_sha256"] == canonical_sha256(p)
+    store.close()
+    original_open = confirmation.CustodyStore.open
     changed_ready = json.loads(ready_raw); changed_ready["durability"]["steps"] = ["synthetic-durability-change"]
     (candidate / "READY.json").write_bytes(json.dumps(changed_ready, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
     monkeypatch.setattr(confirmation, "load_custody_for_scoring", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("candidate READY mismatch must precede custody open")))
@@ -410,20 +518,20 @@ def test_open_custody_after_release_uses_actual_confirmation_bundles(tmp_path, m
         formal.open_custody_after_release(release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_raw, custody_capability_secret=b"c" * 32, candidate_bundle_root=candidate, custody_bundle_root=custody, binding_secret=binding_secret)
     (candidate / "READY.json").write_bytes(ready_raw)
     def candidate_drift(*args, **kwargs):
-        value = original_loader(*args, **kwargs)
+        value = original_open(*args, **kwargs)
         drifted = json.loads(ready_raw); drifted["durability"]["steps"] = ["synthetic-loader-drift"]
         (candidate / "READY.json").write_bytes(json.dumps(drifted, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
         return value
-    monkeypatch.setattr(confirmation, "load_custody_for_scoring", candidate_drift)
+    monkeypatch.setattr(confirmation.CustodyStore, "open", candidate_drift)
     with pytest.raises(CustodyError, match="custody_release_bundle_drift"):
         formal.open_custody_after_release(release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_raw, custody_capability_secret=b"c" * 32, candidate_bundle_root=candidate, custody_bundle_root=custody, binding_secret=binding_secret)
     (candidate / "READY.json").write_bytes(ready_raw)
     def drift(*args, **kwargs):
-        value = original_loader(*args, **kwargs); (custody / "READY.json").write_bytes(b"{}"); return value
-    monkeypatch.setattr(confirmation, "load_custody_for_scoring", drift)
+        value = original_open(*args, **kwargs); (custody / "READY.json").write_bytes(b"{}"); return value
+    monkeypatch.setattr(confirmation.CustodyStore, "open", drift)
     with pytest.raises(CustodyError, match="custody_release_bundle_drift"):
         formal.open_custody_after_release(release_authorization=release, projection=p, ranking_artifacts=artifacts, current_worker_receipt=current_receipt, protocol=proto, endpoint_manifest=endpoint, resource_receipts=resources, custody_ready_sha256=custody_ready, custody_bundle_sha256=custody_raw, custody_capability_secret=b"c" * 32, candidate_bundle_root=candidate, custody_bundle_root=custody, binding_secret=binding_secret)
-    monkeypatch.setattr(confirmation, "load_custody_for_scoring", original_loader)
+    monkeypatch.setattr(confirmation.CustodyStore, "open", original_open)
     # Keep the original candidate (whose READY was restored byte-for-byte) so
     # the final custody tamper reaches the custody binding check.
     candidate_b, custody_b, _ = _published_confirmation_bundle(tmp_path, "B")

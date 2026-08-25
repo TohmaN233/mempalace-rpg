@@ -1,11 +1,15 @@
 import copy
 import hashlib
+import json
+import shutil
+import sqlite3
+import tracemalloc
 
 import pytest
 
 from benchmarks import aerp7_convomem_rank as rank
 from benchmarks import aerp7_convomem_scoring as score
-from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256
+from benchmarks.aerp7_convomem_confirmation import CustodyError, CustodyStore, canonical_sha256
 
 
 def h(value): return hashlib.sha256(value.encode()).hexdigest()
@@ -68,6 +72,219 @@ def run():
     p=projection(); arts=artifacts(p); return p, arts, manifest(p,arts), custody(p)
 
 
+class _CursorProjectionStore(rank.CandidateProjectionStore):
+    """Candidate-only cursor seam used to exercise the formal consumer shape."""
+
+    def __init__(self, p, tmp_path):
+        self.reference = {
+            "schema": rank.CANDIDATE_PROJECTION_REFERENCE_SCHEMA,
+            "bundle_path": str((tmp_path / "candidate").resolve()),
+            "projection_path": "projection.json", "ready_path": "READY.json",
+            "generation_id": h("generation"),
+            "projection_raw_sha256": h("projection-raw"),
+            "projection_canonical_sha256": canonical_sha256(p),
+            "dataset": dict(p["dataset"]), "query_count": len(p["items"]),
+            "candidate_text_count": sum(len(row["candidates"]) for row in p["corpora"]),
+        }
+        self.database = tmp_path / "candidate.sqlite3"
+        self.connection = sqlite3.connect(self.database)
+        self.connection.executescript("CREATE TABLE items(item_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL); CREATE TABLE corpora(corpus_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);")
+        self.connection.executemany("INSERT INTO items VALUES (?, ?)", [(row["item_id"], json.dumps(row)) for row in p["items"]])
+        self.connection.executemany("INSERT INTO corpora VALUES (?, ?)", [(row["corpus_id"], json.dumps(row)) for row in p["corpora"]])
+        self.connection.commit()
+        self._items = list(p["items"]); self._corpora = {row["corpus_id"]: row for row in p["corpora"]}
+        self._run_active = False; self._closed = False
+
+    def iter_items(self):
+        yield from self._items
+
+    def corpus(self, corpus_id):
+        return self._corpora[corpus_id]
+
+    def begin_run(self):
+        self._run_active = True
+
+    def end_run(self):
+        self._run_active = False
+
+
+class _CursorCustodyStore(CustodyStore):
+    """Custody capability exposing only the scorer's label-free cursor."""
+
+    def __init__(self, reference, rows, directory):
+        self.reference = reference; self.directory = directory; self.connection = None; self._rows = rows
+
+    def iter_scoring_items(self):
+        yield from self._rows
+
+    def close(self):
+        if self.directory.exists():
+            shutil.rmtree(self.directory)
+
+
+def _cursor_custody(p, projection_store, tmp_path):
+    rows = custody(p)["items"]
+    reference = {
+        "schema": score.CUSTODY_REFERENCE_SCHEMA,
+        "bundle_path": str((tmp_path / "candidate-custody").resolve()),
+        "candidate_reference": dict(projection_store.reference),
+        "custody_path": str((tmp_path / "sealed-custody.json").resolve()),
+        "ready_path": str((tmp_path / "custody.READY.json").resolve()),
+        "generation_id": projection_store.reference["generation_id"],
+        "custody_raw_sha256": h("custody-raw"), "custody_canonical_sha256": h("custody-canonical"),
+        "dataset": dict(p["dataset"]), "item_count": len(rows),
+        "evidence_span_count": sum(len(row["evidence_spans"]) for row in rows),
+        "ready_sha256": h("custody-ready"),
+    }
+    return _CursorCustodyStore(reference, rows, tmp_path / "custody-store"), rows
+
+
+class _LargeCursorProjectionStore(rank.CandidateProjectionStore):
+    """Disk-backed candidate cursor for the full score_frozen memory seam."""
+
+    def __init__(self, query_count, tmp_path):
+        self.query_count = query_count
+        self.corpus_id = h("large-corpus")
+        self.message_id = h("large-message")
+        self.conversation_id = h("large-conversation")
+        self.reference = {
+            "schema": rank.CANDIDATE_PROJECTION_REFERENCE_SCHEMA,
+            "bundle_path": str((tmp_path / "candidate").resolve()),
+            "projection_path": "projection.json", "ready_path": "READY.json",
+            "generation_id": h(f"large-generation-{query_count}"),
+            "projection_raw_sha256": h(f"large-projection-raw-{query_count}"),
+            "projection_canonical_sha256": h(f"large-projection-{query_count}"),
+            "dataset": {key: h("large-" + key) for key in ("canonical_sha256", "premix_sha256", "revision_sha256", "source_inventory_sha256")},
+            "query_count": query_count, "candidate_text_count": 1,
+        }
+        self.database = tmp_path / "candidate.sqlite3"
+        self.connection = sqlite3.connect(self.database)
+        self.connection.executescript("CREATE TABLE items(item_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL); CREATE TABLE corpora(corpus_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);")
+        corpus = {
+            "corpus_id": self.corpus_id, "declared_context_size": 2,
+            "actual_conversation_count": 1, "actual_message_count": 1,
+            "candidates": [{"message_id": self.message_id, "opaque_conversation_id": self.conversation_id, "conversation_order": 0, "message_order": 0, "corpus_order": 0, "speaker": "user", "text": "target"}],
+        }
+        self.connection.execute("INSERT INTO corpora VALUES (?, ?)", (self.corpus_id, json.dumps(corpus, separators=(",", ":"))))
+        for index in range(query_count):
+            item = {"item_id": h(f"large-item-{index}"), "persona_id": h("large-persona"), "query_text": f"large query {index}", "corpus_id": self.corpus_id}
+            self.connection.execute("INSERT INTO items VALUES (?, ?)", (item["item_id"], json.dumps(item, separators=(",", ":"))))
+        self.connection.commit()
+        self._corpus = corpus
+        self._run_active = False; self._closed = False
+
+    def iter_items(self):
+        for index in range(self.query_count):
+            yield {"item_id": h(f"large-item-{index}"), "persona_id": h("large-persona"), "query_text": f"large query {index}", "corpus_id": self.corpus_id}
+
+    def corpus(self, corpus_id):
+        assert corpus_id == self.corpus_id
+        return self._corpus
+
+    def begin_run(self):
+        self._run_active = True
+
+    def end_run(self):
+        self._run_active = False
+
+
+class _LargeCursorCustodyStore(CustodyStore):
+    def __init__(self, projection_store, tmp_path):
+        self.projection_store = projection_store
+        self.directory = tmp_path / "custody-store"
+        self.directory.mkdir()
+        self.connection = None
+        positive_count = projection_store.query_count - projection_store.query_count // 6
+        self.reference = {
+            "schema": score.CUSTODY_REFERENCE_SCHEMA,
+            "bundle_path": str((tmp_path / "candidate-custody").resolve()),
+            "candidate_reference": dict(projection_store.reference),
+            "custody_path": str((tmp_path / "sealed-custody.json").resolve()),
+            "ready_path": str((tmp_path / "custody.READY.json").resolve()),
+            "generation_id": projection_store.reference["generation_id"],
+            "custody_raw_sha256": h("large-custody-raw"), "custody_canonical_sha256": h("large-custody-canonical"),
+            "dataset": dict(projection_store.reference["dataset"]),
+            "item_count": projection_store.query_count, "evidence_span_count": positive_count,
+            "ready_sha256": h("large-custody-ready"),
+        }
+
+    def iter_scoring_items(self):
+        groups = tuple(score.UPSTREAM_GROUPS)
+        for index in range(self.projection_store.query_count):
+            group = groups[index % len(groups)]
+            positive = score.UPSTREAM_GROUPS[group] == "positive"
+            yield {
+                "item_id": h(f"large-item-{index}"), "directory_group": group,
+                "evidence_conversation_ids": [self.projection_store.conversation_id] if positive else [],
+                "evidence_spans": [{"speaker": "user", "text": "target"}] if positive else [],
+            }
+
+
+class _LargeArtifactReader:
+    def __init__(self, value, *, projection_digest, projection):
+        self.arm_id = value["arm_id"]; self.artifact_sha256 = value["artifact_sha256"]
+        self._query_count = value["query_count"]
+        self.reference = None; self._original_refs = []
+        if self.arm_id == "original_public_product":
+            self._original_refs = [{"build_id": f"large-build-{number}", "index_sha256": h(f"large-index-{number}"), "candidate_reference": value["candidate_reference"]} for number in range(5)]
+
+    def preflight(self, access, db):
+        return None
+
+    def original_replicates(self):
+        return self._original_refs
+
+    def iter_rows(self):
+        corpus = {"corpus_id": h("large-corpus"), "candidates": [{"message_id": h("large-message"), "opaque_conversation_id": h("large-conversation"), "conversation_order": 0, "message_order": 0, "corpus_order": 0, "speaker": "user", "text": "target"}]}
+        for index in range(self._query_count):
+            item_id = h(f"large-item-{index}"); query = f"large query {index}"
+            ids = [h("large-message")]; conversations = [h("large-conversation")]
+            common = {"item_id": item_id, "query_sha256": h(query), "candidate_input_sha256": rank._candidate_input(corpus, rank.ORIGINAL_MEMPALACE_SERIALIZER if self.arm_id == "original_public_product" else rank.CURRENT_SERIALIZER), "ranked_message_ids": ids, "retrieved_conversation_ids": conversations}
+            if self.arm_id == "original_public_product":
+                yield {**common, "confidence": None, "confidence_receipt": None, "replicate_ranked_message_ids": [ids] * 5, "replicate_retrieved_conversation_ids": [conversations] * 5}
+            else:
+                yield {**common, "confidence": 0.5, "confidence_receipt": {"contract": score.CONFIDENCE_CONTRACT, "top_two_scores": [1.0, 0.0]}}
+
+
+def _large_manifest(projection_digest, artifact_values):
+    row = {
+        "schema": score.MANIFEST_SCHEMA, "projection_sha256": projection_digest,
+        "protocol_source": rank.PROTOCOL_SOURCE,
+        "serializer_contract": {"current": rank.CURRENT_SERIALIZER, "original_public_product": rank.ORIGINAL_MEMPALACE_SERIALIZER},
+        "arms": [{"arm_id": value["arm_id"], "ranking_artifact_sha256": value["artifact_sha256"], "confidence_contract": rank.CONFIDENCE_CONTRACT if value["arm_id"] in score.CURRENT_ARMS else None} for value in artifact_values],
+        "directory_endpoints": [{"directory_group": group, "endpoint": endpoint} for group, endpoint in score.UPSTREAM_GROUPS.items()],
+        "bootstrap": {"seed": 17, "resamples": 2, "percentile_lower": .025, "percentile_upper": .975, "percentile_rule": "linear", "original_replicate_rule": "per_query_arithmetic_mean"},
+        "synthetic_test_mode": True, "reference_arm": "strong_raw",
+    }
+    row["manifest_sha256"] = score.endpoint_manifest_digest(row)
+    return row
+
+
+def _large_score(query_count, tmp_path, monkeypatch):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    projection_store = _LargeCursorProjectionStore(query_count, tmp_path)
+    custody_store = _LargeCursorCustodyStore(projection_store, tmp_path)
+    artifact_values = [{"arm_id": arm_id, "artifact_sha256": h(f"large-artifact-{query_count}-{arm_id}"), "query_count": query_count, "candidate_reference": projection_store.reference} for arm_id in ("original_public_product", *sorted(score.CURRENT_ARMS))]
+    endpoint_manifest = _large_manifest(projection_store.reference["projection_canonical_sha256"], artifact_values)
+    monkeypatch.setattr(score, "_ArtifactReader", _LargeArtifactReader)
+    ledger_path = tmp_path / "mapping-ledger.json"
+    tracemalloc.start()
+    try:
+        report = score.score_frozen(
+            projection=projection_store, endpoint_manifest=endpoint_manifest,
+            ranking_artifacts=artifact_values, evidence_token_secret=b"x" * 32,
+            custody_store=custody_store, formal_live=False, mapping_ledger_path=ledger_path,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        projection_store.connection.close()
+    assert report["mapping_ledger"]["count"] == custody_store.reference["evidence_span_count"]
+    assert ledger_path.is_file() and ledger_path.with_name("mapping-ledger.READY.json").is_file()
+    return peak
+
+
+
 def test_full_synthetic_scoring_is_leak_free_and_bootstrap_is_deterministic():
     p, arts, m, c=run(); first=score.score_frozen(projection=p,endpoint_manifest=m,ranking_artifacts=arts,custody_loader=lambda:c,evidence_token_secret=b"x"*32); second=score.score_frozen(projection=p,endpoint_manifest=m,ranking_artifacts=arts,custody_loader=lambda:c,evidence_token_secret=b"x"*32)
     assert first==second and first["paired_bootstrap"]["overall_positive"]["paired_deltas"]
@@ -75,6 +292,65 @@ def test_full_synthetic_scoring_is_leak_free_and_bootstrap_is_deterministic():
     assert first["arms"]["strong_raw"]["confidence_separability"]["by_declared_context"]["2"]["average_precision"] >= 0
     assert all("message_id" not in row for row in first["mapping_ledger"])
     assert score.validate_report(first)["report_sha256"]==first["report_sha256"]
+
+
+def test_cursor_projection_and_custody_consumer_never_calls_legacy_loaders(tmp_path, monkeypatch):
+    p, arts, m, c = run()
+    projection_store = _CursorProjectionStore(p, tmp_path)
+    custody_store, rows = _cursor_custody(p, projection_store, tmp_path)
+    from benchmarks import aerp7_convomem_confirmation as confirmation
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy custody loader must not be called")
+    monkeypatch.setattr(confirmation, "load_sealed_custody", forbidden)
+    monkeypatch.setattr(confirmation, "load_custody_for_scoring", forbidden)
+    legacy_reader = score._ArtifactReader
+    class StoreFixtureReader(legacy_reader):
+        def __init__(self, value, *, projection_digest, projection):
+            super().__init__(value, projection_digest=projection_digest, projection=p)
+    monkeypatch.setattr(score, "_ArtifactReader", StoreFixtureReader)
+    ledger_path = tmp_path / "mapping-ledger.json"
+    try:
+        streamed = score.score_frozen(
+            projection=projection_store, endpoint_manifest=m, ranking_artifacts=arts,
+            evidence_token_secret=b"x" * 32, custody_store=custody_store,
+            formal_live=False, mapping_ledger_path=ledger_path,
+        )
+        legacy = score.score_frozen(
+            projection=p, endpoint_manifest=m, ranking_artifacts=arts,
+            evidence_token_secret=b"x" * 32, custody_loader=lambda: c,
+        )
+        assert isinstance(streamed["mapping_ledger"], dict)
+        assert streamed["mapping_ledger"]["schema"] == score.MAPPING_LEDGER_REFERENCE_SCHEMA
+        assert streamed["mapping_ledger"]["count"] == sum(len(row["evidence_spans"]) for row in rows)
+        assert streamed["arms"] == legacy["arms"]
+        assert streamed["paired_bootstrap"] == legacy["paired_bootstrap"]
+        assert streamed["ranking_artifact_sha256"] == legacy["ranking_artifact_sha256"]
+        assert ledger_path.is_file() and ledger_path.with_name("mapping-ledger.READY.json").is_file()
+        assert score.validate_report(streamed)["report_sha256"] == streamed["report_sha256"]
+    finally:
+        custody_store.connection = None
+        projection_store.connection.close()
+
+
+def test_inline_rehearsal_custody_store_does_not_leave_report_ledger_in_ephemeral_directory(tmp_path):
+    p, arts, m, c = run()
+    projection_store = _CursorProjectionStore(p, tmp_path)
+    custody_store, _rows = _cursor_custody(p, projection_store, tmp_path)
+    custody_store.directory.mkdir(parents=True, exist_ok=True)
+    try:
+        report = score.score_frozen(
+            projection=p, endpoint_manifest=m, ranking_artifacts=arts,
+            evidence_token_secret=b"x" * 32, custody_loader=lambda: custody_store,
+            formal_live=False,
+        )
+        assert isinstance(report["mapping_ledger"], list)
+        custody_store.close()
+        # The caller may close the ephemeral CustodyStore before the scientific
+        # gate revalidates the report.  The compatibility report must remain
+        # self-contained rather than point at the deleted store directory.
+        assert score.validate_report(report)["report_sha256"] == report["report_sha256"]
+    finally:
+        projection_store.connection.close()
 
 
 def test_evidence_micro_recall_at_10_is_an_explicit_secondary_denominator():
@@ -99,7 +375,7 @@ def test_public_failures_precede_custody_and_mapping_is_exact_speaker_text_with_
     with pytest.raises(CustodyError,match="abstention_evidence_must_be_empty"): score.score_frozen(projection=p,endpoint_manifest=m,ranking_artifacts=arts,custody_loader=lambda:c,evidence_token_secret=b"x"*32)
     ambiguous=copy.deepcopy(p); candidate=copy.deepcopy(ambiguous["corpora"][0]["candidates"][0]); candidate["message_id"]=h("ambiguous-message"); candidate["message_order"]=11; candidate["corpus_order"]=11; ambiguous["corpora"][0]["candidates"].append(candidate); ambiguous["corpora"][0]["actual_message_count"]+=1
     ambiguous_arts=artifacts(ambiguous)
-    with pytest.raises(CustodyError, match="exact_evidence_mapping_incomplete"):
+    with pytest.raises(CustodyError, match="scoring_formal_projection_store_required"):
         score.score_frozen(projection=ambiguous,endpoint_manifest=manifest(ambiguous,ambiguous_arts),ranking_artifacts=ambiguous_arts,custody_loader=lambda:custody(ambiguous),evidence_token_secret=b"x"*32, formal_live=True)
 
 
@@ -134,3 +410,101 @@ def test_formal_freeze_report_completeness_and_duplicate_span_ndcg_are_fail_clos
     assert metrics["recall_at_10"]==1.0 and metrics["ndcg_at_10"]==1.0
     bad=copy.deepcopy(report); bad["ranking_artifact_sha256"]["strong_raw"]=h("different-valid-digest"); bad["report_sha256"]=score.report_digest(bad)
     with pytest.raises(CustodyError,match="scoring_report_artifact_manifest_binding_invalid"): score.validate_report(bad)
+
+
+def test_streaming_confidence_cursor_is_numerically_equal_to_legacy_pair_scorer():
+    pairs = [(0.2, 1), (0.2, 0), (0.7, 1), (0.1, 0), (0.7, 0), (0.9, 1)]
+    with score._ScoringDB() as spool:
+        spool.connection.executemany("INSERT INTO confidence VALUES (?, ?, ?, ?, ?)", [("strong_raw", "p", 2, confidence, label) for confidence, label in pairs])
+        spool.connection.commit()
+        assert score._stream_auroc_ap(spool.connection, "strong_raw", "p", 2) == score._auroc_ap(pairs)
+
+
+def test_ready_bound_ranking_reader_streams_without_retaining_payload_rows(tmp_path):
+    """Exercise the persisted-artifact seam rather than the inline legacy path."""
+    rows = [{"item_id": h(f"stream-item-{index}"), "padding": "x" * 1024} for index in range(20_000)]
+    artifact_path = tmp_path / "ranking.json"
+    ready_path = tmp_path / "ranking.READY.json"
+    projection_digest = h("projection")
+    serializer_receipt = rank.CURRENT_SERIALIZER
+    serializer_digest = rank._digest(serializer_receipt)
+    input_rows = [
+        {"item_id": item_id, "corpus_id": h("corpus"), "candidate_input_sha256": h(f"candidate-{item_id}")}
+        for item_id in sorted(row["item_id"] for row in rows)
+    ]
+    input_path = tmp_path / "input-receipt-items.json"
+    input_path.write_bytes(rank._bytes(input_rows))
+    input_payload_digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    input_legacy_digest = rank._input_receipt_legacy_fields(
+        projection_sha256=projection_digest,
+        serializer_sha256=serializer_digest,
+        item_corpus_set_sha256=input_payload_digest,
+        item_corpora_path=input_path,
+    )
+    input_receipt = {
+        "schema": rank.INPUT_RECEIPT_REFERENCE_SCHEMA,
+        "item_corpora_path": input_path.name,
+        "item_corpus_set_sha256": input_payload_digest,
+        "item_count": len(input_rows),
+        "projection_sha256": projection_digest,
+        "serializer_sha256": serializer_digest,
+        "legacy_input_sha256": input_legacy_digest,
+    }
+    model_receipt = {
+        "encoder_identity": "synthetic-encoder", "encoder_semantics": "deterministic",
+        "files": [{"path_role": "weights", "sha256": h("weights"), "bytes": 2}],
+    }
+    code_receipt = {"head": h("head")[:40], "tree": h("tree")[:40], "diff_digest": h("diff"), "dirty_policy": "clean_required"}
+    artifact_path.write_bytes(json.dumps({"rankings": rows}, separators=(",", ":")).encode("utf-8"))
+    artifact_digest = h("artifact")
+    ready = {
+        "schema": rank.RANKING_ARTIFACT_READY_SCHEMA,
+        "arm_id": "strong_raw",
+        "generation_id": "generation",
+        "projection_sha256": projection_digest,
+        "payload_sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+        "artifact_sha256": artifact_digest,
+        "ready_sha256": "",
+    }
+    ready["ready_sha256"] = canonical_sha256({key: value for key, value in ready.items() if key != "ready_sha256"})
+    ready_path.write_bytes(json.dumps(ready, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    reference = {
+        "schema": rank.RANKING_ARTIFACT_REFERENCE_SCHEMA,
+        "artifact_path": str(artifact_path.resolve()),
+        "ready_path": str(ready_path.resolve()),
+        "arm_id": "strong_raw",
+        "projection_sha256": projection_digest,
+        "generation_id": "generation",
+        "payload_sha256": ready["payload_sha256"],
+        "artifact_sha256": artifact_digest,
+        "ready_sha256": ready["ready_sha256"],
+        "method_receipt": rank._arm_method("strong_raw"), "serializer_receipt": serializer_receipt,
+        "input_receipt": input_receipt, "input_sha256": input_legacy_digest,
+        "model_receipt": model_receipt, "model_sha256": rank._digest(model_receipt),
+        "source_receipt": rank.PROTOCOL_SOURCE, "source_commit_sha256": rank._digest(rank.PROTOCOL_SOURCE),
+        "serializer_sha256": serializer_digest, "code_receipt": code_receipt, "code_sha256": rank._digest(code_receipt), "trace_sha256": h("trace"),
+    }
+    reader = score._ArtifactReader(reference, projection_digest=projection_digest, projection=None)
+    tracemalloc.start()
+    try:
+        count = sum(1 for _ in reader.iter_rows())
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert count == len(rows)
+    assert peak < 8_000_000
+
+
+@pytest.mark.performance
+def test_full_score_frozen_cursor_memory_does_not_scale_with_100k_to_200k_queries(tmp_path, monkeypatch):
+    """The bounded-memory assertion crosses the complete scorer seam."""
+    # Keep this stress lane focused on the complete consumer loop while the
+    # small-fixture tests cover the full four-arm registry.  Both confidence
+    # arms remain present because the preregistered non-regression gate needs
+    # the raw/P5 pair.
+    monkeypatch.setattr(score, "CURRENT_ARMS", {"strong_raw", "static_p5"})
+    peak_100k = _large_score(100_000, tmp_path / "one", monkeypatch)
+    peak_200k = _large_score(200_000, tmp_path / "two", monkeypatch)
+    assert peak_200k <= peak_100k + 16 * 1024 * 1024, (
+        f"score_frozen_peak_100k={peak_100k} score_frozen_peak_200k={peak_200k}"
+    )
