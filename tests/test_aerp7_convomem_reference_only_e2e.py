@@ -329,10 +329,13 @@ def test_formal_reference_only_path_survives_public_to_scored_release_on_posix_e
     assert public["candidate_reference"] == candidate_receipt["candidate_reference"]
     private = custodian.sign_private_payload({
         "schema": custodian.FORMAL_PRIVATE_SCHEMA,
-        "binding_secret": binding_secret,
-        "custody_capability_secret": b"k" * 32,
-        "evidence_token_secret": b"e" * 32,
-        "scorer_attestation_secret": b"s" * 32,
+        # Match the one-shot transport: private JSON carries UTF-8 secret
+        # strings and the custodian converts them back to bytes after HMAC
+        # validation.  The signing capability below remains bytes.
+        "binding_secret": binding_secret.decode("ascii"),
+        "custody_capability_secret": "k" * 32,
+        "evidence_token_secret": "e" * 32,
+        "scorer_attestation_secret": "s" * 32,
         "public_packet_sha256": freeze["packet_sha256"],
         "freeze_packet_file_sha256": public_config["freeze_packet_file_sha256"],
         "output_path": public_config["output_path"],
