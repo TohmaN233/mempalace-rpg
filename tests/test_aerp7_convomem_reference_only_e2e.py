@@ -161,9 +161,15 @@ def _source_roots(tmp_path: Path):
                 cases.append({
                     "contextSize": context_size,
                     "evidenceItems": [{key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}],
+                    # The original public-product query contract is exact
+                    # Top-10, so every independently ranked corpus supplies
+                    # at least ten candidate message IDs.
                     "conversations": [{"id": conversation, "messages": [
-                        {"speaker": "user", "text": "candidate one"},
-                        {"speaker": "assistant", "text": "candidate two"},
+                        {
+                            "speaker": "user" if number % 2 == 0 else "assistant",
+                            "text": f"candidate {number}",
+                        }
+                        for number in range(10)
                     ]}],
                 })
     premix_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
