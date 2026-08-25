@@ -190,6 +190,7 @@ def test_original_coordinator_routes_stream_draft_to_persistent_reference_withou
     reference = fixture["candidate_reference_bundle"](tmp_path)
     seams, _palace, _state = fixture["seams"]()
     palace_path = tmp_path / "stream-palace"
+    palace_path.mkdir()
     draft = executor.original_product.run_original_public_replicate_streaming(
         candidate_reference=reference, build_id="executor-stream-build",
         collection_identity="executor-stream-collection", palace_path=palace_path,
