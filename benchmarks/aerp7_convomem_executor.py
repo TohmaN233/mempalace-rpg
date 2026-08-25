@@ -1113,6 +1113,17 @@ def coordinator_reaudit_original_worker_packet(*, packet: Mapping[str, Any], dra
     # independent re-audit, the coordinator must bind the completed index digest
     # (which necessarily changes when coordinator_physical_receipt is added).
     resource["index_sha256"] = replicate["index_sha256"]
+    measurements = resource.get("query_measurements")
+    if isinstance(measurements, Mapping) and measurements.get("schema") == "aerp7-original-product-resource-measurement-reference-v1":
+        rebound = dict(measurements)
+        sequence = rebound.get("sequence")
+        if not isinstance(sequence, Mapping):
+            raise CustodyError("executor_original_resource_measurement_reference_invalid")
+        rebound_sequence = dict(sequence)
+        rebound["replicate_reference"] = dict(replicate)
+        rebound_sequence["replicate_reference_sha256"] = _digest(replicate)
+        rebound["sequence"] = rebound_sequence
+        resource["query_measurements"] = rebound
     resource["resource_sha256"] = formal.resource_digest(resource)
     return replicate, resource
 
