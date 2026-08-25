@@ -96,14 +96,24 @@ def _calibration(model_receipt):
 
 
 def _plan(tmp_path: Path, *, operator_secret: bytes, model_receipt, code_receipt, checkpoint: Path):
+    external = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert isinstance(external, dict)
+    driver = external.get("driver_code_receipt")
+    original = external.get("original_execution_policy")
+    assert isinstance(driver, dict) and isinstance(original, dict)
+    for value in (
+        driver.get("python"), original.get("original_root"), original.get("model_dir"), original.get("original_python"),
+    ):
+        assert isinstance(value, str) and Path(value).is_absolute()
     names = {
         "canonical_root": "canonical", "premix_root": "premix", "candidate_output_dir": "candidate",
         "custody_output_dir": "custody", "staging_root": "private-staging", "protocol_path": "protocol.json",
         "authorization_path": "authorization.json", "output_dir": "public", "custodian_public_config_path": "custodian-public.json",
         "final_output_path": "final.json", "one_shot_receipt_path": "receipt.json",
         "infrastructure_failure_receipt_path": "failure.json", "progress_receipt_path": "progress.json",
-        "expected_checkpoint_path": str(checkpoint), "original_root": "original", "model_dir": "model",
-        "python_executable": sys.executable, "original_python": sys.executable,
+        "expected_checkpoint_path": str(checkpoint), "original_root": original["original_root"],
+        "model_dir": original["model_dir"], "python_executable": driver["python"],
+        "original_python": original["original_python"],
     }
     row = {
         "schema": authoring.PLAN_SCHEMA,
