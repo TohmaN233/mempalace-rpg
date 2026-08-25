@@ -149,28 +149,40 @@ def _source_roots(tmp_path: Path):
             "abstention_evidence",
         ):
             conversation = f"{persona}-{group}"
+            abstention = group == "abstention_evidence"
+            # Raw custody needs a non-empty official conversation binding for
+            # every canonical item.  CustodyStore deliberately emits an empty
+            # conversation list to the scorer for the abstention endpoint.
+            evidence_conversations = [{"id": conversation}]
+            evidence_spans = [] if abstention else [{"speaker": "speaker", "text": "answer evidence"}]
             evidence = {
                 "personId": persona, "question": f"q-{persona}-{group}", "answer": f"answer-{persona}-{group}",
-                "category": group, "conversations": [{"id": conversation}],
-                "message_evidences": [{"speaker": "speaker", "text": "answer evidence"}],
+                "category": group, "conversations": evidence_conversations,
+                "message_evidences": evidence_spans,
             }
             path = canonical / "core_benchmark" / "evidence_questions" / group / "tier" / f"{persona}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"evidence_items": [evidence]}), encoding="utf-8")
+            messages = (
+                ([{"speaker": "speaker", "text": "answer evidence"}] if not abstention else [])
+                + [
+                    {
+                        "speaker": "user" if number % 2 == 0 else "assistant",
+                        "text": f"candidate {number}",
+                    }
+                    for number in range(9 if not abstention else 10)
+                ]
+            )
+            assert len(messages) == 10
+            assert sum((message["speaker"], message["text"]) == ("speaker", "answer evidence") for message in messages) == (0 if abstention else 1)
             for context_size in (1, 8):
                 cases.append({
                     "contextSize": context_size,
                     "evidenceItems": [{key: evidence[key] for key in ("personId", "question", "answer", "category", "conversations")}],
-                    # The original public-product query contract is exact
-                    # Top-10, so every independently ranked corpus supplies
-                    # at least ten candidate message IDs.
-                    "conversations": [{"id": conversation, "messages": [
-                        {
-                            "speaker": "user" if number % 2 == 0 else "assistant",
-                            "text": f"candidate {number}",
-                        }
-                        for number in range(10)
-                    ]}],
+                    # The exact original query is Top-10.  Positive cases
+                    # contain one, and only one, normalized evidence span;
+                    # abstentions intentionally contain none.
+                    "conversations": [{"id": conversation, "messages": messages}],
                 })
     premix_path = premix / "core_benchmark" / "pre_mixed_testcases" / "cases.json"
     premix_path.parent.mkdir(parents=True, exist_ok=True)
