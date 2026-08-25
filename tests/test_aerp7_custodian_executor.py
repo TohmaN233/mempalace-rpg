@@ -24,6 +24,45 @@ from benchmarks import aerp7_convomem_scoring as score
 from benchmarks.aerp7_convomem_confirmation import CustodyError, canonical_sha256
 
 
+def test_capacity_scoring_observation_accepts_only_instrumented_scalar_fields(tmp_path):
+    assert custodian._capacity_scoring_observation({
+        "schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "scoring",
+        "scoring_db_peak_bytes": 7, "report_bytes": 11, "mapping_ledger_bytes": 13,
+    }) == {"scoring_db_peak_bytes": 7, "report_bytes": 11, "mapping_ledger_bytes": 13}
+    with pytest.raises(CustodyError, match="capacity_scoring_sidecar_invalid"):
+        custodian._capacity_scoring_observation({
+            "schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "scoring",
+            "scoring_db_peak_bytes": 0, "report_bytes": 11, "mapping_ledger_bytes": 13,
+        })
+
+
+def test_capacity_scoring_sidecar_rejects_wrong_role_or_binding(tmp_path):
+    binding = {
+        "plan_sha256": "a" * 64, "generation_id": "generation", "projection_sha256": "b" * 64,
+        "public_freeze_packet_sha256": "c" * 64, "authorization_id": "authorization",
+        "report_sha256": "d" * 64, "final_packet_sha256": "e" * 64,
+    }
+    row = {
+        "schema": custodian.CAPACITY_SCORING_SIDECAR_SCHEMA, "kind": "custodian_scoring",
+        "binding": binding,
+        "components": {"custody_ephemeral_sqlite_bytes": 1, "candidate_store_bytes": 2, "mapping_ledger_ready_bytes": 3, "final_packet_bytes": 4, "report_bytes": 5},
+        "scoring_db_peak_bytes": 6, "report_bytes": 5, "mapping_ledger_bytes": 3,
+    }
+    row["sidecar_sha256"] = custodian._digest(row)
+    sidecar = tmp_path / "capacity.json"; sidecar.write_text(json.dumps(row), encoding="utf-8")
+    assert custodian.load_capacity_scoring_sidecar(sidecar)["binding"] == binding
+    row["kind"] = "scoring"; sidecar.write_text(json.dumps(row), encoding="utf-8")
+    with pytest.raises(CustodyError, match="capacity_scoring_sidecar_invalid"):
+        custodian.load_capacity_scoring_sidecar(sidecar)
+    row["kind"] = "custodian_scoring"
+    row["binding"] = {**binding, "public_packet_sha256": binding["public_freeze_packet_sha256"]}
+    row["binding"].pop("public_freeze_packet_sha256")
+    row["sidecar_sha256"] = custodian._digest({key: value for key, value in row.items() if key != "sidecar_sha256"})
+    sidecar.write_text(json.dumps(row), encoding="utf-8")
+    with pytest.raises(CustodyError, match="capacity_scoring_sidecar_invalid"):
+        custodian.load_capacity_scoring_sidecar(sidecar)
+
+
 def _h(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -230,6 +269,17 @@ def test_real_synthetic_bundle_scores_in_a_distinct_subprocess_and_is_idempotent
     assert retry["exit_code"] == 0, retry["stderr"].decode("utf-8", "replace")
     assert output.read_bytes() == initial
     assert not list(output.parent.glob(".custodian-packet.json.tmp-*"))
+
+
+def test_observerless_custodian_launcher_does_not_construct_capacity_supervisor(tmp_path, monkeypatch):
+    config, config_path, private, _freeze = _public_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        custodian.executor, "_SupervisorTreeObserver",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("capacity supervisor")),
+    )
+    launched = custodian.launch_custodian(public_config_path=config_path, private_payload=private)
+    assert launched["exit_code"] == 0
+    assert "supervisor_receipt" not in launched
 
 
 def test_consumed_marker_requires_capability_hmac_and_rejects_tampering(tmp_path, monkeypatch):

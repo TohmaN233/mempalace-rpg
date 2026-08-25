@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from benchmarks import aerp7_convomem_executor as executor
 from benchmarks import aerp7_convomem_formal as formal
@@ -49,6 +49,11 @@ PUBLIC_CONFIG_KEYS = frozenset({
     "custody_bundle", "output_path", "freeze_packet_file_sha256",
     "candidate_ready_sha256", "custody_ready_sha256", "custody_bundle_sha256",
 })
+FORMAL_PUBLIC_CAPACITY_CONFIG_KEYS = frozenset({
+    *PUBLIC_CONFIG_KEYS, "capacity_scoring_sidecar_path", "capacity_plan_sha256",
+    "capacity_generation_id", "capacity_projection_sha256",
+})
+CAPACITY_SCORING_SIDECAR_SCHEMA = "aerp7-convomem-capacity-custodian-scoring-sidecar-v1"
 PRIVATE_KEYS = frozenset({
     "schema", "binding_secret", "custody_capability_secret", "evidence_token_secret",
     "scorer_attestation_secret", "public_packet_sha256", "freeze_packet_file_sha256",
@@ -177,10 +182,13 @@ def _private(value: Any, *, packet_sha256: str, file_sha256: str, output_path: P
 
 
 def _public_config(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != PUBLIC_CONFIG_KEYS:
+    if not isinstance(value, Mapping):
         raise CustodyError("custodian_public_config_invalid")
     row = dict(value)
     synthetic = row.get("synthetic_test_mode")
+    allowed = FORMAL_PUBLIC_CAPACITY_CONFIG_KEYS if synthetic is False and set(row) == FORMAL_PUBLIC_CAPACITY_CONFIG_KEYS else PUBLIC_CONFIG_KEYS
+    if set(row) != allowed:
+        raise CustodyError("custodian_public_config_invalid")
     expected_schema = PUBLIC_CONFIG_SCHEMA if synthetic is True else FORMAL_PUBLIC_CONFIG_SCHEMA
     if row.get("schema") != expected_schema or synthetic not in {True, False}:
         raise CustodyError("custodian_public_config_invalid")
@@ -189,6 +197,63 @@ def _public_config(value: Any) -> dict[str, Any]:
             raise CustodyError("custodian_public_config_invalid")
     for key in ("freeze_packet_file_sha256", "candidate_ready_sha256", "custody_ready_sha256", "custody_bundle_sha256"):
         _hex(row.get(key), "custodian_public_config_digest_invalid")
+    if "capacity_scoring_sidecar_path" in row:
+        path = Path(row["capacity_scoring_sidecar_path"])
+        if synthetic is not False or not path.is_absolute() or path.parent != Path(row["output_path"]).parent or path.exists() or path.is_symlink():
+            raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+        for key in ("capacity_plan_sha256", "capacity_projection_sha256"):
+            _hex(row.get(key), "custodian_capacity_scoring_sidecar_invalid")
+        if not isinstance(row.get("capacity_generation_id"), str) or not row["capacity_generation_id"]:
+            raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    return row
+
+
+def _capacity_scoring_observation(value: Mapping[str, Any]) -> dict[str, int]:
+    """Accept only the scalar emitted by the instrumented scoring spool."""
+    row = dict(value)
+    required = {"schema", "kind", "scoring_db_peak_bytes", "report_bytes", "mapping_ledger_bytes"}
+    if set(row) != required or row.get("schema") != executor.CAPACITY_EVENT_SCHEMA or row.get("kind") != "scoring":
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    if any(isinstance(row[key], bool) or not isinstance(row[key], int) or row[key] <= 0 for key in (
+        "scoring_db_peak_bytes", "report_bytes", "mapping_ledger_bytes",
+    )):
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    return {key: int(row[key]) for key in ("scoring_db_peak_bytes", "report_bytes", "mapping_ledger_bytes")}
+
+
+def _path_footprint(path: Path) -> int:
+    """Exact local footprint for a named ephemeral component, never recursive."""
+    total = 0
+    for candidate in (path, path.with_name(path.name + "-journal"), path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        if candidate.is_file() and not candidate.is_symlink():
+            total += candidate.stat().st_size
+    return total
+
+
+def load_capacity_scoring_sidecar(path: Path) -> dict[str, Any]:
+    row = _load_public(path, code="custodian_capacity_scoring_sidecar_invalid")
+    required = {
+        "schema", "kind", "binding", "components", "scoring_db_peak_bytes",
+        "report_bytes", "mapping_ledger_bytes", "sidecar_sha256",
+    }
+    if set(row) != required or row.get("schema") != CAPACITY_SCORING_SIDECAR_SCHEMA or row.get("kind") != "custodian_scoring" or row.get("sidecar_sha256") != _digest({key: item for key, item in row.items() if key != "sidecar_sha256"}):
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    binding = row.get("binding")
+    binding_required = {"plan_sha256", "generation_id", "projection_sha256", "public_freeze_packet_sha256", "authorization_id", "report_sha256", "final_packet_sha256"}
+    if not isinstance(binding, Mapping) or set(binding) != binding_required:
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    for key in binding_required - {"generation_id", "authorization_id"}:
+        _hex(binding.get(key), "custodian_capacity_scoring_sidecar_invalid")
+    if not all(isinstance(binding.get(key), str) and binding[key] for key in ("generation_id", "authorization_id")):
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    components = row.get("components")
+    component_required = {"custody_ephemeral_sqlite_bytes", "candidate_store_bytes", "mapping_ledger_ready_bytes", "final_packet_bytes", "report_bytes"}
+    if not isinstance(components, Mapping) or set(components) != component_required:
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    if any(isinstance(row[key], bool) or not isinstance(row[key], int) or row[key] <= 0 for key in ("scoring_db_peak_bytes", "report_bytes", "mapping_ledger_bytes")):
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+    if any(isinstance(components[key], bool) or not isinstance(components[key], int) or components[key] <= 0 for key in component_required):
+        raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
     return row
 
 
@@ -688,6 +753,15 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     ledger_path = Path(cfg["output_path"]).with_name(
         f".{Path(cfg['output_path']).name}.aerp7-mapping-ledger-{private['authorization_id']}.json"
     )
+    capacity_score: dict[str, int] | None = None
+    capacity_components: dict[str, int] | None = None
+
+    def observe_score(value: Mapping[str, Any]) -> None:
+        nonlocal capacity_score
+        if capacity_score is not None:
+            raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+        capacity_score = _capacity_scoring_observation(value)
+
     try:
         if formal_live:
             store_parent = Path(tempfile.mkdtemp(prefix="aerp7-custodian-score-", dir=Path(cfg["candidate_bundle"]).parent))
@@ -702,7 +776,31 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
             custody_loader=(None if formal_live else (lambda: opened)),
             evidence_token_secret=private["evidence_token_secret"], formal_live=formal_live,
             mapping_ledger_path=ledger_path if formal_live else None,
+            capacity_observer=observe_score if "capacity_scoring_sidecar_path" in cfg else None,
         )
+        if "capacity_scoring_sidecar_path" in cfg:
+            if capacity_score is None or store is None:
+                raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+            ledger_ready = ledger_path.with_name(ledger_path.stem + ".READY.json")
+            custody_receipt = opened.receipt() if callable(getattr(opened, "receipt", None)) else None
+            if not isinstance(custody_receipt, Mapping):
+                raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+            custody_bytes = custody_receipt.get("sqlite_store_bytes")
+            candidate_bytes = _path_footprint(store.database)
+            ledger_bytes = _path_footprint(ledger_path) + _path_footprint(ledger_ready)
+            if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (custody_bytes, candidate_bytes, ledger_bytes)):
+                raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+            if ledger_bytes != capacity_score["mapping_ledger_bytes"] + _path_footprint(ledger_ready):
+                # The scorer's scalar is the payload itself.  The sidecar also
+                # charges its READY publication exactly once.
+                raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+            capacity_components = {
+                "custody_ephemeral_sqlite_bytes": int(custody_bytes),
+                "candidate_store_bytes": candidate_bytes,
+                "mapping_ledger_ready_bytes": ledger_bytes,
+                "report_bytes": capacity_score["report_bytes"],
+                "final_packet_bytes": 1,  # replaced by canonical final bytes below.
+            }
     finally:
         if store is not None:
             store.close()
@@ -750,7 +848,31 @@ def _execute_authorized(*, public: Mapping[str, Any], private: Mapping[str, Any]
     outer["packet_sha256"] = _digest(outer)
     _scan_public(outer, private_values=[private[name] for name in ("binding_secret", "custody_capability_secret", "evidence_token_secret", "scorer_attestation_secret")])
     output = Path(cfg["output_path"])
-    result = formal.publish_nonreplace(output, _bytes(outer), fsync_parent=executor._sync_parent)
+    outer_bytes = _bytes(outer)
+    if "capacity_scoring_sidecar_path" in cfg:
+        if capacity_score is None or capacity_components is None:
+            raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+        capacity_components["final_packet_bytes"] = len(outer_bytes)
+        sidecar = {
+            "schema": CAPACITY_SCORING_SIDECAR_SCHEMA,
+            "kind": "custodian_scoring",
+            "binding": {
+                "plan_sha256": cfg["capacity_plan_sha256"],
+                "generation_id": cfg["capacity_generation_id"],
+                "projection_sha256": cfg["capacity_projection_sha256"],
+                "public_freeze_packet_sha256": packet["packet_sha256"],
+                "authorization_id": private["authorization_id"],
+                "report_sha256": report["report_sha256"],
+                "final_packet_sha256": outer["packet_sha256"],
+            },
+            "components": capacity_components,
+            **capacity_score,
+        }
+        sidecar["sidecar_sha256"] = _digest(sidecar)
+        executor.formal.publish_nonreplace(
+            Path(cfg["capacity_scoring_sidecar_path"]), _bytes(sidecar), fsync_parent=executor._sync_parent,
+        )
+    result = formal.publish_nonreplace(output, outer_bytes, fsync_parent=executor._sync_parent)
     return {**result, "packet_sha256": outer["packet_sha256"], "gate_outcome": decision["outcome"]}
 
 
@@ -883,7 +1005,8 @@ def _sanitized_env() -> dict[str, str]:
     return retained
 
 
-def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, Any], timeout_seconds: float | None = None, python_executable: str | None = None) -> dict[str, Any]:
+def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, Any], timeout_seconds: float | None = None, python_executable: str | None = None,
+                     capacity_observer: Callable[[Mapping[str, Any]], None] | None = None) -> dict[str, Any]:
     """Test harness launcher: private JSON is stdin only; child env is public."""
     executable = python_executable or sys.executable
     if Path(executable).resolve() != Path(sys.executable).resolve() or (timeout_seconds is not None and timeout_seconds <= 0):
@@ -895,18 +1018,35 @@ def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, 
     payload = _bytes(private_payload)
     try:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            stdout, stderr = process.communicate(payload, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
+        if capacity_observer is None:
             try:
-                import psutil
-                root = psutil.Process(process.pid)
-                for child in root.children(recursive=True):
-                    child.kill()
-            except BaseException:
-                pass
-            process.kill(); stdout, stderr = process.communicate()
-            raise CustodyError("custodian_infrastructure_failure", reason="wall_timeout", timeout_seconds=timeout_seconds)
+                stdout, stderr = process.communicate(payload, timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                try:
+                    import psutil
+                    root = psutil.Process(process.pid)
+                    for child in root.children(recursive=True):
+                        child.kill()
+                except BaseException:
+                    pass
+                process.kill(); stdout, stderr = process.communicate()
+                raise CustodyError("custodian_infrastructure_failure", reason="wall_timeout", timeout_seconds=timeout_seconds)
+            supervisor: dict[str, Any] | None = None
+        else:
+            with executor._SupervisorTreeObserver(process.pid) as monitor:
+                try:
+                    stdout, stderr = process.communicate(payload, timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    try:
+                        import psutil
+                        root = psutil.Process(process.pid)
+                        for child in root.children(recursive=True):
+                            child.kill()
+                    except BaseException:
+                        pass
+                    process.kill(); stdout, stderr = process.communicate()
+                    raise CustodyError("custodian_infrastructure_failure", reason="wall_timeout", timeout_seconds=timeout_seconds)
+            supervisor = monitor.receipt()
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
     secret_values = [str(value).encode("utf-8") for key, value in private_payload.items() if key.endswith("secret")]
@@ -929,7 +1069,25 @@ def launch_custodian(*, public_config_path: Path, private_payload: Mapping[str, 
         raise CustodyError("custodian_subprocess_output_invalid")
     if packet["public_freeze_file_sha256"] != public_config["freeze_packet_file_sha256"]:
         raise CustodyError("custodian_subprocess_output_public_binding_invalid")
-    return {"pid": process.pid, "exit_code": process.returncode, "stdout": stdout, "stderr": stderr, "command_sha256": _digest(command), "environment_keys": sorted(env), "output_file_sha256": _file_sha256(output_path), "packet_sha256": packet["packet_sha256"]}
+    if "capacity_scoring_sidecar_path" in public_config:
+        sidecar = Path(public_config["capacity_scoring_sidecar_path"])
+        observed = load_capacity_scoring_sidecar(sidecar)
+        binding = observed["binding"]
+        if binding["plan_sha256"] != public_config["capacity_plan_sha256"] or binding["generation_id"] != public_config["capacity_generation_id"] or binding["projection_sha256"] != public_config["capacity_projection_sha256"] or binding["public_freeze_packet_sha256"] != packet["public_freeze_packet_sha256"] or binding["authorization_id"] != _authorization_id(private_payload) or binding["final_packet_sha256"] != packet["packet_sha256"] or binding["report_sha256"] != packet["envelope"]["report"]["report_sha256"]:
+            raise CustodyError("custodian_capacity_scoring_sidecar_invalid")
+        if capacity_observer is not None:
+            capacity_observer({
+                "schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "custodian_scoring",
+                "scoring_db_peak_bytes": observed["scoring_db_peak_bytes"],
+                "report_bytes": observed["report_bytes"], "mapping_ledger_bytes": observed["mapping_ledger_bytes"],
+                "components": dict(observed["components"]), "binding": dict(binding),
+                "supervisor_receipt": supervisor,
+            })
+        sidecar.unlink(); executor._sync_parent(sidecar.parent)
+    result = {"pid": process.pid, "exit_code": process.returncode, "stdout": stdout, "stderr": stderr, "command_sha256": _digest(command), "environment_keys": sorted(env), "output_file_sha256": _file_sha256(output_path), "packet_sha256": packet["packet_sha256"]}
+    if supervisor is not None:
+        result["supervisor_receipt"] = supervisor
+    return result
 
 
 def _read_private_stdin() -> dict[str, Any]:

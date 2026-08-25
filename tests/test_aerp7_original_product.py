@@ -1186,3 +1186,40 @@ def test_query_sidecar_rejects_nonpositive_timing_and_binding_tampering():
             replicate=draft.replicate_without_coordinator_audit,
             expected_count=2,
         )
+
+
+def test_capacity_chroma_sidecar_is_scalar_complete_and_tamper_detected(tmp_path):
+    class Inner:
+        def __init__(self): self.phases = []
+        def checkpoint(self, phase): self.phases.append(phase)
+        def receipt(self): return {"production": "unchanged"}
+
+    palace = tmp_path / "palace"; palace.mkdir()
+    inner = Inner()
+    observer = original.CapacityPeakObserver(observer=inner, palace_path=palace, build_id="build", generation_id="generation", projection_sha256="p" * 64)
+    observer.checkpoint("before_ingest")
+    (palace / "index.bin").write_bytes(b"abc")
+    observer.checkpoint("after_ingest")
+    (palace / "index.bin").write_bytes(b"abcdef")
+    observer.checkpoint("after_cold_close")
+    observer.checkpoint("after_queries")
+    assert observer.receipt() == {"production": "unchanged"}
+    sidecar = tmp_path / "peak.json"
+    assert observer.publish_sidecar(sidecar)["peak_bytes"] == 6
+    assert original.load_capacity_chroma_sidecar(sidecar)["peak_bytes"] == 6
+    broken = json.loads(sidecar.read_text(encoding="utf-8")); broken["peak_bytes"] = 7
+    sidecar.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(original.OriginalProductError, match="sidecar invalid"):
+        original.load_capacity_chroma_sidecar(sidecar)
+
+
+def test_capacity_chroma_sidecar_fails_closed_on_missing_phase(tmp_path):
+    class Inner:
+        def checkpoint(self, phase): pass
+        def receipt(self): return {}
+
+    palace = tmp_path / "palace"; palace.mkdir(); (palace / "index.bin").write_bytes(b"x")
+    observer = original.CapacityPeakObserver(observer=Inner(), palace_path=palace, build_id="build", generation_id="generation", projection_sha256="p" * 64)
+    observer.checkpoint("before_ingest")
+    with pytest.raises(original.OriginalProductError, match="observer incomplete"):
+        observer.publish_sidecar(tmp_path / "peak.json")

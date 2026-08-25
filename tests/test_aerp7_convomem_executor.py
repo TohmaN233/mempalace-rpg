@@ -374,9 +374,20 @@ def test_synthetic_public_coordinator_launches_nine_isolated_workers(tmp_path, m
     with pytest.raises(CustodyError, match="receipt_coverage_invalid"):
         executor.formal.validate_current_execution_receipts(tampered, current_worker_receipt=packet["current_worker_receipt"], protocol=packet["protocol"], projection=projection, resources=packet["resource_receipts"], ranking_artifacts=current_artifacts, supervisors=packet["supervisors"], allow_synthetic=True)
     assert (output / "public-freeze.json").is_file()
+    assert not list(output.rglob("*capacity*.json"))
     assert all("CUSTODY" not in key and "BINDING" not in key for row in packet["supervisors"].values() for key in [])
     with pytest.raises(CustodyError, match="output_present"):
         executor.public_coordinator(config)
+
+
+def test_capacity_observer_is_single_optional_event_function():
+    events = []
+    executor._capacity_event(events.append, "current_artifact", role="raw", artifact_reference={"measurement_reference": {}})
+    executor._capacity_event(None, "ignored", value=1)
+    assert events == [{
+        "schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "current_artifact",
+        "role": "raw", "artifact_reference": {"measurement_reference": {}},
+    }]
 
 
 def test_formal_current_worker_uses_live_runner_without_synthetic_fallback(tmp_path, monkeypatch):

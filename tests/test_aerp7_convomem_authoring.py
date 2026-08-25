@@ -125,6 +125,41 @@ def test_signed_one_shot_plan_is_exact_and_rejects_path_or_hmac_drift(tmp_path: 
         authoring.validate_one_shot_plan(plan, operator_capability=secret)
 
 
+def test_signed_capacity_calibration_plan_is_separate_and_binds_its_external_inputs(tmp_path: Path) -> None:
+    secret = b"x" * 32
+    envelope = tmp_path / "envelope.json"; envelope.write_bytes(b'{"envelope":true}')
+    collector = tmp_path / "collector.py"; collector.write_bytes(b"collector")
+    launcher = tmp_path / "launcher.py"; launcher.write_bytes(b"launcher")
+    fields = {
+        "schema": "aerp7-convomem-capacity-calibration-plan-v1",
+        "purpose": "private_disk_calibration_only", "formal_evidence_eligible": False,
+        "scientific_metrics_retained": False,
+        "repo_root": str(tmp_path.resolve()), "run_root": str((tmp_path / "run").resolve()),
+        "canonical_root": str((tmp_path / "canonical").resolve()), "premix_root": str((tmp_path / "premix").resolve()),
+        "expected_checkpoint_path": str((tmp_path / "checkpoint.json").resolve()),
+        "original_root": str((tmp_path / "original").resolve()), "model_dir": str((tmp_path / "model").resolve()),
+        "python_executable": str((tmp_path / "python").resolve()), "original_python": str((tmp_path / "original-python").resolve()),
+        "source_manifest": authoring.CENSUS_SOURCE_MANIFEST,
+        "model_receipt": {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": "a" * 64, "bytes": 1}]},
+        "census_semantics": authoring.CENSUS_SEMANTICS,
+        "preparse_current_code_receipt": {"head": "a" * 40, "tree": "b" * 40, "diff_digest": "c" * 64, "dirty_policy": "clean_required"},
+        "capacity_envelope_path": str(envelope.resolve()), "capacity_envelope_file_sha256": hashlib.sha256(envelope.read_bytes()).hexdigest(),
+        "capacity_envelope_semantic_sha256": "d" * 64,
+        "capacity_collector_path": str(collector.resolve()), "capacity_collector_sha256": hashlib.sha256(collector.read_bytes()).hexdigest(),
+        "capacity_launcher_path": str(launcher.resolve()), "capacity_launcher_sha256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
+        "observation_output_path": str((tmp_path.parent / (tmp_path.name + "-observation.json")).resolve()),
+        "calibration_receipt_path": str((tmp_path.parent / (tmp_path.name + "-receipt.json")).resolve()),
+        "disk_safety_margin_bytes": 1, "rss_safety_margin_bytes": 2,
+        "public_authorization_nonce": "u" * 32, "custodian_nonce": "n" * 32,
+        "custodian_expires_at_unix": 2_000_000_000,
+    }
+    signed = authoring.sign_capacity_calibration_plan(fields, operator_capability=secret)
+    assert authoring.validate_capacity_calibration_plan(signed, operator_capability=secret)["plan_sha256"] == signed["plan_sha256"]
+    signed["capacity_launcher_sha256"] = "0" * 64
+    with pytest.raises(CustodyError, match="plan_digest"):
+        authoring.validate_capacity_calibration_plan(signed, operator_capability=secret)
+
+
 def test_signed_one_shot_plan_allows_only_a_shared_canonical_and_premix_source_root(tmp_path: Path) -> None:
     secret = b"x" * 32
     source_root = str((tmp_path / "convomem").resolve())

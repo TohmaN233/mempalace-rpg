@@ -128,6 +128,80 @@ class LiveOriginalObserver:
         return {"peak_rss_bytes": 0, "storage_bytes": int(storage), "passage_embedding": {"calls": self._corpus_count, "texts": int(self._denominators["candidate_text_count"]), "measurement": PUBLIC_UPSERT_MEASUREMENT}, "query_embedding": {"calls": int(self._denominators["query_count"]), "texts": int(self._denominators["query_count"]), "measurement": PUBLIC_SEARCH_MEASUREMENT}, "provider": self._provider}
 
 
+CAPACITY_CHROMA_SIDECAR_SCHEMA = "aerp7-convomem-capacity-chroma-sidecar-v1"
+
+
+class CapacityPeakObserver:
+    """Measure one live palace without changing the production observer receipt.
+
+    This is deliberately a wrapper, not a second original-product path.  It
+    samples only at the existing four lifecycle checkpoints and publishes a
+    scalar-only sidecar once the worker has completed successfully.
+    """
+    _PHASES = ("before_ingest", "after_ingest", "after_cold_close", "after_queries")
+
+    def __init__(self, *, observer: ResourceObserver, palace_path: Path, build_id: str,
+                 generation_id: str, projection_sha256: str) -> None:
+        self._observer = observer
+        self._palace_path = palace_path
+        self._build_id = build_id; self._generation_id = generation_id; self._projection_sha256 = projection_sha256
+        if not all(isinstance(value, str) and value for value in (build_id, generation_id, projection_sha256)):
+            raise OriginalProductError("capacity chroma observer binding invalid")
+        self._phases: list[str] = []
+        self._peak_bytes = 0
+
+    def checkpoint(self, phase: str) -> None:
+        if len(self._phases) >= len(self._PHASES) or phase != self._PHASES[len(self._phases)]:
+            raise OriginalProductError("capacity chroma observer lifecycle invalid")
+        self._observer.checkpoint(phase)
+        if self._palace_path.exists():
+            if self._palace_path.is_symlink() or not self._palace_path.is_dir():
+                raise OriginalProductError("capacity chroma observer palace invalid")
+            total = 0
+            for child in self._palace_path.rglob("*"):
+                if child.is_symlink():
+                    raise OriginalProductError("capacity chroma observer palace invalid")
+                if child.is_file(): total += child.stat().st_size
+            self._peak_bytes = max(self._peak_bytes, total)
+        self._phases.append(phase)
+
+    def receipt(self) -> Mapping[str, Any]:
+        return self._observer.receipt()
+
+    def publish_sidecar(self, path: Path) -> dict[str, Any]:
+        if self._phases != list(self._PHASES) or self._peak_bytes <= 0:
+            raise OriginalProductError("capacity chroma observer incomplete")
+        if path.exists() or path.is_symlink() or not path.parent.is_dir() or path.parent.is_symlink():
+            raise OriginalProductError("capacity chroma sidecar output invalid")
+        value = {"schema": CAPACITY_CHROMA_SIDECAR_SCHEMA, "build_id": self._build_id,
+                 "generation_id": self._generation_id, "projection_sha256": self._projection_sha256,
+                 "peak_bytes": int(self._peak_bytes), "sidecar_sha256": ""}
+        value["sidecar_sha256"] = _digest({key: item for key, item in value.items() if key != "sidecar_sha256"})
+        raw = _canonical_bytes(value)
+        try:
+            with path.open("xb") as stream:
+                stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        except OSError as exc:
+            raise OriginalProductError("capacity chroma sidecar write failed") from exc
+        if path.read_bytes() != raw:
+            raise OriginalProductError("capacity chroma sidecar readback failed")
+        return value
+
+
+def load_capacity_chroma_sidecar(path: Path) -> dict[str, Any]:
+    """Read the bounded sidecar emitted by :class:`CapacityPeakObserver`."""
+    if path.is_symlink() or not path.is_file():
+        raise OriginalProductError("capacity chroma sidecar missing")
+    try: raw = path.read_bytes(); value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OriginalProductError("capacity chroma sidecar invalid") from exc
+    if not isinstance(value, Mapping) or set(value) != {"schema", "build_id", "generation_id", "projection_sha256", "peak_bytes", "sidecar_sha256"} or value.get("schema") != CAPACITY_CHROMA_SIDECAR_SCHEMA:
+        raise OriginalProductError("capacity chroma sidecar invalid")
+    if (not all(isinstance(value.get(key), str) and value[key] for key in ("build_id", "generation_id", "projection_sha256")) or isinstance(value.get("peak_bytes"), bool) or not isinstance(value.get("peak_bytes"), int) or value["peak_bytes"] <= 0 or value.get("sidecar_sha256") != _digest({key: item for key, item in value.items() if key != "sidecar_sha256"}) or raw != _canonical_bytes(value)):
+        raise OriginalProductError("capacity chroma sidecar invalid")
+    return dict(value)
+
+
 @dataclass(frozen=True)
 class _LivePinnedCapability:
     """Opaque in-process provenance token minted only by the live context."""

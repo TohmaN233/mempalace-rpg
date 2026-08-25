@@ -19,6 +19,8 @@ from benchmarks.aerp5_product_paired_locomo import git_state
 
 
 PLAN_SCHEMA = "aerp7-convomem-one-shot-plan-v1"
+CAPACITY_CALIBRATION_PLAN_SCHEMA = "aerp7-convomem-capacity-calibration-plan-v1"
+CAPACITY_CALIBRATION_PURPOSE = "private_disk_calibration_only"
 CENSUS_DATASET_SOURCE = {
     "repository": "SalesforceAIResearch/ConvoMem",
     "commit": "e3e9b39115b02346824c70d349350de738f8be41",
@@ -200,6 +202,91 @@ def validate_private_disk_preflight(value: Any, *, operator_capability: bytes,
     expected = hmac.new(operator_capability, _bytes({key: item for key, item in row.items() if key != "preflight_hmac"}), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(row["preflight_hmac"], expected):
         raise CustodyError("private_disk_preflight_hmac_invalid")
+    return row
+
+
+def sign_capacity_calibration_plan(value: Mapping[str, Any], *, operator_capability: bytes) -> dict[str, Any]:
+    """Sign the intentionally non-scientific capacity execution contract.
+
+    This is not a variant of the formal one-shot plan: it has no disk estimate
+    to enforce and binds the external collector inputs that will produce one.
+    """
+    row = dict(value)
+    if row.get("schema") != CAPACITY_CALIBRATION_PLAN_SCHEMA or "plan_sha256" in row or "plan_hmac" in row:
+        raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    row["plan_sha256"] = _digest(row)
+    row["plan_hmac"] = hmac.new(operator_capability, _bytes({key: item for key, item in row.items() if key != "plan_hmac"}), hashlib.sha256).hexdigest()
+    return row
+
+
+def validate_capacity_calibration_plan(value: Any, *, operator_capability: bytes) -> dict[str, Any]:
+    """Validate the separate calibration plan without accepting formal output.
+
+    External tool file bytes are rechecked by the driver before parsing corpus
+    data.  This pure validator only establishes the signed schema and path
+    topology so callers can reject a malformed plan before filesystem mutation.
+    """
+    if not isinstance(value, Mapping):
+        raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    row = dict(value)
+    required = {
+        "schema", "purpose", "formal_evidence_eligible", "scientific_metrics_retained",
+        "repo_root", "run_root", "canonical_root", "premix_root", "expected_checkpoint_path",
+        "original_root", "model_dir", "python_executable", "original_python", "source_manifest",
+        "model_receipt", "census_semantics", "preparse_current_code_receipt", "capacity_envelope_path",
+        "capacity_envelope_file_sha256", "capacity_envelope_semantic_sha256", "capacity_collector_path",
+        "capacity_collector_sha256", "capacity_launcher_path", "capacity_launcher_sha256", "observation_output_path",
+        "calibration_receipt_path", "disk_safety_margin_bytes", "rss_safety_margin_bytes",
+        "public_authorization_nonce", "custodian_nonce", "custodian_expires_at_unix", "plan_sha256", "plan_hmac",
+    }
+    if set(row) != required or row.get("schema") != CAPACITY_CALIBRATION_PLAN_SCHEMA:
+        raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    if row.get("purpose") != CAPACITY_CALIBRATION_PURPOSE or row.get("formal_evidence_eligible") is not False or row.get("scientific_metrics_retained") is not False:
+        raise CustodyError("aerp7_capacity_calibration_plan_purpose_invalid")
+    path_keys = {
+        "repo_root", "run_root", "canonical_root", "premix_root", "expected_checkpoint_path", "original_root",
+        "model_dir", "python_executable", "original_python", "capacity_envelope_path", "capacity_collector_path", "capacity_launcher_path",
+        "observation_output_path", "calibration_receipt_path",
+    }
+    if any(not isinstance(row[key], str) or not Path(row[key]).is_absolute() for key in path_keys):
+        raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    run_root = Path(row["run_root"])
+    for key in ("observation_output_path", "calibration_receipt_path"):
+        path = Path(row[key])
+        try:
+            path.relative_to(run_root)
+        except ValueError:
+            continue
+        raise CustodyError("aerp7_capacity_calibration_plan_output_inside_run_root")
+    protected = (Path(row["repo_root"]), Path(row["canonical_root"]), Path(row["premix_root"]), Path(row["model_dir"]), Path(row["original_root"]))
+    for key in ("observation_output_path", "calibration_receipt_path"):
+        output = Path(row[key])
+        if any(output.is_relative_to(root) for root in protected):
+            raise CustodyError("aerp7_capacity_calibration_plan_output_protected")
+    if Path(row["observation_output_path"]) == Path(row["calibration_receipt_path"]):
+        raise CustodyError("aerp7_capacity_calibration_plan_path_collision")
+    if any(not isinstance(row[key], str) or len(row[key].encode("utf-8")) < 32 for key in ("custodian_nonce", "public_authorization_nonce")):
+        raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    if isinstance(row["custodian_expires_at_unix"], bool) or not isinstance(row["custodian_expires_at_unix"], int):
+        raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    for key in ("capacity_envelope_file_sha256", "capacity_envelope_semantic_sha256", "capacity_collector_sha256", "capacity_launcher_sha256"):
+        try:
+            rank._hex(row.get(key), "aerp7_capacity_calibration_plan_invalid")
+        except CustodyError:
+            raise CustodyError("aerp7_capacity_calibration_plan_invalid") from None
+    for key in ("disk_safety_margin_bytes", "rss_safety_margin_bytes"):
+        if isinstance(row[key], bool) or not isinstance(row[key], int) or row[key] < 0:
+            raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    if row.get("source_manifest") != CENSUS_SOURCE_MANIFEST or row.get("census_semantics") != CENSUS_SEMANTICS:
+        raise CustodyError("aerp7_capacity_calibration_preparse_freeze_invalid")
+    formal._model_receipt(row.get("model_receipt"))
+    if clean_code_receipt_shape(row.get("preparse_current_code_receipt")) is None:
+        raise CustodyError("aerp7_capacity_calibration_plan_invalid")
+    if row["plan_sha256"] != _digest({key: item for key, item in row.items() if key not in {"plan_sha256", "plan_hmac"}}):
+        raise CustodyError("aerp7_capacity_calibration_plan_digest_invalid")
+    expected = hmac.new(operator_capability, _bytes({key: item for key, item in row.items() if key != "plan_hmac"}), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(str(row["plan_hmac"]), expected):
+        raise CustodyError("aerp7_capacity_calibration_plan_hmac_invalid")
     return row
 
 

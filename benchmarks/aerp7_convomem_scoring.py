@@ -255,13 +255,76 @@ class _ProjectionAccess:
         return value
 
 
+class _ObservedScoringConnection:
+    """A deliberately small proxy which observes SQLite *during* mutations.
+
+    Looking at ``score.sqlite3`` after the connection closes misses a rollback
+    journal entirely.  The proxy brackets every connection operation and commit
+    so the database, ``-journal``, WAL and SHM files are sampled while SQLite
+    owns them.  It otherwise preserves the sqlite connection surface used by
+    the scorer.
+    """
+
+    def __init__(self, connection: sqlite3.Connection, owner: "_ScoringDB") -> None:
+        self._connection = connection
+        self._owner = owner
+
+    def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        self._owner._observe_footprint()
+        try:
+            return self._connection.execute(*args, **kwargs)
+        finally:
+            self._owner._observe_footprint()
+
+    def executemany(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        self._owner._observe_footprint()
+        try:
+            return self._connection.executemany(*args, **kwargs)
+        finally:
+            self._owner._observe_footprint()
+
+    def executescript(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        self._owner._observe_footprint()
+        try:
+            return self._connection.executescript(*args, **kwargs)
+        finally:
+            self._owner._observe_footprint()
+
+    def commit(self) -> None:
+        self._owner._observe_footprint()
+        try:
+            self._connection.commit()
+        finally:
+            self._owner._observe_footprint()
+
+    def close(self) -> None:
+        self._owner._observe_footprint()
+        try:
+            self._connection.close()
+        finally:
+            self._owner._observe_footprint()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
 class _ScoringDB:
     """Ephemeral disk spool for custody rows, confidence pairs and ledgers."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, observe_capacity: bool = False) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="aerp7-scoring-")
         self.path = Path(self._tmp.name) / "score.sqlite3"
-        self.connection = sqlite3.connect(self.path)
+        self._observe_capacity = observe_capacity
+        self._peak_footprint_bytes = 0
+        self._raw_connection = sqlite3.connect(self.path)
+        # The formal scorer's normal path deliberately retains sqlite's native
+        # connection.  Capacity calibration opts into the bracketed proxy; it
+        # is not allowed to add path stats, sampling failures, or call-shape
+        # changes to scientific scoring.
+        self.connection: Any = (
+            _ObservedScoringConnection(self._raw_connection, self)
+            if observe_capacity else self._raw_connection
+        )
         self.connection.executescript(
             """
             CREATE TABLE projection_items(
@@ -302,6 +365,28 @@ class _ScoringDB:
             """
         )
         self.connection.commit()
+
+    def _observe_footprint(self) -> int:
+        if not self._observe_capacity:
+            return 0
+        total = 0
+        for path in (
+            self.path,
+            self.path.with_name(self.path.name + "-journal"),
+            self.path.with_name(self.path.name + "-wal"),
+            self.path.with_name(self.path.name + "-shm"),
+        ):
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+        self._peak_footprint_bytes = max(self._peak_footprint_bytes, total)
+        return total
+
+    @property
+    def peak_footprint_bytes(self) -> int:
+        # Take one final active-connection observation; the peak itself remains
+        # the maximum sampled around every write/commit above.
+        self._observe_footprint()
+        return self._peak_footprint_bytes
 
     def close(self) -> None:
         try:
@@ -1411,6 +1496,7 @@ def score_frozen(
     evidence_token_secret: bytes, custody_loader: Callable[[], Any] | None = None,
     formal_live: bool | None = None, custody_store: Any = None,
     mapping_ledger_path: Path | str | None = None,
+    capacity_observer: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     formal_hint = formal_live is True or (
         formal_live is None and isinstance(endpoint_manifest, Mapping)
@@ -1463,7 +1549,7 @@ def score_frozen(
     ledger_sidecar_path: Path | None = None
     ledger_sidecar_ready_path: Path | None = None
     try:
-        with _ScoringDB() as db:
+        with _ScoringDB(observe_capacity=capacity_observer is not None) as db:
             _prepare_projection_items(access, db)
             for reader in readers:
                 reader.preflight(access, db)
@@ -1576,7 +1662,25 @@ def score_frozen(
                 ledger_value = custody_index.legacy_ledger()
             report = {"schema": SCHEMA, "projection_sha256": access.digest, "endpoint_manifest_sha256": manifest["manifest_sha256"], "endpoint_manifest": manifest, "protocol": {"synthetic_test_mode": manifest["synthetic_test_mode"], "arm_registry": [arm["arm_id"] for arm in manifest["arms"]], "reference_arm": manifest["reference_arm"], "bootstrap": manifest["bootstrap"]}, "ranking_artifact_sha256": {reader.arm_id: reader.artifact_sha256 for reader in readers}, "mapping_ledger": ledger_value, "arms": arms, "paired_bootstrap": {"overall_positive": _bootstrap_states(states, manifest, subset="overall_positive"), "derived_hard_changing_and_implicit": _bootstrap_states(states, manifest, subset="derived_hard_changing_and_implicit"), "static_p5_vs_strong_raw_abstention_confidence": _confidence_nonregression_states(states, manifest, db)}}
             report["report_sha256"] = report_digest(report)
-            return validate_report(report)
+            checked_report = validate_report(report)
+            if capacity_observer is not None:
+                footprint = db.peak_footprint_bytes
+                if footprint <= 0:
+                    raise CustodyError("scoring_capacity_db_footprint_invalid")
+                report_bytes = json.dumps(checked_report, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                ledger_bytes = 0
+                if ledger_sidecar_path is not None:
+                    if not ledger_sidecar_path.is_file() or ledger_sidecar_path.is_symlink():
+                        raise CustodyError("scoring_capacity_mapping_ledger_invalid")
+                    ledger_bytes = ledger_sidecar_path.stat().st_size
+                if ledger_bytes <= 0:
+                    raise CustodyError("scoring_capacity_mapping_ledger_invalid")
+                capacity_observer({
+                    "schema": "aerp7-convomem-capacity-observer-event-v1", "kind": "scoring",
+                    "scoring_db_peak_bytes": footprint, "report_bytes": len(report_bytes),
+                    "mapping_ledger_bytes": ledger_bytes,
+                })
+            return checked_report
     except BaseException:
         if ledger_sidecar_created and ledger_sidecar_path is not None:
             try:

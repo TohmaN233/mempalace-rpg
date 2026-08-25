@@ -72,6 +72,31 @@ def run():
     p=projection(); arts=artifacts(p); return p, arts, manifest(p,arts), custody(p)
 
 
+def test_scoring_db_capacity_peak_includes_active_rollback_journal() -> None:
+    with score._ScoringDB(observe_capacity=True) as db:
+        db.connection.execute("BEGIN IMMEDIATE")
+        db.connection.execute(
+            "INSERT INTO projection_items VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("item", "persona", "corpus", 1, 1, 1, "x" * 1_000_000),
+        )
+        active = sum(
+            path.stat().st_size
+            for path in (db.path, db.path.with_name(db.path.name + "-journal"), db.path.with_name(db.path.name + "-wal"), db.path.with_name(db.path.name + "-shm"))
+            if path.is_file() and not path.is_symlink()
+        )
+        assert db.path.with_name(db.path.name + "-journal").is_file()
+        assert db.peak_footprint_bytes >= active > 0
+        db.connection.commit()
+        assert db.peak_footprint_bytes >= active
+
+
+def test_scoring_db_default_path_has_no_capacity_stat_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(score._ScoringDB, "_observe_footprint", lambda _self: (_ for _ in ()).throw(AssertionError("capacity stat")))
+    with score._ScoringDB() as db:
+        db.connection.execute("SELECT 1").fetchone()
+        db.connection.commit()
+
+
 class _CursorProjectionStore(rank.CandidateProjectionStore):
     """Candidate-only cursor seam used to exercise the formal consumer shape."""
 

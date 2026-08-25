@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -23,6 +24,15 @@ RECEIPT_SCHEMA = "aerp7-convomem-one-shot-receipt-v1"
 INFRASTRUCTURE_FAILURE_SCHEMA = "aerp7-convomem-one-shot-infrastructure-failure-v1"
 PROGRESS_SCHEMA = "aerp7-convomem-one-shot-progress-v1"
 GENERATION_SEAL_SCHEMA = "aerp7-convomem-generation-seal-v2"
+CALIBRATION_ONLY_SCHEMA = "aerp7-convomem-capacity-calibration-only-v1"
+CALIBRATION_OBSERVATION_SCHEMA = "aerp7-convomem-capacity-observation-events-v1"
+CALIBRATION_RECEIPT_SCHEMA = "aerp7-convomem-capacity-calibration-receipt-v1"
+_CAPACITY_CURRENT_ROLES = ("raw", "p5_primary", "p5_repeat", "six")
+_CAPACITY_SUPERVISORS = frozenset({
+    "source_bundle_build", "public_coordinator", "custodian_scoring",
+    *(f"current-{role}" for role in _CAPACITY_CURRENT_ROLES),
+    *(f"original-{number}" for number in range(5)),
+})
 
 
 def _bytes(value: Any) -> bytes:
@@ -35,6 +45,39 @@ def _digest(value: Any) -> str:
 
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_capacity_coverage(*, events: list[Mapping[str, Any]], supervisors: Mapping[str, Any]) -> None:
+    """Admission refuses partial component/supervisor telemetry.
+
+    Calibration is intentionally disposable, but a partial trace must never be
+    promoted into an apparent capacity observation.  Keep this narrow: the
+    exact eleven components are the measurement contract; housekeeping events
+    are forwarded live to an external collector but not retained as evidence.
+    """
+    if set(supervisors) != _CAPACITY_SUPERVISORS:
+        raise CustodyError("aerp7_capacity_calibration_supervisor_coverage_invalid")
+    for receipt in supervisors.values():
+        if not isinstance(receipt, Mapping) or receipt.get("supervisor_observation_complete") is not True:
+            raise CustodyError("aerp7_capacity_calibration_supervisor_coverage_invalid")
+        if isinstance(receipt.get("observed_process_tree_peak_rss_bytes"), bool) or not isinstance(receipt.get("observed_process_tree_peak_rss_bytes"), int) or receipt["observed_process_tree_peak_rss_bytes"] <= 0:
+            raise CustodyError("aerp7_capacity_calibration_supervisor_coverage_invalid")
+    source = [row for row in events if row.get("kind") == "source_bundle_build"]
+    current = [row for row in events if row.get("kind") == "current_artifact"]
+    original = [row for row in events if row.get("kind") == "original_replicate"]
+    scoring = [row for row in events if row.get("kind") == "custodian_scoring"]
+    if len(source) != 1 or len(current) != 4 or len(original) != 5 or len(scoring) != 1:
+        raise CustodyError("aerp7_capacity_calibration_component_coverage_invalid")
+    if any(
+        isinstance(source[0].get(key), bool) or not isinstance(source[0].get(key), int) or source[0][key] <= 0
+        for key in ("candidate_payload_bytes", "candidate_ready_bytes", "custody_payload_bytes", "custody_ready_bytes")
+    ):
+        raise CustodyError("aerp7_capacity_calibration_component_coverage_invalid")
+    if {row.get("role") for row in current} != set(_CAPACITY_CURRENT_ROLES) or {row.get("number") for row in original} != set(range(1, 6)):
+        raise CustodyError("aerp7_capacity_calibration_component_coverage_invalid")
+    expected_count = 11
+    if len(events) != expected_count:
+        raise CustodyError("aerp7_capacity_calibration_component_coverage_invalid")
 
 
 def _final_snapshot(path: Path, *, code: str) -> tuple[dict[str, Any], str]:
@@ -100,6 +143,70 @@ def _publish_failure(*, path: Path, plan_sha256: str, stage: str, error: BaseExc
     row = {"schema": INFRASTRUCTURE_FAILURE_SCHEMA, "plan_sha256": plan_sha256, "stage": stage, "error_code": code}
     row["failure_sha256"] = _digest(row)
     executor.formal.publish_nonreplace(path, _bytes(row), fsync_parent=executor._sync_parent)
+
+
+def _capacity_event(observer: executor.CapacityObserver, kind: str, **payload: Any) -> None:
+    observer(json.loads(_bytes({"schema": executor.CAPACITY_EVENT_SCHEMA, "kind": kind, **payload})))
+
+
+def _capacity_paths(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive every disposable execution target below the fresh run root."""
+    root = Path(plan["run_root"]).resolve()
+    return {
+        "candidate_output_dir": str(root / "candidate"), "custody_output_dir": str(root / "custody"),
+        "staging_root": str(root / "staging"), "protocol_path": str(root / "protocol.json"),
+        "authorization_path": str(root / "authorization.json"), "output_dir": str(root / "public"),
+        "custodian_public_config_path": str(root / "custodian-public.json"), "final_output_path": str(root / "custodian-final.json"),
+        "progress_receipt_path": str(root / "progress.json"),
+        "infrastructure_failure_receipt_path": str(root / "infrastructure-failure.json"),
+        "capacity_scoring_sidecar_path": str(root / "custodian-scoring-capacity.json"),
+    }
+
+
+def _source_capacity_tree(*, candidate_root: Path, custody_root: Path) -> dict[str, int]:
+    """Measure all four retained source handoff files exactly once."""
+    paths = {
+        "candidate_payload_bytes": candidate_root / "projection.json",
+        "candidate_ready_bytes": candidate_root / "READY.json",
+        "custody_payload_bytes": custody_root / "sealed-custody.json",
+        "custody_ready_bytes": custody_root / "READY.json",
+    }
+    result: dict[str, int] = {}
+    for key, path in paths.items():
+        if not path.is_file() or path.is_symlink():
+            raise CustodyError("aerp7_capacity_calibration_source_tree_invalid")
+        size = path.stat().st_size
+        if size <= 0:
+            raise CustodyError("aerp7_capacity_calibration_source_tree_invalid")
+        result[key] = size
+    return result
+
+
+def _verify_capacity_inputs(plan: Mapping[str, Any]) -> None:
+    envelope = Path(plan["capacity_envelope_path"])
+    collector = Path(plan["capacity_collector_path"])
+    launcher = Path(plan["capacity_launcher_path"])
+    if any(path.is_symlink() or not path.is_file() for path in (envelope, collector, launcher)):
+        raise CustodyError("aerp7_capacity_calibration_external_input_missing")
+    if (_file_sha256(envelope) != plan["capacity_envelope_file_sha256"] or _file_sha256(collector) != plan["capacity_collector_sha256"]
+            or _file_sha256(launcher) != plan["capacity_launcher_sha256"]):
+        raise CustodyError("aerp7_capacity_calibration_external_input_drift")
+    try:
+        value = json.loads(envelope.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CustodyError("aerp7_capacity_calibration_envelope_invalid") from exc
+    if not isinstance(value, Mapping) or value.get("schema") != "aerp7-convomem-capacity-envelope-v1" or value.get("envelope_sha256") != plan["capacity_envelope_semantic_sha256"] or value["envelope_sha256"] != _digest({key: item for key, item in value.items() if key != "envelope_sha256"}):
+        raise CustodyError("aerp7_capacity_calibration_envelope_invalid")
+
+
+def _require_external_publish_target(path: Path) -> None:
+    if path.exists() or path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir():
+        raise CustodyError("aerp7_capacity_calibration_external_output_invalid")
+
+
+def _publish_external(path: Path, value: Mapping[str, Any]) -> dict[str, Any]:
+    _require_external_publish_target(path)
+    return executor.formal.publish_nonreplace(path, _bytes(value), fsync_parent=executor._sync_parent)
 
 
 def _seal_hmac(value: Mapping[str, Any], *, custody_binding_secret: bytes) -> str:
@@ -435,18 +542,18 @@ def _recover_final_without_receipt(*, plan: Mapping[str, Any], private: Mapping[
     return {**published, **receipt}
 
 
-def run_one_shot(*, signed_plan: Mapping[str, Any], operator_capability: bytes, private_capabilities: Mapping[str, Any], model_receipt: Mapping[str, Any], repo_root: Path) -> dict[str, Any]:
-    """Run all public and custody stages once; private capabilities use stdin only."""
-    plan = authoring.validate_one_shot_plan(signed_plan, operator_capability=operator_capability); private = _private(private_capabilities)
-    require_formal_durability()
-    if dict(model_receipt) != plan["model_receipt"]: raise CustodyError("aerp7_one_shot_model_preparse_binding_invalid")
-    _require_new_formal_targets(plan=plan)
-    receipt_path = Path(plan["one_shot_receipt_path"]); existing = _existing_receipt(path=receipt_path, plan=plan, repo_root=repo_root, private=private)
-    if existing is not None: return existing
-    recovered = _recover_final_without_receipt(plan=plan, private=private, repo_root=repo_root)
-    if recovered is not None: return recovered
-    if int(time.time()) >= plan["custodian_expires_at_unix"]: raise CustodyError("aerp7_one_shot_custodian_capability_expired")
+def _run_execution(*, plan: Mapping[str, Any], operator_capability: bytes, private: Mapping[str, bytes], model_receipt: Mapping[str, Any], repo_root: Path,
+                   enforce_disk_preflight: bool, publish_formal_receipt: bool,
+                   capacity_observer: executor.CapacityObserver | None) -> dict[str, Any]:
+    """Execute the shared source→public→custody chain exactly once.
+
+    The two public callers differ only in their signed admission/promotion
+    contracts.  Every source, checkpoint, protocol, public coordinator, and
+    custody gate remains here so a capacity run cannot accidentally drift into
+    a second, weaker orchestration path.
+    """
     stage = "preparse"
+    capacity_supervisors: dict[str, dict[str, Any]] = {}
     _publish_progress(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage)
     try:
         # Signed-plan verification above occurs before this first legal parser
@@ -459,30 +566,42 @@ def run_one_shot(*, signed_plan: Mapping[str, Any], operator_capability: bytes, 
         binding = checkpoint.capture_binding(expected_checkpoint_path=Path(plan["expected_checkpoint_path"]), current_code_receipt=code)
         stage = "source"; _publish_progress(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage)
         source_before = authoring.observe_source_manifest(canonical_root=Path(plan["canonical_root"]), premix_root=Path(plan["premix_root"]), expected=plan["source_manifest"])
-        built = confirmation.build_prelabel_bundle(canonical_root=Path(plan["canonical_root"]), premix_root=Path(plan["premix_root"]), candidate_output_dir=Path(plan["candidate_output_dir"]), custody_output_dir=Path(plan["custody_output_dir"]), staging_root=Path(plan["staging_root"]), secret=private["custody_binding_secret"], selection=confirmation.SelectionConfig.census_v1())
+        if capacity_observer is None:
+            built = confirmation.build_prelabel_bundle(canonical_root=Path(plan["canonical_root"]), premix_root=Path(plan["premix_root"]), candidate_output_dir=Path(plan["candidate_output_dir"]), custody_output_dir=Path(plan["custody_output_dir"]), staging_root=Path(plan["staging_root"]), secret=private["custody_binding_secret"], selection=confirmation.SelectionConfig.census_v1())
+        else:
+            with executor._SupervisorTreeObserver(os.getpid()) as monitor:
+                built = confirmation.build_prelabel_bundle(canonical_root=Path(plan["canonical_root"]), premix_root=Path(plan["premix_root"]), candidate_output_dir=Path(plan["candidate_output_dir"]), custody_output_dir=Path(plan["custody_output_dir"]), staging_root=Path(plan["staging_root"]), secret=private["custody_binding_secret"], selection=confirmation.SelectionConfig.census_v1())
+            capacity_supervisors["source_bundle_build"] = monitor.receipt()
         source_after = authoring.observe_source_manifest(canonical_root=Path(plan["canonical_root"]), premix_root=Path(plan["premix_root"]), expected=plan["source_manifest"])
         if source_before != source_after:
             raise CustodyError("aerp7_one_shot_source_toctou")
-        # Capacity is a private coordinator gate.  It binds the generation's
-        # custody receipt only after both bundles are published, but strictly
-        # before the public coordinator can launch its first ranking worker.
         candidate_receipt = _candidate_receipt(built)
         custody_reference = confirmation.custody_reference(
             candidate_bundle=Path(plan["candidate_output_dir"]), custody_bundle=Path(plan["custody_output_dir"]),
             candidate_reference=candidate_receipt["candidate_reference"],
         )
-        private_preflight = authoring.author_private_disk_preflight(
-            plan=plan, candidate_reference=candidate_receipt["candidate_reference"], custody_reference=custody_reference,
-            operator_capability=operator_capability,
-        )
-        checked_preflight = authoring.validate_private_disk_preflight(
-            private_preflight, operator_capability=operator_capability, expected_plan_sha256=plan["plan_sha256"],
-        )
-        formal.enforce_private_disk_preflight(
-            preflight=checked_preflight, candidate_bundle_root=Path(plan["candidate_output_dir"]),
-            custody_bundle_root=Path(plan["custody_output_dir"]), candidate_reference=candidate_receipt["candidate_reference"],
-            staging_root=Path(plan["staging_root"]),
-        )
+        if capacity_observer is not None:
+            _capacity_event(
+                capacity_observer, "source_bundle_build",
+                **_source_capacity_tree(
+                    candidate_root=Path(plan["candidate_output_dir"]),
+                    custody_root=Path(plan["custody_output_dir"]),
+                ),
+                supervisor_receipt=capacity_supervisors["source_bundle_build"],
+            )
+        if enforce_disk_preflight:
+            private_preflight = authoring.author_private_disk_preflight(
+                plan=plan, candidate_reference=candidate_receipt["candidate_reference"], custody_reference=custody_reference,
+                operator_capability=operator_capability,
+            )
+            checked_preflight = authoring.validate_private_disk_preflight(
+                private_preflight, operator_capability=operator_capability, expected_plan_sha256=plan["plan_sha256"],
+            )
+            formal.enforce_private_disk_preflight(
+                preflight=checked_preflight, candidate_bundle_root=Path(plan["candidate_output_dir"]),
+                custody_bundle_root=Path(plan["custody_output_dir"]), candidate_reference=candidate_receipt["candidate_reference"],
+                staging_root=Path(plan["staging_root"]),
+            )
         stage = "protocol"; _publish_progress(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage)
         protocol = authoring.author_formal_protocol(repo_root=repo_root, candidate_receipt=candidate_receipt, model_receipt=model_receipt, expected_checkpoint_path=Path(plan["expected_checkpoint_path"]), preparse_semantics=plan["census_semantics"], preparse_current_code_receipt=plan["preparse_current_code_receipt"])
         if protocol["execution_checkpoint"] != binding: raise CustodyError("aerp7_one_shot_checkpoint_drift")
@@ -497,40 +616,177 @@ def run_one_shot(*, signed_plan: Mapping[str, Any], operator_capability: bytes, 
             public_freeze = executor._load(freeze_path)
         else:
             with _heartbeat(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage):
-                with _operator_environment(operator_capability): executor.public_coordinator(config)
+                with _operator_environment(operator_capability):
+                    if capacity_observer is None:
+                        executor.public_coordinator(config)
+                    else:
+                        with executor._SupervisorTreeObserver(os.getpid()) as monitor:
+                            executor.public_coordinator(config, capacity_observer=capacity_observer)
+                        capacity_supervisors["public_coordinator"] = monitor.receipt()
             public_freeze = executor._load(freeze_path)
         freeze_file_sha256 = _file_sha256(freeze_path)
         if public_freeze.get("protocol", {}).get("protocol_sha256") != protocol["protocol_sha256"]: raise CustodyError("aerp7_one_shot_public_freeze_protocol_mismatch")
         custody_root = Path(plan["custody_output_dir"])
         custody_ready_sha256 = confirmation._snapshot(custody_root / "READY.json", "aerp7_one_shot_custody_ready")[2]
         public_config = {"schema": custodian.FORMAL_PUBLIC_CONFIG_SCHEMA, "synthetic_test_mode": False, "public_freeze_packet": str(freeze_path.resolve()), "candidate_bundle": str(Path(plan["candidate_output_dir"]).resolve()), "custody_bundle": str(custody_root.resolve()), "output_path": str(Path(plan["final_output_path"]).resolve()), "freeze_packet_file_sha256": freeze_file_sha256, "candidate_ready_sha256": protocol["candidate"]["ready_sha256"], "custody_ready_sha256": custody_ready_sha256, "custody_bundle_sha256": built["custody_raw_sha256"]}
+        if capacity_observer is not None:
+            public_config["capacity_scoring_sidecar_path"] = str(Path(plan["capacity_scoring_sidecar_path"]).resolve())
+            public_config["capacity_plan_sha256"] = plan["plan_sha256"]
+            public_config["capacity_generation_id"] = candidate_receipt["candidate_reference"]["generation_id"]
+            public_config["capacity_projection_sha256"] = candidate_receipt["candidate_reference"]["projection_canonical_sha256"]
         public_config_path = Path(plan["custodian_public_config_path"]); executor._write_new(public_config_path, public_config)
         stage = "custodian"; _publish_progress(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage)
         private_payload = _custodian_private_payload(plan=plan, private=private, public_freeze=public_freeze, freeze_file_sha256=freeze_file_sha256)
         with _heartbeat(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage):
-            custodian.launch_custodian(public_config_path=public_config_path, private_payload=private_payload, timeout_seconds=None, python_executable=plan["python_executable"])
+            if capacity_observer is None:
+                custodian.launch_custodian(public_config_path=public_config_path, private_payload=private_payload, timeout_seconds=None, python_executable=plan["python_executable"])
+            else:
+                custodian_result = custodian.launch_custodian(public_config_path=public_config_path, private_payload=private_payload, timeout_seconds=None, python_executable=plan["python_executable"], capacity_observer=capacity_observer)
+                capacity_supervisors["custodian_scoring"] = dict(custodian_result["supervisor_receipt"])
         final_path = Path(plan["final_output_path"])
         final, final_sha = _final_snapshot(final_path, code="aerp7_one_shot_final_packet_invalid")
-        # Child-return metadata is only transport telemetry.  First bind this
-        # stable public snapshot to the child's immutable consumed marker, then
-        # rerun the full final-packet verifier before publishing a receipt.
         _require_consumed_final_binding(
-            final_path=final_path,
-            final=final,
-            final_sha256=final_sha,
-            public_freeze=public_freeze,
-            protocol=protocol,
-            freeze_file_sha256=freeze_file_sha256,
-            private_payload=private_payload,
+            final_path=final_path, final=final, final_sha256=final_sha, public_freeze=public_freeze,
+            protocol=protocol, freeze_file_sha256=freeze_file_sha256, private_payload=private_payload,
             code="aerp7_one_shot_initial_consumed_marker_invalid",
         )
         validated_final = custodian.validate_completed_packet(config=public_config, outer=final, private_payload=private_payload)
         if validated_final["packet_sha256"] != final.get("packet_sha256") or validated_final["gate_outcome"] not in {"PASS", "FAIL"}:
             raise CustodyError("aerp7_one_shot_final_packet_invalid")
-        receipt = {"schema": RECEIPT_SCHEMA, "plan_sha256": plan["plan_sha256"], "protocol_sha256": protocol["protocol_sha256"], "checkpoint_sha256": binding["checkpoint_sha256"], "public_freeze_sha256": freeze_file_sha256, "final_output_file_sha256": final_sha, "custodian_packet_sha256": final["packet_sha256"], "gate_outcome": final["gate_decision"]["outcome"]}; receipt["receipt_sha256"] = _digest(receipt)
-        published = executor.formal.publish_nonreplace(receipt_path, _bytes(receipt), fsync_parent=executor._sync_parent)
+        if publish_formal_receipt:
+            receipt = {"schema": RECEIPT_SCHEMA, "plan_sha256": plan["plan_sha256"], "protocol_sha256": protocol["protocol_sha256"], "checkpoint_sha256": binding["checkpoint_sha256"], "public_freeze_sha256": freeze_file_sha256, "final_output_file_sha256": final_sha, "custodian_packet_sha256": final["packet_sha256"], "gate_outcome": final["gate_decision"]["outcome"]}; receipt["receipt_sha256"] = _digest(receipt)
+            published = executor.formal.publish_nonreplace(Path(plan["one_shot_receipt_path"]), _bytes(receipt), fsync_parent=executor._sync_parent)
+            _publish_progress(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage="complete")
+            return {**published, **receipt}
         _publish_progress(path=Path(plan["progress_receipt_path"]), plan_sha256=plan["plan_sha256"], stage="complete")
-        return {**published, **receipt}
+        return {"protocol": protocol, "binding": binding, "source_before": source_before, "source_after": source_after, "built": built, "public_freeze": public_freeze, "public_freeze_file_sha256": freeze_file_sha256, "public_config": public_config, "final": final, "final_output_file_sha256": final_sha, "validated_final": validated_final, "capacity_supervisors": capacity_supervisors}
     except BaseException as exc:
         _publish_failure(path=Path(plan["infrastructure_failure_receipt_path"]), plan_sha256=plan["plan_sha256"], stage=stage, error=exc)
+        raise
+
+
+def run_one_shot(*, signed_plan: Mapping[str, Any], operator_capability: bytes, private_capabilities: Mapping[str, Any], model_receipt: Mapping[str, Any], repo_root: Path) -> dict[str, Any]:
+    """Run all public and custody stages once; private capabilities use stdin only."""
+    plan = authoring.validate_one_shot_plan(signed_plan, operator_capability=operator_capability); private = _private(private_capabilities)
+    require_formal_durability()
+    if dict(model_receipt) != plan["model_receipt"]: raise CustodyError("aerp7_one_shot_model_preparse_binding_invalid")
+    _require_new_formal_targets(plan=plan)
+    receipt_path = Path(plan["one_shot_receipt_path"]); existing = _existing_receipt(path=receipt_path, plan=plan, repo_root=repo_root, private=private)
+    if existing is not None: return existing
+    recovered = _recover_final_without_receipt(plan=plan, private=private, repo_root=repo_root)
+    if recovered is not None: return recovered
+    if int(time.time()) >= plan["custodian_expires_at_unix"]: raise CustodyError("aerp7_one_shot_custodian_capability_expired")
+    return _run_execution(plan=plan, operator_capability=operator_capability, private=private, model_receipt=model_receipt, repo_root=repo_root, enforce_disk_preflight=True, publish_formal_receipt=True, capacity_observer=None)
+
+
+def run_capacity_calibration(*, signed_plan: Mapping[str, Any], operator_capability: bytes,
+                             private_capabilities: Mapping[str, Any], model_receipt: Mapping[str, Any],
+                             repo_root: Path, capacity_observer: executor.CapacityObserver | None = None) -> dict[str, Any]:
+    """Execute the real chain solely to collect capacity sidecars.
+
+    It deliberately omits the private disk admission (which is what the run is
+    intended to measure) and the formal one-shot completion receipt.  It does
+    not omit source, code, checkpoint, custody, or final-packet validation.
+    """
+    plan = authoring.validate_capacity_calibration_plan(signed_plan, operator_capability=operator_capability)
+    private = _private(private_capabilities)
+    require_formal_durability()
+    if Path(repo_root).resolve() != Path(plan["repo_root"]).resolve() or dict(model_receipt) != plan["model_receipt"]:
+        raise CustodyError("aerp7_capacity_calibration_preparse_binding_invalid")
+    _verify_capacity_inputs(plan)
+    root = Path(plan["run_root"]).resolve()
+    if root.exists() or root.is_symlink():
+        raise CustodyError("aerp7_capacity_calibration_output_not_new")
+    _require_external_publish_target(Path(plan["observation_output_path"]))
+    _require_external_publish_target(Path(plan["calibration_receipt_path"]))
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    marker = {"schema": CALIBRATION_ONLY_SCHEMA, "plan_sha256": plan["plan_sha256"], "purpose": authoring.CAPACITY_CALIBRATION_PURPOSE, "formal_evidence_eligible": False, "scientific_metrics_retained": False}
+    marker["marker_sha256"] = _digest(marker)
+    executor.formal.publish_nonreplace(root / "CALIBRATION_ONLY.json", _bytes(marker), fsync_parent=executor._sync_parent)
+    (root / "staging").mkdir()
+    execution_plan = {
+        **{key: plan[key] for key in ("canonical_root", "premix_root", "expected_checkpoint_path", "original_root", "model_dir", "python_executable", "original_python", "source_manifest", "model_receipt", "census_semantics", "preparse_current_code_receipt", "public_authorization_nonce", "custodian_nonce", "custodian_expires_at_unix", "plan_sha256")},
+        **_capacity_paths(plan),
+    }
+    events: list[dict[str, Any]] = []
+    def collect(value: Mapping[str, Any]) -> None:
+        event = dict(value)
+        if event.get("schema") != executor.CAPACITY_EVENT_SCHEMA or not isinstance(event.get("kind"), str):
+            raise CustodyError("aerp7_capacity_calibration_observer_event_invalid")
+        # The caller is the physical collector bridge.  It must consume and
+        # validate any READY-bound references while their run-root paths still
+        # exist; this driver retains only its scalar reduction below.
+        if capacity_observer is not None:
+            capacity_observer(dict(event))
+        # The output is a scalar handoff.  Do not retain artifact references,
+        # paths, query rows, corpus IDs, or any custody-derived value here.
+        # Store only the component contract.  The shared current-store cleanup
+        # is operational telemetry, not a measured component, so it never
+        # becomes an apparently complete capacity trace.
+        if event["kind"] == "shared_current_store_cleanup":
+            return
+        scalar: dict[str, Any] = {"schema": executor.CAPACITY_EVENT_SCHEMA, "kind": event["kind"]}
+        for key in ("role", "number", "candidate_payload_bytes", "candidate_ready_bytes", "custody_payload_bytes", "custody_ready_bytes", "chroma_peak_bytes", "scoring_db_peak_bytes", "report_bytes", "mapping_ledger_bytes", "components", "binding", "retained_input_receipt_bytes", "store_bytes"):
+            if key in event:
+                scalar[key] = event[key]
+        events.append(scalar)
+    try:
+        result = _run_execution(plan=execution_plan, operator_capability=operator_capability, private=private,
+                                model_receipt=model_receipt, repo_root=repo_root,
+                                enforce_disk_preflight=False, publish_formal_receipt=False,
+                                capacity_observer=collect)
+        freeze = result["public_freeze"]
+        freeze_supervisors = freeze.get("supervisors") if isinstance(freeze, Mapping) else None
+        stage_supervisors = result.get("capacity_supervisors")
+        if not isinstance(freeze_supervisors, Mapping) or not isinstance(stage_supervisors, Mapping):
+            raise CustodyError("aerp7_capacity_calibration_supervisors_invalid")
+        supervisors = {
+            "source_bundle_build": dict(stage_supervisors.get("source_bundle_build", {})),
+            "public_coordinator": dict(stage_supervisors.get("public_coordinator", {})),
+            **{name: dict(value) for name, value in freeze_supervisors.items()},
+            "custodian_scoring": dict(stage_supervisors.get("custodian_scoring", {})),
+        }
+        _validate_capacity_coverage(events=events, supervisors=supervisors)
+        observation = {
+            "schema": CALIBRATION_OBSERVATION_SCHEMA, "plan_sha256": plan["plan_sha256"],
+            "capacity_envelope_file_sha256": plan["capacity_envelope_file_sha256"],
+            "capacity_envelope_semantic_sha256": plan["capacity_envelope_semantic_sha256"],
+            "capacity_collector_sha256": plan["capacity_collector_sha256"], "capacity_launcher_sha256": plan["capacity_launcher_sha256"],
+            "collector_events": events, "supervisor_receipts": dict(supervisors),
+        }
+        observation["observation_sha256"] = _digest(observation)
+        shutil.rmtree(root)
+        if root.exists() or root.is_symlink():
+            raise CustodyError("aerp7_capacity_calibration_run_root_cleanup_failed")
+        executor._sync_parent(root.parent)
+        _publish_external(Path(plan["observation_output_path"]), observation)
+        receipt = {
+            "schema": CALIBRATION_RECEIPT_SCHEMA, "plan_sha256": plan["plan_sha256"],
+            "checkpoint_sha256": result["binding"]["checkpoint_sha256"], "protocol_sha256": result["protocol"]["protocol_sha256"],
+            "source_manifest_sha256": _digest(plan["source_manifest"]), "model_receipt_sha256": _digest(plan["model_receipt"]),
+            "capacity_envelope_file_sha256": plan["capacity_envelope_file_sha256"], "capacity_envelope_semantic_sha256": plan["capacity_envelope_semantic_sha256"],
+            "capacity_collector_sha256": plan["capacity_collector_sha256"], "capacity_launcher_sha256": plan["capacity_launcher_sha256"],
+            "public_freeze_file_sha256": result["public_freeze_file_sha256"], "custodian_packet_sha256": result["final"]["packet_sha256"],
+            "observation_file_sha256": _file_sha256(Path(plan["observation_output_path"])), "collector_events": events,
+            "supervisor_receipts": dict(supervisors), "formal_evidence_eligible": False, "scientific_metrics_retained": False,
+            "disposable_run_root_removed": True,
+        }
+        receipt["receipt_sha256"] = _digest(receipt)
+        published = _publish_external(Path(plan["calibration_receipt_path"]), receipt)
+        return {**published, **receipt}
+    except BaseException as exc:
+        # Unlike a formal attempt, calibration is deliberately non-resumable:
+        # its run root can contain an unconsumed public authorization.  Remove
+        # the complete disposable tree before emitting a path-free failure.
+        if root.exists() or root.is_symlink():
+            if root.is_symlink() or not root.is_dir():
+                raise CustodyError("aerp7_capacity_calibration_run_root_cleanup_failed") from exc
+            shutil.rmtree(root)
+            if root.exists() or root.is_symlink():
+                raise CustodyError("aerp7_capacity_calibration_run_root_cleanup_failed") from exc
+            executor._sync_parent(root.parent)
+        failure = {"schema": "aerp7-convomem-capacity-calibration-failure-v1", "plan_sha256": plan["plan_sha256"], "error_code": exc.receipt["code"] if isinstance(exc, CustodyError) else type(exc).__name__, "disposable_run_root_removed": True}
+        failure["failure_sha256"] = _digest(failure)
+        _publish_external(Path(plan["calibration_receipt_path"]), failure)
         raise

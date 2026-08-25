@@ -27,7 +27,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from benchmarks import aerp7_convomem_formal as formal
 from benchmarks import aerp7_original_product as original_product
@@ -63,6 +63,9 @@ FORMAL_ORIGINAL_CONFIG_KEYS = frozenset({
     "output_path", "draft_path", "build_id", "original_root", "model_dir",
     "palace_path", "original_python", "replicate_staging_parent",
 })
+FORMAL_ORIGINAL_CAPACITY_CONFIG_KEYS = frozenset({*FORMAL_ORIGINAL_CONFIG_KEYS, "capacity_chroma_sidecar_path"})
+CAPACITY_EVENT_SCHEMA = "aerp7-convomem-capacity-observer-event-v1"
+CapacityObserver = Callable[[Mapping[str, Any]], None]
 
 
 def _bytes(value: Any) -> bytes:
@@ -272,7 +275,13 @@ def _assert_original_mode(config: Mapping[str, Any]) -> bool:
     synthetic = config.get("synthetic_test_mode")
     expected = ORIGINAL_CONFIG_KEYS if synthetic is True else FORMAL_ORIGINAL_CONFIG_KEYS
     expected_schema = SCHEMA if synthetic is True else FORMAL_SCHEMA
-    if set(config) != expected or config.get("schema") != expected_schema:
+    if synthetic is False and set(config) == FORMAL_ORIGINAL_CAPACITY_CONFIG_KEYS:
+        sidecar = config.get("capacity_chroma_sidecar_path")
+        if not isinstance(sidecar, str) or not sidecar.strip():
+            raise CustodyError("executor_original_capacity_sidecar_invalid")
+    elif set(config) != expected:
+        raise CustodyError("executor_original_config_invalid")
+    if config.get("schema") != expected_schema:
         raise CustodyError("executor_original_config_invalid")
     if synthetic is True:
         _assert_synthetic(config)
@@ -280,6 +289,15 @@ def _assert_original_mode(config: Mapping[str, Any]) -> bool:
     if synthetic is not False:
         raise CustodyError("executor_formal_execution_blocked")
     return False
+
+
+def _capacity_event(observer: CapacityObserver | None, kind: str, **payload: Any) -> None:
+    """Emit one in-process observation event; never persist it in public output."""
+    if observer is None: return
+    # The observer receives an isolated canonical value, so it cannot mutate a
+    # worker packet/reference later used by formal validation or publication.
+    event = json.loads(_bytes({"schema": CAPACITY_EVENT_SCHEMA, "kind": kind, **payload}))
+    observer(event)
 
 
 def _formal_original_resource(*, draft: original_product.OriginalProductWorkerDraft, replicate: Mapping[str, Any], denominators: Mapping[str, int], resource_comparability: str) -> dict[str, Any]:
@@ -1007,8 +1025,14 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
     else:
         draft_path = Path(str(config["draft_path"])); palace_path = Path(str(config["palace_path"]))
         replicate_staging_parent = Path(str(config["replicate_staging_parent"]))
+        capacity_sidecar = (
+            Path(str(config["capacity_chroma_sidecar_path"]))
+            if "capacity_chroma_sidecar_path" in config else None
+        )
         if output.parent.resolve() != draft_path.parent.resolve() or output.parent.resolve() != palace_path.parent.resolve() or not replicate_staging_parent.is_dir() or replicate_staging_parent.is_symlink() or any(path.exists() or path.is_symlink() for path in (output, draft_path, palace_path)):
             raise CustodyError("executor_original_output_capability_invalid")
+        if capacity_sidecar is not None and (capacity_sidecar.parent.resolve() != output.parent.resolve() or capacity_sidecar.exists() or capacity_sidecar.is_symlink()):
+            raise CustodyError("executor_original_capacity_sidecar_invalid")
         candidate_reference = formal.load_candidate_worker_reference(
             worker_config=worker_config, protocol=protocol,
             candidate_bundle_root=bundle, staging_parent=output.parent,
@@ -1034,9 +1058,15 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
         with original_product.pinned_live_original_product(
             original_root=original_root, model_dir=model_dir, palace_path=palace_path,
         ) as (seams, live_receipt):
-            observer = original_product.LiveOriginalObserver(
+            live_observer = original_product.LiveOriginalObserver(
                 palace_path=palace_path, provider=seams.encoder.runtime_identity,
                 denominators=denominators, corpus_count=corpus_count,
+            )
+            observer = (
+                original_product.CapacityPeakObserver(observer=live_observer, palace_path=palace_path,
+                    build_id=build_id, generation_id=candidate_reference["generation_id"],
+                    projection_sha256=candidate_reference["projection_canonical_sha256"])
+                if capacity_sidecar is not None else live_observer
             )
             draft = original_product.run_original_public_replicate_streaming(
                 candidate_reference=candidate_reference, build_id=build_id,
@@ -1045,6 +1075,8 @@ def original_worker(config: Mapping[str, Any]) -> dict[str, Any]:
                 formal=True, resource_sink=lambda _value: None,
                 staging_parent=replicate_staging_parent,
             )
+            if capacity_sidecar is not None:
+                observer.publish_sidecar(capacity_sidecar)
         draft_bytes = original_product.serialize_worker_draft(draft)
         _write_bytes_new(draft_path, draft_bytes)
         replicate = draft.replicate_without_coordinator_audit
@@ -1297,7 +1329,8 @@ def _run_subprocess(command: Sequence[str], *, config: Mapping[str, Any], output
 
 
 def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str, Any],
-                             authorization: Mapping[str, Any], staging: Path) -> dict[str, Any]:
+                             authorization: Mapping[str, Any], staging: Path,
+                             capacity_observer: CapacityObserver | None = None) -> dict[str, Any]:
     """Build and validate a complete public packet below an unpublished sibling."""
     synthetic = config["synthetic_test_mode"]
     protocol_path = Path(str(config["protocol_path"]))
@@ -1369,6 +1402,8 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
                 "original_python": str(Path(str(config["original_python"])).resolve()),
                 "replicate_staging_parent": str(original_support.resolve()),
             }
+            if capacity_observer is not None:
+                child["capacity_chroma_sidecar_path"] = str((staging / f"original-{number}-capacity.json").resolve())
         supervisors[f"original-{number}"] = _run_subprocess(
             [str(Path(str(original_policy["original_python"])).resolve()) if not synthetic else executable, "-m", "benchmarks.aerp7_convomem_executor", "--original-worker-stdin"],
             config=child, output=path,
@@ -1408,6 +1443,22 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
             worker_packet=original_packet, replicate_reference=replicate,
             resource_receipt=finalized_resource,
         )
+        if capacity_observer is not None:
+            sidecar = Path(str(child["capacity_chroma_sidecar_path"]))
+            try:
+                chroma = original_product.load_capacity_chroma_sidecar(sidecar)
+                if chroma["build_id"] != replicate["build_id"] or chroma["generation_id"] != replicate["candidate_reference"]["generation_id"] or chroma["projection_sha256"] != replicate["candidate_reference"]["projection_canonical_sha256"]:
+                    raise CustodyError("executor_original_capacity_sidecar_invalid")
+                with original_product.OriginalReplicateStore.open(replicate) as store:
+                    candidate_index = store.resource_summary()["resources"]["candidate_index"]
+            except (KeyError, original_product.OriginalProductError) as exc:
+                raise CustodyError("executor_original_capacity_sidecar_invalid") from exc
+            _capacity_event(
+                capacity_observer, "original_replicate", number=number + 1,
+                replicate_reference=dict(replicate), candidate_index_receipt=dict(candidate_index),
+                chroma_peak_bytes=chroma["peak_bytes"],
+            )
+            sidecar.unlink(); _sync_parent(sidecar.parent)
         _remove_reaudited_original_palace(palace_path=palace_path, completion=completion)
         original_replicates.append(dict(completion["replicate_reference"]))
         rebound = {
@@ -1508,6 +1559,41 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
         candidate_reference=None if synthetic else protocol["candidate"]["candidate_reference"],
         resources=resources, ranking_artifacts=current_artifacts, supervisors=supervisors, allow_synthetic=synthetic,
     )
+    if capacity_observer is not None:
+        shared_input_receipt_path: Path | None = None
+        for role in ("raw", "p5_primary", "p5_repeat", "six"):
+            artifact = current_by_role[role]["artifact"]
+            if not isinstance(artifact, Mapping) or artifact.get("measurement_reference") is None:
+                raise CustodyError("executor_current_capacity_artifact_invalid")
+            artifact_reference = rank.validate_ranking_artifact_reference(artifact)
+            artifact_directory = Path(artifact_reference["artifact_path"]).parent.resolve()
+            measurement_reference = rank.validate_measurement_reference(
+                artifact_reference["measurement_reference"], base_path=artifact_directory,
+                expected_projection_sha256=artifact_reference["projection_sha256"],
+                expected_generation_id=artifact_reference["generation_id"],
+            )
+            input_receipt = rank.validate_input_receipt_reference(
+                artifact_reference["input_receipt"], base_path=artifact_directory,
+                expected_projection_sha256=artifact_reference["projection_sha256"],
+                expected_serializer_sha256=artifact_reference["serializer_sha256"],
+            )
+            receipt_path = (artifact_directory / input_receipt["item_corpora_path"]).resolve()
+            if receipt_path.parent != artifact_directory or receipt_path.is_symlink() or not receipt_path.is_file():
+                raise CustodyError("executor_current_capacity_input_receipt_invalid")
+            if shared_input_receipt_path is None:
+                shared_input_receipt_path = receipt_path
+            elif receipt_path != shared_input_receipt_path:
+                raise CustodyError("executor_current_capacity_input_receipt_invalid")
+            _capacity_event(
+                capacity_observer, "current_artifact", role=role,
+                artifact_directory=str(artifact_directory), artifact_reference=dict(artifact_reference),
+                measurement_reference=dict(measurement_reference), input_receipt_reference=dict(input_receipt),
+            )
+        if shared_input_receipt_path is None:
+            raise CustodyError("executor_current_capacity_input_receipt_invalid")
+        retained_input_receipt_bytes = shared_input_receipt_path.stat().st_size
+        if retained_input_receipt_bytes <= 0:
+            raise CustodyError("executor_current_capacity_input_receipt_invalid")
     # Four isolated current workers share one derived candidate SQLite store.
     # It remains only until every artifact (including the P5 repeat) validates.
     # The cleanup receipt is public observability, not a scientific input.
@@ -1518,6 +1604,15 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
         candidate_store_cleanup = shared_store.cleanup_after_artifacts_validated(
             [current_by_role[name]["artifact"] for name in ("raw", "p5_primary", "p5_repeat", "six")],
             expected_count=4,
+        )
+    if capacity_observer is not None:
+        store_bytes = candidate_store_cleanup.get("store_bytes")
+        if isinstance(store_bytes, bool) or not isinstance(store_bytes, int) or store_bytes <= 0:
+            raise CustodyError("executor_current_capacity_cleanup_invalid")
+        _capacity_event(
+            capacity_observer, "shared_current_store_cleanup",
+            cleanup_receipt=dict(candidate_store_cleanup), store_bytes=store_bytes,
+            retained_input_receipt_bytes=retained_input_receipt_bytes,
         )
     output = Path(str(config["output_dir"]))
     published_current_artifacts = [
@@ -1541,7 +1636,7 @@ def _build_staged_generation(*, config: Mapping[str, Any], protocol: Mapping[str
     return packet
 
 
-def public_coordinator(config: Mapping[str, Any]) -> dict[str, Any]:
+def public_coordinator(config: Mapping[str, Any], *, capacity_observer: CapacityObserver | None = None) -> dict[str, Any]:
     synthetic = config.get("synthetic_test_mode")
     expected_keys = PUBLIC_CONFIG_KEYS if synthetic is True else FORMAL_PUBLIC_CONFIG_KEYS
     expected_schema = SCHEMA if synthetic is True else FORMAL_SCHEMA
@@ -1577,6 +1672,7 @@ def public_coordinator(config: Mapping[str, Any]) -> dict[str, Any]:
     try:
         packet = _build_staged_generation(
             config=config, protocol=protocol, authorization=authorization, staging=staging,
+            capacity_observer=capacity_observer,
         )
         _publish_generation(staging=staging, staging_identity=staging_identity, output=output)
     except BaseException:

@@ -148,6 +148,130 @@ def test_one_shot_runs_in_order_and_rejects_any_second_formal_attempt(tmp_path, 
     assert calls.count("custodian") == 1
 
 
+def test_formal_one_shot_delegates_the_execution_body_with_formal_switches(tmp_path, monkeypatch):
+    """Characterize the public caller before extracting its private body."""
+    secret = b"o" * 32; plan = _plan(tmp_path, secret); observed = {}
+    monkeypatch.setattr(one, "require_formal_durability", lambda: None)
+    monkeypatch.setattr(one, "_require_new_formal_targets", lambda **_kwargs: None)
+    monkeypatch.setattr(one, "_existing_receipt", lambda **_kwargs: None)
+    monkeypatch.setattr(one, "_recover_final_without_receipt", lambda **_kwargs: None)
+
+    def shared(**kwargs):
+        observed.update(kwargs)
+        return {"shared": True}
+
+    monkeypatch.setattr(one, "_run_execution", shared)
+    assert one.run_one_shot(
+        signed_plan=plan, operator_capability=secret, private_capabilities=_private(),
+        model_receipt=plan["model_receipt"], repo_root=tmp_path,
+    ) == {"shared": True}
+    assert observed["enforce_disk_preflight"] is True
+    assert observed["publish_formal_receipt"] is True
+    assert observed["capacity_observer"] is None
+
+
+def test_capacity_calibration_reuses_execution_but_skips_only_admission_and_formal_receipt(tmp_path, monkeypatch):
+    secret = b"o" * 32
+    envelope = {"schema": "aerp7-convomem-capacity-envelope-v1", "payload": 1}
+    envelope["envelope_sha256"] = one._digest(envelope)
+    envelope_path = tmp_path / "envelope.json"; envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+    collector_path = tmp_path / "collector.py"; collector_path.write_text("collector", encoding="utf-8")
+    model = {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": "a" * 64, "bytes": 1}]}
+    fields = {
+        "schema": authoring.CAPACITY_CALIBRATION_PLAN_SCHEMA, "purpose": authoring.CAPACITY_CALIBRATION_PURPOSE,
+        "formal_evidence_eligible": False, "scientific_metrics_retained": False,
+        "repo_root": str(tmp_path.resolve()), "run_root": str((tmp_path / "run").resolve()),
+        "canonical_root": str((tmp_path / "canonical").resolve()), "premix_root": str((tmp_path / "premix").resolve()),
+        "expected_checkpoint_path": str((tmp_path / "checkpoint.json").resolve()), "original_root": str((tmp_path / "original").resolve()),
+        "model_dir": str((tmp_path / "model").resolve()), "python_executable": str((tmp_path / "python").resolve()), "original_python": str((tmp_path / "original-python").resolve()),
+        "source_manifest": authoring.CENSUS_SOURCE_MANIFEST, "model_receipt": model, "census_semantics": authoring.CENSUS_SEMANTICS,
+        "preparse_current_code_receipt": {"head": "a" * 40, "tree": "b" * 40, "diff_digest": "c" * 64, "dirty_policy": "clean_required"},
+        "capacity_envelope_path": str(envelope_path.resolve()), "capacity_envelope_file_sha256": one._file_sha256(envelope_path), "capacity_envelope_semantic_sha256": envelope["envelope_sha256"],
+        "capacity_collector_path": str(collector_path.resolve()), "capacity_collector_sha256": one._file_sha256(collector_path), "capacity_launcher_path": str(collector_path.resolve()), "capacity_launcher_sha256": one._file_sha256(collector_path),
+        "observation_output_path": str((tmp_path.parent / (tmp_path.name + "-observation.json")).resolve()), "calibration_receipt_path": str((tmp_path.parent / (tmp_path.name + "-receipt.json")).resolve()),
+        "disk_safety_margin_bytes": 0, "rss_safety_margin_bytes": 0, "public_authorization_nonce": "u" * 32, "custodian_nonce": "n" * 32, "custodian_expires_at_unix": 2_000_000_000,
+    }
+    plan = authoring.sign_capacity_calibration_plan(fields, operator_capability=secret)
+    monkeypatch.setattr(one, "require_formal_durability", lambda: None)
+    def fake_execution(**kwargs):
+        assert kwargs["enforce_disk_preflight"] is False and kwargs["publish_formal_receipt"] is False
+        assert (Path(plan["run_root"]) / "CALIBRATION_ONLY.json").is_file()
+        emit = kwargs["capacity_observer"]
+        emit({"schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "source_bundle_build", "candidate_payload_bytes": 2, "candidate_ready_bytes": 3, "custody_payload_bytes": 4, "custody_ready_bytes": 5})
+        for role in ("raw", "p5_primary", "p5_repeat", "six"):
+            emit({"schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "current_artifact", "role": role})
+        for number in range(1, 6):
+            emit({"schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "original_replicate", "number": number, "chroma_peak_bytes": number})
+        emit({"schema": executor.CAPACITY_EVENT_SCHEMA, "kind": "custodian_scoring", "scoring_db_peak_bytes": 7, "report_bytes": 11, "mapping_ledger_bytes": 13, "components": {"candidate_store_bytes": 1}})
+        receipt = {"supervisor_observation_complete": True, "observed_process_tree_peak_rss_bytes": 1}
+        supervisors = {f"current-{role}": dict(receipt) for role in ("raw", "p5_primary", "p5_repeat", "six")}
+        supervisors.update({f"original-{number}": dict(receipt) for number in range(5)})
+        return {"binding": {"checkpoint_sha256": "c" * 64}, "protocol": {"protocol_sha256": "p" * 64}, "public_freeze_file_sha256": "f" * 64, "final": {"packet_sha256": "z" * 64}, "public_freeze": {"supervisors": supervisors}, "capacity_supervisors": {"source_bundle_build": dict(receipt), "public_coordinator": dict(receipt), "custodian_scoring": dict(receipt)}}
+    monkeypatch.setattr(one, "_run_execution", fake_execution)
+    result = one.run_capacity_calibration(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=model, repo_root=tmp_path)
+    assert result["formal_evidence_eligible"] is False and result["scientific_metrics_retained"] is False
+    assert result["disposable_run_root_removed"] is True and not Path(plan["run_root"]).exists()
+    assert Path(plan["observation_output_path"]).is_file() and Path(plan["calibration_receipt_path"]).is_file()
+
+
+def test_capacity_calibration_failure_keeps_marked_disposable_root_and_publishes_no_completion(tmp_path, monkeypatch):
+    secret = b"o" * 32
+    envelope = {"schema": "aerp7-convomem-capacity-envelope-v1", "payload": 1}; envelope["envelope_sha256"] = one._digest(envelope)
+    envelope_path = tmp_path / "envelope.json"; envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+    collector_path = tmp_path / "collector.py"; collector_path.write_text("collector", encoding="utf-8")
+    model = {"encoder_identity": "synthetic", "encoder_semantics": "test", "files": [{"path_role": "weights", "sha256": "a" * 64, "bytes": 1}]}
+    fields = {
+        "schema": authoring.CAPACITY_CALIBRATION_PLAN_SCHEMA, "purpose": authoring.CAPACITY_CALIBRATION_PURPOSE, "formal_evidence_eligible": False, "scientific_metrics_retained": False,
+        "repo_root": str(tmp_path.resolve()), "run_root": str((tmp_path / "run").resolve()), "canonical_root": str((tmp_path / "canonical").resolve()), "premix_root": str((tmp_path / "premix").resolve()), "expected_checkpoint_path": str((tmp_path / "checkpoint.json").resolve()), "original_root": str((tmp_path / "original").resolve()), "model_dir": str((tmp_path / "model").resolve()), "python_executable": str((tmp_path / "python").resolve()), "original_python": str((tmp_path / "original-python").resolve()), "source_manifest": authoring.CENSUS_SOURCE_MANIFEST, "model_receipt": model, "census_semantics": authoring.CENSUS_SEMANTICS, "preparse_current_code_receipt": {"head": "a" * 40, "tree": "b" * 40, "diff_digest": "c" * 64, "dirty_policy": "clean_required"}, "capacity_envelope_path": str(envelope_path.resolve()), "capacity_envelope_file_sha256": one._file_sha256(envelope_path), "capacity_envelope_semantic_sha256": envelope["envelope_sha256"], "capacity_collector_path": str(collector_path.resolve()), "capacity_collector_sha256": one._file_sha256(collector_path), "capacity_launcher_path": str(collector_path.resolve()), "capacity_launcher_sha256": one._file_sha256(collector_path), "observation_output_path": str((tmp_path.parent / (tmp_path.name + "-observation.json")).resolve()), "calibration_receipt_path": str((tmp_path.parent / (tmp_path.name + "-receipt.json")).resolve()), "disk_safety_margin_bytes": 0, "rss_safety_margin_bytes": 0, "public_authorization_nonce": "u" * 32, "custodian_nonce": "n" * 32, "custodian_expires_at_unix": 2_000_000_000,
+    }
+    plan = authoring.sign_capacity_calibration_plan(fields, operator_capability=secret)
+    monkeypatch.setattr(one, "require_formal_durability", lambda: None)
+    monkeypatch.setattr(one, "_run_execution", lambda **_kwargs: (_ for _ in ()).throw(CustodyError("injected")))
+    with pytest.raises(CustodyError, match="injected"):
+        one.run_capacity_calibration(signed_plan=plan, operator_capability=secret, private_capabilities=_private(), model_receipt=model, repo_root=tmp_path)
+    assert not Path(plan["run_root"]).exists() and not Path(plan["observation_output_path"]).exists()
+    failure = json.loads(Path(plan["calibration_receipt_path"]).read_text(encoding="utf-8"))
+    assert failure["schema"] == "aerp7-convomem-capacity-calibration-failure-v1" and failure["disposable_run_root_removed"] is True
+
+
+def test_capacity_coverage_rejects_one_missing_component_or_supervisor() -> None:
+    receipt = {"supervisor_observation_complete": True, "observed_process_tree_peak_rss_bytes": 1}
+    supervisors = {name: dict(receipt) for name in one._CAPACITY_SUPERVISORS}
+    events = [
+        {"kind": "source_bundle_build", "candidate_payload_bytes": 1, "candidate_ready_bytes": 1, "custody_payload_bytes": 1, "custody_ready_bytes": 1},
+        *[{"kind": "current_artifact", "role": role} for role in ("raw", "p5_primary", "p5_repeat", "six")],
+        *[{"kind": "original_replicate", "number": number} for number in range(1, 6)],
+        {"kind": "custodian_scoring"},
+    ]
+    one._validate_capacity_coverage(events=events, supervisors=supervisors)
+    with pytest.raises(CustodyError, match="component_coverage"):
+        one._validate_capacity_coverage(events=events[:-1], supervisors=supervisors)
+    supervisors.pop("original-4")
+    with pytest.raises(CustodyError, match="supervisor_coverage"):
+        one._validate_capacity_coverage(events=events, supervisors=supervisors)
+
+
+def test_capacity_external_publish_target_rejects_existing_or_nonreal_parent(tmp_path) -> None:
+    existing = tmp_path / "existing.json"; existing.write_text("occupied", encoding="utf-8")
+    with pytest.raises(CustodyError, match="external_output_invalid"):
+        one._require_external_publish_target(existing)
+    with pytest.raises(CustodyError, match="external_output_invalid"):
+        one._require_external_publish_target(tmp_path / "missing" / "output.json")
+
+
+def test_source_capacity_tree_charges_payload_and_both_ready_files(tmp_path) -> None:
+    candidate = tmp_path / "candidate"; custody = tmp_path / "custody"
+    candidate.mkdir(); custody.mkdir()
+    (candidate / "projection.json").write_bytes(b"candidate")
+    (candidate / "READY.json").write_bytes(b"candidate-ready")
+    (custody / "sealed-custody.json").write_bytes(b"custody")
+    (custody / "READY.json").write_bytes(b"custody-ready")
+    assert one._source_capacity_tree(candidate_root=candidate, custody_root=custody) == {
+        "candidate_payload_bytes": 9, "candidate_ready_bytes": 15,
+        "custody_payload_bytes": 7, "custody_ready_bytes": 13,
+    }
+
+
 @pytest.mark.parametrize("stage", ("checkpoint", "source", "public"))
 def test_pre_custody_failures_never_launch_custodian(tmp_path, monkeypatch, stage):
     secret = b"o" * 32; plan = _plan(tmp_path, secret); calls = []; _install_success(monkeypatch, tmp_path, plan, calls)
