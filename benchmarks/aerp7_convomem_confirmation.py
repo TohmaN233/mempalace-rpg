@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import hashlib
 import hmac
 import json
@@ -16,6 +17,7 @@ import secrets
 import shutil
 import stat
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ PREMIX_EXACT_EMPTY_MESSAGE_TEXT_NORMALIZATION = {
 SQLITE_INDEX_EXPANSION_FACTOR = 3
 STAGING_HEADROOM_BYTES = 8 * 1024 * 1024 * 1024
 _HEX = set("0123456789abcdef")
+_WINDOWS_POWERSHELL = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
 # ``speaker`` is deliberately candidate-visible in v3: it is an input to the
 # frozen current-method observation serializer.  Everything which can reveal a
 # label, a source locator, or an endpoint assignment remains capability-sealed.
@@ -2250,6 +2253,121 @@ def _same_directory(path: Path, identity: tuple[int, int]) -> bool:
     except CustodyError: return False
 
 
+def validated_wsl_interop() -> str | None:
+    """Return only a live WSL interop socket; inherited text is never enough."""
+    value = os.environ.get("WSL_INTEROP")
+    if not value or "\x00" in value or os.name != "posix" or not sys.platform.startswith("linux"):
+        return None
+    path = Path(value)
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return None
+    if not path.is_absolute() or path.parent != Path("/run/WSL") or not stat.S_ISSOCK(metadata.st_mode):
+        return None
+    return str(path)
+
+
+def _drvfs_mount(path: Path) -> tuple[str, str] | None:
+    try:
+        resolved = path.resolve(strict=True)
+        device = os.stat(resolved).st_dev
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    candidates: list[tuple[list[str], str, str, str, Path]] = []
+    for line in lines:
+        try:
+            left, right = line.split(" - ", 1)
+            fields = left.split()
+            filesystem, source, options = right.split()[:3]
+            mountpoint = Path(fields[4])
+        except (ValueError, IndexError):
+            return None
+        try:
+            resolved.relative_to(mountpoint)
+        except ValueError:
+            continue
+        candidates.append((fields, filesystem, source, options, mountpoint))
+    if not candidates:
+        return None
+    deepest = max(len(mountpoint.parts) for *_record, mountpoint in candidates)
+    selected = [record for record in candidates if len(record[-1].parts) == deepest]
+    if len(selected) != 1:
+        return None
+    fields, filesystem, source, options, mountpoint = selected[0]
+    try:
+        major_text, minor_text = fields[2].split(":", 1)
+        if not major_text.isdecimal() or not minor_text.isdecimal():
+            return None
+        device_matches = (os.major(device), os.minor(device)) == (int(major_text), int(minor_text))
+    except (IndexError, ValueError, OSError):
+        return None
+    mount_parts = mountpoint.parts
+    is_drive_mountpoint = (
+        fields[3] == "/"
+        and len(mount_parts) == 3
+        and mount_parts[:2] == ("/", "mnt")
+        and len(mount_parts[2]) == 1
+        and mount_parts[2].isalpha()
+    )
+    option_tokens = [part for option in options.split(",") for part in option.split(";")]
+    drvfs_names = [token.removeprefix("aname=") for token in option_tokens if token.startswith("aname=")]
+    drvfs_paths = [token.removeprefix("path=") for token in option_tokens if token.startswith("path=")]
+    expected_drive_root = mount_parts[2].upper() + ":\\" if is_drive_mountpoint else ""
+    if filesystem != "9p" or not is_drive_mountpoint or not device_matches or drvfs_names != ["drvfs"] or drvfs_paths != [expected_drive_root]:
+        return None
+    return str(mountpoint), source
+
+
+def _verified_wsl_drvfs_interop(source: Path, destination: Path) -> str | None:
+    """Allow one sibling move through Windows only on verified WSL DrvFs."""
+    interop = validated_wsl_interop()
+    if interop is None or not source.is_absolute() or not destination.is_absolute():
+        return None
+    try:
+        metadata = os.lstat(source)
+        source_parent = source.parent.resolve(strict=True)
+        destination_parent = destination.parent.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or source_parent != destination_parent:
+        return None
+    source_mount = _drvfs_mount(source_parent)
+    if source_mount is None or source_mount != _drvfs_mount(destination_parent):
+        return None
+    return interop
+
+
+def _windows_drvfs_path(path: Path) -> str:
+    parts = path.parts
+    if not path.is_absolute() or len(parts) < 3 or parts[:2] != ("/", "mnt") or len(parts[2]) != 1 or not parts[2].isalpha():
+        raise CustodyError("cleanup_tombstone_windows_fallback_path_invalid")
+    return parts[2].upper() + ":\\" + "\\".join(parts[3:])
+
+
+def _windows_directory_move_noreplace(source: Path, destination: Path, interop: str) -> bool:
+    """Directory.Move refuses overwrite; a raced failure remains fail-closed."""
+    if destination.exists() or destination.is_symlink():
+        return False
+    if _WINDOWS_POWERSHELL.is_symlink() or not _WINDOWS_POWERSHELL.is_file():
+        raise CustodyError("cleanup_tombstone_windows_fallback_unavailable")
+    command = "$ErrorActionPreference='Stop';try{[System.IO.Directory]::Move($env:AERP7_WSL_MOVE_SOURCE,$env:AERP7_WSL_MOVE_DESTINATION);exit 0}catch [System.IO.IOException]{if([System.IO.Directory]::Exists($env:AERP7_WSL_MOVE_DESTINATION)){exit 3};exit 4}catch{exit 4}"
+    try:
+        result = subprocess.run(
+            [str(_WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+            env={"WSL_INTEROP": interop, "WSLENV": "AERP7_WSL_MOVE_SOURCE:AERP7_WSL_MOVE_DESTINATION", "AERP7_WSL_MOVE_SOURCE": _windows_drvfs_path(source), "AERP7_WSL_MOVE_DESTINATION": _windows_drvfs_path(destination)},
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+    except OSError as exc:
+        raise CustodyError("cleanup_tombstone_windows_fallback_failed") from exc
+    if result.returncode == 3:
+        return False
+    if result.returncode != 0:
+        raise CustodyError("cleanup_tombstone_windows_fallback_failed", returncode=result.returncode)
+    return True
+
+
 def _rename_noreplace(source: Path, destination: Path) -> bool:
     """Atomically move a directory only when its generated destination is free."""
     if os.name == "nt":
@@ -2276,6 +2394,10 @@ def _rename_noreplace(source: Path, destination: Path) -> bool:
     error = ctypes.get_errno()
     if error == 17:
         return False
+    if error == errno.EINVAL:
+        interop = _verified_wsl_drvfs_interop(source, destination)
+        if interop is not None:
+            return _windows_directory_move_noreplace(source, destination, interop)
     raise CustodyError("cleanup_tombstone_rename_failed", platform="linux", errno=error)
 
 

@@ -1404,6 +1404,138 @@ def test_windows_noreplace_rename_retries_collision_and_reports_fatal_code(tmp_p
     assert error.value.receipt["winerror"] in {2, 3}
 
 
+def test_linux_drvfs_einval_uses_verified_windows_directory_move(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source"; destination = tmp_path / "destination"; source.mkdir()
+
+    class RenameAt2:
+        argtypes: object
+        restype: object
+
+        def __call__(self, *_args: object) -> int:
+            return -1
+
+    class Library:
+        renameat2 = RenameAt2()
+
+    observed: list[tuple[Path, Path, str]] = []
+    monkeypatch.setattr(custody.os, "name", "posix")
+    monkeypatch.setattr(custody.sys, "platform", "linux")
+    monkeypatch.setattr(custody.ctypes, "CDLL", lambda *_args, **_kwargs: Library())
+    monkeypatch.setattr(custody.ctypes, "get_errno", lambda: custody.errno.EINVAL)
+    monkeypatch.setattr(custody, "_verified_wsl_drvfs_interop", lambda _source, _destination: "/run/WSL/interop")
+    monkeypatch.setattr(custody, "_windows_directory_move_noreplace", lambda left, right, interop: observed.append((left, right, interop)) or True)
+    assert custody._rename_noreplace(source, destination) is True
+    assert observed == [(source, destination, "/run/WSL/interop")]
+
+
+def test_windows_directory_move_uses_native_drvfs_paths_and_retries_collisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[dict[str, str]] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(custody.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(custody.Path, "is_symlink", lambda _path: False)
+    monkeypatch.setattr(custody.Path, "is_file", lambda _path: True)
+    monkeypatch.setattr(custody.subprocess, "run", lambda command, **kwargs: commands.append(list(command)) or captured.append(dict(kwargs["env"])) or SimpleNamespace(returncode=0))
+    assert custody._windows_directory_move_noreplace(Path("/mnt/e/formal/source"), Path("/mnt/e/formal/destination"), "/run/WSL/interop") is True
+    assert captured == [{"WSL_INTEROP": "/run/WSL/interop", "WSLENV": "AERP7_WSL_MOVE_SOURCE:AERP7_WSL_MOVE_DESTINATION", "AERP7_WSL_MOVE_SOURCE": r"E:\formal\source", "AERP7_WSL_MOVE_DESTINATION": r"E:\formal\destination"}]
+    assert commands[0][0] == str(custody._WINDOWS_POWERSHELL)
+    monkeypatch.setattr(custody.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=3))
+    assert custody._windows_directory_move_noreplace(Path("/mnt/e/formal/source"), Path("/mnt/e/formal/destination"), "/run/WSL/interop") is False
+
+
+def test_drvfs_mount_rejects_mismatched_windows_drive_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    mountinfo = "488 310 0:156 / /mnt/e rw,noatime - 9p E:\\134 rw,aname=drvfs;path=F:\\;uid=0"
+    monkeypatch.setattr(custody.Path, "resolve", lambda path, strict=True: path)
+    monkeypatch.setattr(custody.Path, "read_text", lambda _path, **_kwargs: mountinfo)
+    monkeypatch.setattr(custody.os, "stat", lambda _path: SimpleNamespace(st_dev=os.makedev(0, 156)))
+    assert custody._drvfs_mount(Path("/mnt/e/formal")) is None
+
+
+def test_drvfs_mount_accepts_root_matching_device_and_drive(monkeypatch: pytest.MonkeyPatch) -> None:
+    mountinfo = "488 310 0:156 / /mnt/e rw,noatime - 9p E:\\134 rw,aname=drvfs;path=E:\\;uid=0"
+    monkeypatch.setattr(custody.Path, "resolve", lambda path, strict=True: path)
+    monkeypatch.setattr(custody.Path, "read_text", lambda _path, **_kwargs: mountinfo)
+    monkeypatch.setattr(custody.os, "stat", lambda _path: SimpleNamespace(st_dev=os.makedev(0, 156)))
+    assert custody._drvfs_mount(Path("/mnt/e/formal")) == ("/mnt/e", r"E:\134")
+
+
+def test_drvfs_mount_rejects_mismatched_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    mountinfo = "488 310 0:157 / /mnt/e rw,noatime - 9p E:\\134 rw,aname=drvfs;path=E:\\;uid=0"
+    monkeypatch.setattr(custody.Path, "resolve", lambda path, strict=True: path)
+    monkeypatch.setattr(custody.Path, "read_text", lambda _path, **_kwargs: mountinfo)
+    monkeypatch.setattr(custody.os, "stat", lambda _path: SimpleNamespace(st_dev=os.makedev(0, 156)))
+    assert custody._drvfs_mount(Path("/mnt/e/formal")) is None
+
+
+def test_drvfs_mount_rejects_subtree_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    mountinfo = "488 310 0:156 /subtree /mnt/e rw,noatime - 9p E:\\134 rw,aname=drvfs;path=E:\\;uid=0"
+    monkeypatch.setattr(custody.Path, "resolve", lambda path, strict=True: path)
+    monkeypatch.setattr(custody.Path, "read_text", lambda _path, **_kwargs: mountinfo)
+    monkeypatch.setattr(custody.os, "stat", lambda _path: SimpleNamespace(st_dev=os.makedev(0, 156)))
+    assert custody._drvfs_mount(Path("/mnt/e/formal")) is None
+
+
+def test_drvfs_mount_rejects_nested_mountpoint_with_empty_drive_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    mountinfo = "488 310 0:156 / /mnt/e/sub rw,noatime - 9p arbitrary rw,aname=drvfs;path=;uid=0"
+    real_stat = custody.os.stat
+
+    def synthetic_stat(path: str | Path, *args: object, **kwargs: object) -> object:
+        if Path(path) == Path("/mnt/e/sub/formal"):
+            return SimpleNamespace(st_dev=os.makedev(0, 156))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(custody.Path, "resolve", lambda path, strict=True: path)
+    monkeypatch.setattr(custody.Path, "read_text", lambda _path, **_kwargs: mountinfo)
+    monkeypatch.setattr(custody.os, "stat", synthetic_stat)
+    assert custody._drvfs_mount(Path("/mnt/e/sub/formal")) is None
+
+
+def test_drvfs_mount_rejects_equal_mountpoint_overmount(monkeypatch: pytest.MonkeyPatch) -> None:
+    mountinfo = "\n".join((
+        "488 310 0:156 / /mnt/e rw,noatime - 9p E:\\134 rw,aname=drvfs;path=E:\\;uid=0",
+        "489 310 0:156 / /mnt/e rw,noatime - 9p E:\\134 rw,aname=drvfs;path=E:\\;uid=0",
+    ))
+    monkeypatch.setattr(custody.Path, "resolve", lambda path, strict=True: path)
+    monkeypatch.setattr(custody.Path, "read_text", lambda _path, **_kwargs: mountinfo)
+    monkeypatch.setattr(custody.os, "stat", lambda _path: SimpleNamespace(st_dev=os.makedev(0, 156)))
+    assert custody._drvfs_mount(Path("/mnt/e/formal")) is None
+
+
+def test_drvfs_mount_rejects_substring_only_drvfs_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    mountinfo = "488 310 0:156 / /mnt/e rw,noatime - 9p E:\\134 rw,notaname=drvfs;path=E:\\;uid=0"
+    monkeypatch.setattr(custody.Path, "resolve", lambda path, strict=True: path)
+    monkeypatch.setattr(custody.Path, "read_text", lambda _path, **_kwargs: mountinfo)
+    monkeypatch.setattr(custody.os, "stat", lambda _path: SimpleNamespace(st_dev=os.makedev(0, 156)))
+    assert custody._drvfs_mount(Path("/mnt/e/formal")) is None
+
+
+def test_windows_directory_move_rejects_helper_failures_and_invalid_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(custody.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(custody.Path, "is_symlink", lambda _path: False)
+    monkeypatch.setattr(custody.Path, "is_file", lambda _path: True)
+    monkeypatch.setattr(custody.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=4))
+    with pytest.raises(custody.CustodyError, match="windows_fallback_failed"):
+        custody._windows_directory_move_noreplace(Path("/mnt/e/formal/source"), Path("/mnt/e/formal/destination"), "/run/WSL/interop")
+    source = tmp_path / "source"; source.mkdir()
+
+    class RenameAt2:
+        argtypes: object
+        restype: object
+
+        def __call__(self, *_args: object) -> int:
+            return -1
+
+    class Library:
+        renameat2 = RenameAt2()
+
+    monkeypatch.setattr(custody.os, "name", "posix")
+    monkeypatch.setattr(custody.sys, "platform", "linux")
+    monkeypatch.setattr(custody.ctypes, "CDLL", lambda *_args, **_kwargs: Library())
+    monkeypatch.setattr(custody.ctypes, "get_errno", lambda: custody.errno.EINVAL)
+    monkeypatch.setattr(custody, "_verified_wsl_drvfs_interop", lambda _source, _destination: None)
+    with pytest.raises(custody.CustodyError, match="cleanup_tombstone_rename_failed"):
+        custody._rename_noreplace(source, tmp_path / "destination")
+
+
 @pytest.mark.parametrize("phase", ("selection", "custody_publish", "candidate_publish"))
 def test_build_late_failures_use_cleaning_tombstone_and_preserve_primary_and_cleanup_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
     canonical, premix = _roots(tmp_path); candidate = tmp_path / "candidate"; captured: list[object] = []
