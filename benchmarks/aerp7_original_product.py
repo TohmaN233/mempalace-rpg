@@ -115,14 +115,18 @@ class IndexAuditor(Protocol):
 
 class LiveOriginalObserver:
     """Dataset-neutral worker-side resource observer for the public product."""
-    def __init__(self, *, palace_path: Path, provider: Mapping[str, Any], denominators: Mapping[str, int], corpus_count: int) -> None:
-        self._palace_path = palace_path; self._provider = dict(provider); self._denominators = dict(denominators); self._corpus_count = int(corpus_count); self._phases: list[str] = []
+    def __init__(self, *, palace_path: Path, provider: Mapping[str, Any], denominators: Mapping[str, int], corpus_count: int | None = None) -> None:
+        self._palace_path = palace_path; self._provider = dict(provider); self._denominators = dict(denominators); self._corpus_count = int(corpus_count) if corpus_count is not None else None; self._phases: list[str] = []
+    def bind_corpus_count(self, count: int) -> None:
+        if self._corpus_count is not None or isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise RuntimeError("original product observer corpus count invalid")
+        self._corpus_count = count
     def checkpoint(self, phase: str) -> None:
         expected = ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]
         if len(self._phases) >= len(expected) or phase != expected[len(self._phases)]: raise RuntimeError("original product observer lifecycle invalid")
         self._phases.append(phase)
     def receipt(self) -> dict[str, Any]:
-        if self._phases != ["before_ingest", "after_ingest", "after_cold_close", "after_queries"]: raise RuntimeError("original product observer lifecycle incomplete")
+        if self._phases != ["before_ingest", "after_ingest", "after_cold_close", "after_queries"] or self._corpus_count is None: raise RuntimeError("original product observer lifecycle incomplete")
         storage = sum(path.stat().st_size for path in self._palace_path.rglob("*") if path.is_file() and not path.is_symlink())
         if storage <= 0: raise RuntimeError("original product resource observation incomplete")
         return {"peak_rss_bytes": 0, "storage_bytes": int(storage), "passage_embedding": {"calls": self._corpus_count, "texts": int(self._denominators["candidate_text_count"]), "measurement": PUBLIC_UPSERT_MEASUREMENT}, "query_embedding": {"calls": int(self._denominators["query_count"]), "texts": int(self._denominators["query_count"]), "measurement": PUBLIC_SEARCH_MEASUREMENT}, "provider": self._provider}
@@ -2241,6 +2245,9 @@ def run_original_public_replicate_streaming(
                 candidate_index_peak.sample()
                 if corpus_count <= 0 or candidate_count != reference["candidate_text_count"]:
                     raise OriginalProductError("stream candidate denominator drift")
+                binder = getattr(observer, "bind_corpus_count", None)
+                if binder is not None:
+                    binder(corpus_count)
                 ingest_seconds = time.perf_counter() - started
                 observer.checkpoint("after_ingest")
                 index_started = time.perf_counter()

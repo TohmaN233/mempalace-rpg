@@ -280,7 +280,7 @@ def _validate_rankings(rows:Any,p:Mapping[str,Any])->list[dict[str,Any]]:
       item=row["item_id"]; ids=row["ranked_candidate_ids"]
       if item in seen or item not in expected: raise MemBenchError("membench_ranking_coverage_invalid")
       seen.add(item); allowed={x["candidate_id"] for x in expected[item]["candidates"]}
-      if len(ids)!=min(10,len(allowed)) or len(ids)!=len(set(ids)) or not set(ids)<=allowed: raise MemBenchError("membench_ranking_invalid")
+      if len(ids)>min(10,len(allowed)) or len(ids)!=len(set(ids)) or not set(ids)<=allowed: raise MemBenchError("membench_ranking_invalid")
     if seen!=set(expected): raise MemBenchError("membench_ranking_coverage_invalid")
     return [dict(x) for x in rows]
 def run_synthetic_original_five(*,candidate:Mapping[str,Any],original_runner:Callable[[Mapping[str,Any],str],Mapping[str,Any]],coordinator_reaudit:Callable[[Mapping[str,Any]],Mapping[str,Any]])->dict[str,Any]:

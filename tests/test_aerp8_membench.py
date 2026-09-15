@@ -164,6 +164,16 @@ def test_original_normalized_projection_is_label_free_and_uses_opaque_item_corpo
     assert runtime["corpora"][0]["candidates"][0]["speaker"] == ""
 
 
+def test_ranking_validation_treats_top_k_as_a_maximum():
+    candidate, _ = m.build_bundles(source_role="role-a", source=source(), opacity_secret=b"o" * 32)
+    artifact = m.run_candidate_arms(candidate=candidate, encoder=Encoder())["strong_raw"]
+    shortened = copy.deepcopy(artifact)
+    shortened["rankings"][0]["ranked_candidate_ids"] = shortened["rankings"][0]["ranked_candidate_ids"][:1]
+    shortened["artifact_sha256"] = m.digest({key: value for key, value in shortened.items() if key != "artifact_sha256"})
+
+    assert m._validate_artifact(shortened, candidate, "strong_raw") == shortened
+
+
 def test_five_original_receipts_and_release_bind_every_public_result(tmp_path):
     candidate, custody = m.build_bundles(source_role="role-a", source=source(), opacity_secret=b"o" * 32)
     current, original = current_and_original(candidate)

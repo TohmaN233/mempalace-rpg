@@ -457,6 +457,145 @@ def test_evidence_micro_recall_at_10_is_an_explicit_secondary_denominator():
     assert summary["recall_at_10"] == pytest.approx(.75)
 
 
+def test_scoring_crosswalk_maps_unique_case_normalized_annotated_subspan_at_public_call_seam():
+    p, _arts, _m, c = run()
+    candidate = p["corpora"][0]["candidates"][0]
+    candidate["speaker"] = "user"
+    candidate["text"] = "Yes. target"
+    c["items"][0]["evidence_spans"] = [{"speaker": "User", "text": "target"}]
+    c["projection_sha256"] = canonical_sha256(p)
+    arts = artifacts(p)
+    m = manifest(p, arts)
+
+    report = score.score_frozen(
+        projection=p,
+        endpoint_manifest=m,
+        ranking_artifacts=arts,
+        custody_loader=lambda: c,
+        evidence_token_secret=b"x" * 32,
+    )
+
+    assert report["mapping_ledger"][0]["status"] == "mapped"
+
+
+def test_formal_crosswalk_uses_upstream_tiers_and_span_to_conversation_position():
+    p, _arts, _m, c = run()
+    p["items"] = [p["items"][0]]
+    p["selection_receipt"]["selected_item_context_count"] = 1
+    corpus = p["corpora"][0]
+    first = corpus["candidates"][0]
+    first["text"] = "exact-" + "a" * 100
+    second = copy.deepcopy(first)
+    second.update({
+        "message_id": h("reverse-partial"), "opaque_conversation_id": h("reverse-partial-conversation"),
+        "conversation_order": 1, "message_order": 0, "corpus_order": 11,
+        "text": "reverse-" + "b" * 100,
+    })
+    third = copy.deepcopy(first)
+    third.update({
+        "message_id": h("fuzzy"), "opaque_conversation_id": h("fuzzy-conversation"),
+        "conversation_order": 2, "message_order": 0, "corpus_order": 12,
+        "text": "fuzzy-" + "c" * 100,
+    })
+    corpus["candidates"].extend((second, third))
+    corpus["actual_conversation_count"] = 3
+    corpus["actual_message_count"] += 2
+    c["items"][0]["evidence_conversation_ids"] = [
+        first["opaque_conversation_id"], second["opaque_conversation_id"], third["opaque_conversation_id"],
+    ]
+    c["items"][0]["evidence_spans"] = [
+        {"speaker": "User", "text": first["text"]},
+        {"speaker": "User", "text": second["text"] + " extension"},
+        {"speaker": "User", "text": third["text"][:-1] + "d"},
+    ]
+    access = score._ProjectionAccess(p)
+    with score._ScoringDB() as db:
+        score._prepare_projection_items(access, db)
+        index = score._prepare_custody_rows(
+            access, [c["items"][0]], b"x" * 32, formal_live=True, db=db,
+        )
+        _group, _conversations, mappings = index.get(c["items"][0]["item_id"])
+
+    assert [(row["status"], row["tier"]) for row in mappings] == [
+        ("mapped", "exact_substring"),
+        ("mapped", "reverse_partial_80pct"),
+        ("mapped", "levenshtein_15pct"),
+    ]
+
+
+def test_crosswalk_leaves_tier_exhaustion_unresolved_and_rejects_wrong_position_formally():
+    p, _arts, _m, c = run()
+    c["items"][0]["evidence_spans"] = [{"speaker": "User", "text": "no official threshold match"}]
+    access = score._ProjectionAccess(p)
+    with score._ScoringDB() as db:
+        score._prepare_projection_items(access, db)
+        index = score._prepare_custody_rows(
+            access, c["items"], b"x" * 32, formal_live=False, db=db,
+        )
+        _group, _conversations, mappings = index.get(c["items"][0]["item_id"])
+    assert mappings == [{"status": "unmatched", "reason": "tier_exhausted"}]
+
+    p, _arts, _m, c = run()
+    corpus = p["corpora"][0]
+    wrong_position = copy.deepcopy(corpus["candidates"][0])
+    wrong_position.update({
+        "message_id": h("wrong-position"), "opaque_conversation_id": h("wrong-position-conversation"),
+        "conversation_order": 1, "message_order": 0, "corpus_order": 11,
+        "text": "other",
+    })
+    corpus["candidates"].append(wrong_position)
+    corpus["actual_conversation_count"] = 2
+    corpus["actual_message_count"] += 1
+    c["items"][0]["evidence_conversation_ids"] = [
+        wrong_position["opaque_conversation_id"], corpus["candidates"][0]["opaque_conversation_id"],
+    ]
+    c["items"][0]["evidence_spans"] = [
+        {"speaker": "User", "text": "target"}, {"speaker": "User", "text": "other"},
+    ]
+    access = score._ProjectionAccess(p)
+    with score._ScoringDB() as db:
+        score._prepare_projection_items(access, db)
+        with pytest.raises(CustodyError, match="scoring_exact_evidence_mapping_incomplete"):
+            score._prepare_custody_rows(
+                access, c["items"], b"x" * 32, formal_live=True, db=db,
+            )
+
+
+def test_crosswalk_requires_one_ordered_evidence_conversation_per_positive_span():
+    p, _arts, _m, c = run()
+    c["items"][0]["evidence_spans"].append({"speaker": "User", "text": "target"})
+    access = score._ProjectionAccess(p)
+    with score._ScoringDB() as db:
+        score._prepare_projection_items(access, db)
+        with pytest.raises(CustodyError, match="scoring_evidence_conversation_alignment_invalid"):
+            score._prepare_custody_rows(
+                access, c["items"], b"x" * 32, formal_live=False, db=db,
+            )
+
+
+def test_formal_crosswalk_keeps_unresolved_and_ambiguous_annotated_spans_fail_closed():
+    def assert_formal_mapping_rejected(p, rows):
+        access = score._ProjectionAccess(p)
+        with score._ScoringDB() as db:
+            score._prepare_projection_items(access, db)
+            with pytest.raises(CustodyError, match="scoring_exact_evidence_mapping_incomplete"):
+                score._prepare_custody_rows(
+                    access, rows, b"x" * 32, formal_live=True, db=db,
+                )
+
+    p, _arts, _m, c = run()
+    unresolved = copy.deepcopy(c)["items"]
+    unresolved[0]["evidence_spans"] = [{"speaker": "User", "text": "unrelated-evidence-" + "z" * 100}]
+    assert_formal_mapping_rejected(p, unresolved)
+
+    p, _arts, _m, c = run()
+    duplicate = copy.deepcopy(p["corpora"][0]["candidates"][0])
+    duplicate.update({"message_id": h("duplicate-target"), "message_order": 11, "corpus_order": 11})
+    p["corpora"][0]["candidates"].append(duplicate)
+    p["corpora"][0]["actual_message_count"] += 1
+    assert_formal_mapping_rejected(p, c["items"])
+
+
 def test_public_failures_precede_custody_and_mapping_is_exact_speaker_text_with_cardinality_gates():
     p, arts, m, c=run(); bad=copy.deepcopy(arts); bad[1]["trace_receipt"][0]["ranking_sha256"]=h("tamper")
     with pytest.raises(CustodyError): score.score_frozen(projection=p,endpoint_manifest=m,ranking_artifacts=bad,custody_loader=lambda:(_ for _ in ()).throw(AssertionError("must not open custody")),evidence_token_secret=b"x"*32)

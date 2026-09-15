@@ -53,6 +53,80 @@ def normalize_v1(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
+def _levenshtein_at_most(left: str, right: str, limit: int) -> bool:
+    """Return whether the source-contract edit distance stays within ``limit``."""
+    if abs(len(left) - len(right)) > limit:
+        return False
+    if len(left) > len(right):
+        left, right = right, left
+    previous = list(range(len(left) + 1))
+    for right_index, right_character in enumerate(right, 1):
+        current = [right_index]
+        for left_index, left_character in enumerate(left, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[left_index] + 1,
+                previous[left_index - 1] + (left_character != right_character),
+            ))
+        if min(current) > limit:
+            return False
+        previous = current
+    return previous[-1] <= limit
+
+
+def _conversation_span_match(span: Mapping[str, str], candidates: Sequence[Mapping[str, Any]]) -> tuple[str, list[str]] | None:
+    """Mirror ConvoMem's ordered validator tiers for one conversation."""
+    speaker = normalize_v1(span["speaker"]).casefold()
+    text = span["text"]
+    same_speaker = [
+        candidate for candidate in candidates
+        if normalize_v1(candidate["speaker"]).casefold() == speaker
+    ]
+    exact = [candidate["message_id"] for candidate in same_speaker if text in candidate["text"]]
+    if exact:
+        return "exact_substring", exact
+    reverse = [
+        candidate["message_id"] for candidate in same_speaker
+        if candidate["text"] in text and len(candidate["text"]) >= len(text) * 0.8
+    ]
+    if reverse:
+        return "reverse_partial_80pct", reverse
+    threshold = max(10, int(len(text) * 0.15))
+    fuzzy = [
+        candidate["message_id"] for candidate in same_speaker
+        if _levenshtein_at_most(candidate["text"], text, threshold)
+    ]
+    if fuzzy:
+        return "levenshtein_15pct", fuzzy
+    return None
+
+
+def resolve_evidence_span_v2(
+    span: Mapping[str, str], conversations: Sequence[str], span_ordinal: int,
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Resolve one upstream evidence span or retain its explicit failure reason."""
+    expected_conversation = conversations[span_ordinal]
+    matches = [
+        (conversation_id, _conversation_span_match(
+            span,
+            [candidate for candidate in candidates if candidate["opaque_conversation_id"] == conversation_id],
+        ))
+        for conversation_id in conversations
+    ]
+    matched = [(conversation_id, result) for conversation_id, result in matches if result is not None]
+    if not matched:
+        return {"status": "unmatched", "reason": "tier_exhausted"}
+    if len(matched) != 1:
+        return {"status": "ambiguous", "reason": "multiple_conversations"}
+    conversation_id, (tier, message_ids) = matched[0]
+    if conversation_id != expected_conversation:
+        return {"status": "unmatched", "reason": "wrong_conversation_position"}
+    if len(message_ids) != 1:
+        return {"status": "ambiguous", "reason": "multiple_message_ids", "tier": tier}
+    return {"status": "mapped", "message_id": message_ids[0], "tier": tier}
+
+
 def _sqlite_temp_parent() -> Path | None:
     """Return the inherited, launcher-validated SQLite staging directory.
 
@@ -703,6 +777,8 @@ def _prepare_custody_rows(
         spans = _l(item["evidence_spans"], "scoring_custody_evidence_invalid")
         if endpoint == "positive" and not spans:
             raise CustodyError("positive_evidence_span_missing")
+        if endpoint == "positive" and len(spans) != len(conversations):
+            raise CustodyError("scoring_evidence_conversation_alignment_invalid")
         if endpoint == "abstention" and (spans or conversations):
             raise CustodyError("abstention_evidence_must_be_empty")
         mappings: list[dict[str, Any]] = []
@@ -710,15 +786,10 @@ def _prepare_custody_rows(
             span = _o(raw_span, "scoring_custody_evidence_invalid")
             if set(span) != {"speaker", "text"} or not isinstance(span["speaker"], str) or not isinstance(span["text"], str):
                 raise CustodyError("scoring_custody_evidence_invalid")
-            hits = [
-                candidate["message_id"] for candidate in corpus["candidates"]
-                if candidate["opaque_conversation_id"] in conversations
-                and (normalize_v1(candidate["speaker"]), normalize_v1(candidate["text"])) == (normalize_v1(span["speaker"]), normalize_v1(span["text"]))
-            ]
-            status = "mapped" if len(hits) == 1 else "unmatched" if not hits else "ambiguous"
-            private = {"status": status}
-            if status == "mapped":
-                private["message_id"] = hits[0]
+            private = resolve_evidence_span_v2(
+                span, conversations, span_ordinal, corpus["candidates"],
+            )
+            status = private["status"]
             mappings.append(private)
             token = hmac.new(secret, f"aerp7-public-ledger/v1/{item_id}/{span_ordinal}".encode("utf-8"), hashlib.sha256).hexdigest()
             db.connection.execute(
@@ -1000,15 +1071,14 @@ def _map(projection: Mapping[str, Any], custody: Any, secret: bytes, *, formal_l
             raise CustodyError("scoring_custody_conversations_invalid")
         spans = _l(item["evidence_spans"], "scoring_custody_evidence_invalid")
         if endpoint == "positive" and not spans: raise CustodyError("positive_evidence_span_missing")
+        if endpoint == "positive" and len(spans) != len(evidence_conversations): raise CustodyError("scoring_evidence_conversation_alignment_invalid")
         if endpoint == "abstention" and (spans or evidence_conversations): raise CustodyError("abstention_evidence_must_be_empty")
         groups[item["item_id"]] = group; conversations[item["item_id"]] = list(evidence_conversations); resolved = []
         for ordinal, span in enumerate(spans):
             span = _o(span, "scoring_custody_evidence_invalid")
             if set(span) != {"speaker", "text"} or not isinstance(span["speaker"], str) or not isinstance(span["text"], str): raise CustodyError("scoring_custody_evidence_invalid")
-            hits = [candidate["message_id"] for candidate in corpus["candidates"] if candidate["opaque_conversation_id"] in evidence_conversations and (normalize_v1(candidate["speaker"]), normalize_v1(candidate["text"])) == (normalize_v1(span["speaker"]), normalize_v1(span["text"]))]
-            status = "mapped" if len(hits) == 1 else "unmatched" if not hits else "ambiguous"
-            private = {"status": status}
-            if status == "mapped": private["message_id"] = hits[0]
+            private = resolve_evidence_span_v2(span, evidence_conversations, ordinal, corpus["candidates"])
+            status = private["status"]
             resolved.append(private)
             # Never include mapped message id in a public report.  Token is domain
             # separated and only witnesses cardinality/status for this item.

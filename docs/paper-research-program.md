@@ -6,11 +6,30 @@ isolation. Neither track can rescue a failed gate in the other.
 
 ## Claim boundary and current status
 
-Track A is incomplete. Burned LoCoMo/AERP-5 results are engineering evidence,
-not confirmation. No ConvoMem or MemBench formal source has been opened,
-enumerated, hashed, downloaded, or run. Therefore there is no current paper
-result and no current per-dataset gate result. Track B has a protocol but no
-completed controlled experiment.
+The retrieval method-selection phase is complete as a formal project decision
+milestone; see [the Phase 1 evidence report](phase-1-retrieval-evidence-report.zh-CN.md).
+Across burned LoCoMo, a fixed-seed ConvoMem observed-pair subset, and a
+fixed-seed same-scale MemBench study, Static P5 improved the within-study
+primary Recall@10 aggregation over the corresponding original-compatible arm.
+This freezes Static P5 as the preferred method for the next phase, with
+Six-View and Strong Raw retained as controls.
+
+The three completed studies are formal evidence for the scoped Phase 1
+question—method feasibility and selection for RPG memory retrieval. Both
+sampled studies used one declared fixed seed rather than a result-selected seed:
+ConvoMem records `selection_seed=20260826`; MemBench records
+`seed=membench-same-scale-v1-20260902`. The receipt field
+`formal_evidence_eligible=false` has the narrower meaning of ineligibility for
+the AERP one-shot full official-benchmark release protocol. It does not make
+the fixed-design comparison informal or block the RPG phase.
+
+The external publication boundary remains explicit. LoCoMo is burned and
+non-blind; ConvoMem is not the full census; MemBench is not the missing paper
+`data2test` sample and its original arm is compatibility-patched rather than
+exact-unpatched. These facts prohibit relabelling the runs as complete official
+benchmark reproductions, but that claim is not the objective or completion
+gate of Phase 1. The full ConvoMem census is not suitable for this laptop and
+is not a planned local run. Track B/RPG memory-retrieval work may now begin.
 
 ConvoMem's official primary endpoint is category-specific LLM-judged answer
 accuracy by conversation-count context. The blinded exact-evidence
@@ -157,7 +176,9 @@ The remaining order is:
 3. Run each dataset one time through its source-builder, current-four,
    original-five, and custodian path.
 4. Apply each dataset's gates separately; do not pool a failure away.
-5. Only after Track A, run the frozen Track B experiment.
+5. After the scoped Phase 1 method-selection gate passes, run the frozen Track
+   B/RPG experiment. A separate full official-benchmark reproduction may be
+   added later but does not block Track B.
 
 Docker/cgroup work is not a Track A efficacy blocker. `resource_comparability`
 may be `unavailable`; no efficiency, matched-resource, or systems-security
@@ -293,7 +314,9 @@ Before data acquisition: Pro review freezes manifests, profile choices, source
 roles, metrics, bootstrap units, model files, code checkpoint, budgets, and
 authorization operators. During one-shot execution: preserve external artifacts
 and no-replace receipts, then do not tune. After both Track A datasets pass:
-freeze Track B and run it once. LongMemEval-V2 may then provide an external QA/
+freeze Track B and run it once. For the current scoped program, the three-study
+Phase 1 feasibility result satisfies this transition; full official benchmark
+reproduction is an optional later publication track. LongMemEval-V2 may then provide an external QA/
 latency/LAFS run without being relabelled as evidence R@10.
 
 ## Paper-ready definition
