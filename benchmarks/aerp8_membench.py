@@ -11,6 +11,7 @@ from mempalace_rpg.retrieval import AuthorizedRetrievalCandidate, FixedP5Policy,
 SOURCE_COMMIT="f66d8d1028d3f68627d00f77a967b93fbb8694b6"; SOURCE_TREE="2944102605501f03327b80d1e3471af1e18e2fd7"
 SOURCE_RECEIPT={"dataset":"MemBench","official_commit":SOURCE_COMMIT,"official_tree":SOURCE_TREE,"source_shape":"data2test.question_type.scenario.trajectory.v1"}
 ORIGINAL_COMMIT="87e6f38377b4bee0666374b05df6e14ffd154245"; ORIGINAL_TREE="639b2a849816fd4853072920405822824464e9c6"; ORIGINAL_MODEL_TREE="76217893f057779cee29c903aa24444154ad0da7645853f1041fd970cca275a0"
+BUNDLED_ORIGINAL_ROOT=Path(__file__).resolve().parents[1]
 CANDIDATE_SCHEMA="aerp8-membench-candidate-projection-v2"; CUSTODY_SCHEMA="aerp8-membench-sealed-custody-v2"; FORMAL_CUSTODY_SCHEMA="aerp8-membench-sealed-custody-v3"; NORMALIZATION_SCHEMA="aerp8-membench-normalized-retrieval-v1"; ARTIFACT_SCHEMA="aerp8-membench-ranking-artifact-v2"; PUBLIC_RESULTS_SCHEMA="aerp8-membench-public-results-v2"; SYNTHETIC_PUBLIC_RESULTS_SCHEMA="aerp8-membench-public-results-synthetic-v1"; RELEASE_SCHEMA="aerp8-membench-release-v3"; SYNTHETIC_RELEASE_SCHEMA="aerp8-membench-synthetic-release-v1"; REPORT_SCHEMA="aerp8-membench-retrieval-report-v3"; SYNTHETIC_REPORT_SCHEMA="aerp8-membench-retrieval-report-synthetic-v1"; READY_SCHEMA="aerp8-membench-ready-v1"; FORMAL_PREFLIGHT_SCHEMA="aerp8-membench-formal-preflight-v1"; ORIGINAL_WORKER_CONFIG_SCHEMA="aerp8-membench-original-worker-config-v2"; CURRENT_WORKER_CONFIG_SCHEMA="aerp8-membench-current-worker-config-v1"; THRESHOLD_PROTOCOL_SCHEMA="aerp8-membench-threshold-protocol-v1"; CUSTODIAN_CONFIG_SCHEMA="aerp8-membench-formal-custodian-config-v1"; SOURCE_MANIFEST_SCHEMA="aerp8-membench-formal-source-manifest-v2"; SOURCE_RECEIPT_SCHEMA="aerp8-membench-formal-source-receipt-v2"; SOURCE_BUILDER_CONFIG_SCHEMA="aerp8-membench-formal-source-builder-config-v2"; SOURCE_BUILDER_AUTH_SCHEMA="aerp8-membench-formal-source-builder-authorization-v1"; CURRENT_CHECKPOINT_SCHEMA="aerp8-membench-current-checkpoint-v2"; ORIGINAL_EXECUTION_POLICY_SCHEMA="aerp8-membench-original-execution-policy-v1"
 ARMS=("strong_raw","static_p5","six_view_secondary","original_public_product"); CURRENT_ARMS=ARMS[:3]
 CURRENT_ROLES={"raw":"strong_raw","p5_primary":"static_p5","p5_repeat":"static_p5","six":"six_view_secondary"}
@@ -409,7 +410,7 @@ def _validate_original_runtime(runtime:Any,*,checkpoint_sha256:str,execution_pol
     for key in ("original_root","original_python","mempalace_file","driver_file","model_dir","worker_home_path"):
         if not isinstance(runtime.get(key),str) or not Path(runtime[key]).is_absolute(): raise MemBenchError("membench_original_runtime_receipt_invalid")
     root=Path(runtime["original_root"]); python=Path(runtime["original_python"]); package=Path(runtime["mempalace_file"]); model=Path(runtime["model_dir"]); home=Path(runtime["worker_home_path"]); driver=Path(runtime["driver_file"]); source=_code_source(code_receipt,"benchmarks.aerp8_membench")
-    try: state=original_product.v1.git_state(root)
+    try: state=original_product.v1.original_source_state(root)
     except (OSError,subprocess.SubprocessError) as exc: raise MemBenchError("membench_original_runtime_receipt_invalid") from exc
     if not root.is_dir() or root.is_symlink() or state.get("git_dirty") is not False or state.get("git_head")!=ORIGINAL_COMMIT or state.get("git_tree")!=ORIGINAL_TREE or not python.is_file() or python.is_symlink() or _under(python,root,"membench_original_runtime_receipt_invalid")!=python.resolve() or _sha256_file(python)!=runtime.get("original_python_sha256") or not package.is_file() or package.is_symlink() or _under(package,root,"membench_original_runtime_receipt_invalid")!=package.resolve() or _sha256_file(package)!=runtime.get("mempalace_file_sha256") or driver.resolve()!=Path(source["path"]).resolve() or not driver.is_file() or driver.is_symlink() or _sha256_file(driver)!=runtime.get("driver_file_sha256") or runtime.get("driver_file_sha256")!=source["sha256"] or not model.is_dir() or model.is_symlink() or original_product.v1.file_tree_receipt(model).get("sha256")!=ORIGINAL_MODEL_TREE or not home.is_dir() or home.is_symlink() or draft_path.parent.resolve()!=home.resolve() or ready_path.parent.resolve()!=home.resolve(): raise MemBenchError("membench_original_runtime_receipt_invalid")
     for key in ("original_root","original_python","original_python_sha256","mempalace_file","mempalace_file_sha256","model_dir","model_file_tree_sha256","git_capability"):
@@ -954,10 +955,10 @@ def _probe_original_execution_policy(*,original_root:Path,original_python:Path,g
     return {"sys_executable":str(executable),"sys_version":probe["sys_version"],"base_executable":str(base),"base_executable_sha256":_sha256_file(base),"mempalace_file":str(package),"mempalace_file_sha256":_sha256_file(package)}
 
 def capture_original_execution_policy(*,original_root:Path,original_python:Path,model_dir:Path,git_capability:Mapping[str,Any]|None=None)->dict[str,Any]:
-    """Capture the external pre-run original execution policy before any worker starts."""
+    """Capture the bundled original execution policy before any worker starts."""
     root=original_root.resolve(); python=original_python.resolve(); model=model_dir.resolve(); git=dict(git_capability or _git_capability())
     checked_git=_verify_git_capability(executable=Path(str(git.get("executable",""))),sha256=str(git.get("sha256","")),version=str(git.get("version","")),system32_required=git.get("system32_required"))
-    try: state=original_product.v1.git_state(root); model_receipt=original_product.v1.file_tree_receipt(model)
+    try: state=original_product.v1.original_source_state(root); model_receipt=original_product.v1.file_tree_receipt(model)
     except (OSError,subprocess.SubprocessError,ValueError) as exc: raise MemBenchError("membench_original_execution_policy_invalid") from exc
     if not root.is_dir() or root.is_symlink() or not python.is_file() or python.is_symlink() or _under(python,root,"membench_original_execution_policy_invalid")!=python or not model.is_dir() or model.is_symlink() or state.get("git_dirty") is not False or state.get("git_head")!=ORIGINAL_COMMIT or state.get("git_tree")!=ORIGINAL_TREE or model_receipt.get("sha256")!=ORIGINAL_MODEL_TREE:
         raise MemBenchError("membench_original_execution_policy_invalid")
@@ -983,7 +984,7 @@ def pinned_original_runtime_preflight(*,original_root:Path,original_python:Path,
     _under(python,root,"membench_original_runtime_python_outside_root")
     git_capability=_verify_git_capability(executable=git_executable,sha256=git_sha256,version=git_version,system32_required=git_system32_required)
     try:
-        state=original_product.v1.git_state(root); model_receipt=original_product.v1.file_tree_receipt(model)
+        state=original_product.v1.original_source_state(root); model_receipt=original_product.v1.file_tree_receipt(model)
     except (OSError, subprocess.SubprocessError, ValueError) as exc: raise MemBenchError("membench_original_runtime_receipt_invalid") from exc
     if state.get("git_dirty") is not False or state.get("git_head")!=ORIGINAL_COMMIT or state.get("git_tree")!=ORIGINAL_TREE: raise MemBenchError("membench_original_runtime_pin_drift")
     if model_receipt.get("sha256")!=ORIGINAL_MODEL_TREE: raise MemBenchError("membench_original_runtime_model_drift")

@@ -70,7 +70,7 @@ def test_formal_primary_original_pin_is_official_mempalace_v380() -> None:
 
 
 def original_execution_policy():
-    root=Path('E:/MemPalaceWorkspace/repos/mempalace').resolve()
+    root=m.BUNDLED_ORIGINAL_ROOT
     return m.capture_original_execution_policy(
         original_root=root,
         original_python=m._venv_python(root),

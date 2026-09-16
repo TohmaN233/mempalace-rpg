@@ -46,7 +46,7 @@ CURRENT_REPEATS = 2
 ORIGINAL_REPEATS = 5
 RSS_CAP_BYTES = 2_147_483_648
 SCHEMA = "aerp5-product-paired-locomo-v2"
-EXPECTED_DEFAULT_MANIFEST_SHA256 = "1f76246e627909bbb67adcb8f3809de2b40c3432b0feeb80ed38425884dac388"
+EXPECTED_DEFAULT_MANIFEST_SHA256 = "586c0b11cb6d643deee17bbfeb61d36ba2df49ab9b6adadf6dbae417068ce589"
 EXPECTED_SCIENTIFIC_GATES = {
     "projected_member_count": 1982,
     "original_dialog_count": EXPECTED_ORIGINAL_DIALOG_COUNT,
@@ -154,6 +154,14 @@ def load_manifest(path: Path | None = None) -> dict[str, Any]:
         raise ValueError("AERP5 v2 repeat/TopK contract drifted")
     if manifest["run"].get("rss_cap_bytes") != RSS_CAP_BYTES:
         raise ValueError("AERP5 v2 RSS contract drifted")
+    original = manifest.get("original")
+    if (
+        not isinstance(original, Mapping)
+        or original.get("repo") != "."
+        or original.get("commit") != v1.ORIGINAL_PIN
+        or original.get("tree") != v1.ORIGINAL_TREE
+    ):
+        raise ValueError("AERP5 v2 bundled original source pin is malformed")
     projection = manifest.get("projection")
     if not isinstance(projection, Mapping) or set(projection) != {
         "path", "bytes", "file_sha256", "content_sha256", "schema", "conversation_count", "item_count"
@@ -1517,7 +1525,7 @@ def coordinator_run(*, projection_path: Path, dataset: Path, original_root: Path
         score_path = work / "custodian-score.json"; score_config = {"projection": str(projection_path), "expected_projection_sha256": projection_file_sha256, "expected_projection_content_sha256": projection_content_sha256, "expected_model_sha256": manifest["run"]["model"]["file_tree_sha256"], "freezes": freeze_paths, "work": str(work.resolve()), "expected_freeze_sha256": freeze_hashes, "expected_original_index_receipts": coordinator_index_receipts, "expected_original_index_receipts_sha256": canonical_sha256(coordinator_index_receipts), "aerp4_lineage": aerp4_lineage, "minilm_p5_checkpoint": minilm_p5_checkpoint, "expected_minilm_p5_checkpoint_sha256": minilm_p5_checkpoint_sha256, "dataset": str(dataset), "expected_dataset_sha256": manifest["dataset"]["sha256"], "scorer_implementation_receipt": scorer_receipt, "original_root": str(original_root), "scientific_gates": manifest["scientific_gates"], "expected_scientific_gates_sha256": canonical_sha256(manifest["scientific_gates"]), "manifest_sha256": canonical_sha256(manifest), "output": str(score_path)}
         score_config_path = work / "custodian-config.json"; score_config_path.write_bytes(_canonical(score_config))
         subprocess.run([sys.executable, "-m", "benchmarks.aerp5_product_paired_locomo_v2", "--score-config", str(score_config_path)], cwd=ROOT, check=True)
-        after_current, after_original = v1.git_state(ROOT), v1.git_state(original_root)
+        after_current, after_original = v1.git_state(ROOT), v1.original_source_state(original_root)
         if after_current != before_current or after_original != before_original: raise RuntimeError("measured repository state drifted during formal run")
         if v1.file_tree_receipt(model_dir) != model_before: raise RuntimeError("model file tree drifted during formal run")
         score = _json(score_path)
@@ -1543,7 +1551,7 @@ def environment_receipt(*, model_dir: Path, original_root: Path) -> dict[str, An
     try:
         import numpy; numpy_version = numpy.__version__
     except ImportError: numpy_version = "not-installed"
-    return {"python": sys.version, "executable": sys.executable, "platform": platform.platform(), "hardware": hardware, "packages": packages | {"numpy": numpy_version, "sqlite": sqlite3.sqlite_version}, "model": v1.file_tree_receipt(model_dir), "original": v1.git_state(original_root), "latest": v1.git_state(ROOT), "lockfiles": {path.name: sha256_file(path) for path in sorted(ROOT.glob("*lock*")) if path.is_file()}}
+    return {"python": sys.version, "executable": sys.executable, "platform": platform.platform(), "hardware": hardware, "packages": packages | {"numpy": numpy_version, "sqlite": sqlite3.sqlite_version}, "model": v1.file_tree_receipt(model_dir), "original": v1.original_source_state(original_root), "latest": v1.git_state(ROOT), "lockfiles": {path.name: sha256_file(path) for path in sorted(ROOT.glob("*lock*")) if path.is_file()}}
 
 
 def validate_environment_receipt(receipt: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
@@ -1692,7 +1700,12 @@ def validate_custodian_canonical_inputs(
     dataset_pin = manifest["dataset"]
     canonical_projection = Path(str(projection_pin["path"])).resolve()
     canonical_dataset = Path(str(dataset_pin["path"])).resolve()
-    canonical_original = Path(str(manifest["original"]["repo"])).resolve()
+    original_repo = Path(str(manifest["original"]["repo"]))
+    canonical_original = (
+        original_repo.resolve()
+        if original_repo.is_absolute()
+        else (ROOT / original_repo).resolve()
+    )
     projection_path = Path(str(config.get("projection"))).resolve()
     dataset_path = Path(str(config.get("dataset"))).resolve()
     configured_original = Path(str(config.get("original_root"))).resolve()

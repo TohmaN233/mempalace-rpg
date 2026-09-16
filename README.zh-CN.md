@@ -2,7 +2,7 @@
 
 基于 [MemPalace](https://github.com/MemPalace/mempalace) 改造/抽取的 RPG 专用长期记忆内核与 MCP 服务。
 
-本项目不是完整 MemPalace 的搬运，而是把 RPG 运行时需要的记忆层单独整理出来：场景证据、NPC 主观认知、世界事实、ACL 权限召回、旧酒馆/TavernDB 迁移、以及给 pi 等 Agent 宿主使用的 MCP 工具。
+本项目是 RPG 专用分支，并直接收入官方 MemPalace v3.8.0 Python 源码：在原版 drawer、Chroma 后端与搜索实现之上，加入场景证据、NPC 主观认知、世界事实、ACL 权限召回、旧酒馆/TavernDB 迁移，以及给 pi 等 Agent 宿主使用的 MCP 工具。精确上游 commit 与文件树收据记录在 `mempalace/_upstream_source.json`。
 
 感谢上游 MemPalace 作者与贡献者提供的 Memory Palace / drawer 存储思想、Chroma 后端集成和通用记忆检索基础。
 
@@ -282,6 +282,8 @@ mcp_rpg_get_scene(...)
 ```bash
 pip install -e /path/to/mempalace-rpg
 ```
+
+不需要另行克隆或安装 MemPalace。drawer 后端与 Original 实验对照使用的官方 v3.8.0 `mempalace` 源码已经随本仓库和 wheel 发布；安装后同时提供原版 `mempalace`、`mempalace-mcp` 命令与 RPG 专用命令。
 
 如果接入 pi：
 
@@ -649,4 +651,4 @@ ruff check .
 
 ## 许可与致谢
 
-MIT，沿用上游 MemPalace 许可精神。本项目改造自 MemPalace。
+MIT。本仓库内置的 MemPalace v3.8.0 源码继续遵循上游 MIT 许可证；见 `mempalace/LICENSE.upstream` 与 `THIRD_PARTY_NOTICES.md`。

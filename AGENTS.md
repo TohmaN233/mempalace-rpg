@@ -132,9 +132,10 @@ Before any original worker starts, the external AERP-8 checkpoint is now schema
 `aerp8-membench-current-checkpoint-v2` and binds an
 `aerp8-membench-original-execution-policy-v1` digest. The policy is independently
 re-probed with the frozen original interpreter and scrubbed environment: exact
-original root/interpreter bytes, `sys.executable`, `sys.version`,
+bundled-original root/interpreter bytes, `sys.executable`, `sys.version`,
 `sys._base_executable` (or equivalent base identity) and its bytes, the actual
-`mempalace.__file__` (which must be the pinned root's `mempalace/__init__.py`),
+`mempalace.__file__` (which must be this repository's bundled
+`mempalace/__init__.py`),
 model tree, and Git capability must all match. Its digest is carried through
 each original worker config/runtime/receipt/READY, the original artifact, public
 packet, capability release, `_formal_public`, and custodian pre-custody checks.
@@ -143,9 +144,10 @@ and `.venv/pyvenv.cfg` paths and SHA-256 values. Because the source tree deliber
 does not track the local `.venv`, the final clean checkpoint's external runtime/checkpoint
 receipt must preserve exact paths, byte hashes, and live revalidation evidence instead;
 the review closure carries both files only for isolated reproduction.
-The pinned original is commit
-`72ccd2f3653ab902e419d15bb542c88045342b04`, tree
-`5e4ad9cf1d6387cebe16dd03b6da8355d899f70c`, model tree
+The bundled original is official MemPalace v3.8.0, commit
+`87e6f38377b4bee0666374b05df6e14ffd154245`, tree
+`639b2a849816fd4853072920405822824464e9c6`; its package-byte receipt lives in
+`mempalace/_upstream_source.json`. The model tree remains
 `76217893f057779cee29c903aa24444154ad0da7645853f1041fd970cca275a0`.
 Synthetic live smoke artifacts are not data results: original
 `21917673215412ba42cbc2e1fabd4ea019bb8fcb6ed47b17418211c705e4e30d`;

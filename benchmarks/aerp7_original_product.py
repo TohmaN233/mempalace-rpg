@@ -2714,7 +2714,7 @@ def pinned_live_original_product(*, original_root: Path, model_dir: Path, palace
             yield seams, receipt
         finally:
             try:
-                original_after, model_after = v1.git_state(original_root), v1.file_tree_receipt(model_dir)
+                original_after, model_after = v1.original_source_state(original_root), v1.file_tree_receipt(model_dir)
                 if original_after != original_state or model_after != model_before:
                     raise OriginalProductError("live original code/model receipt drifted during worker execution")
             finally:

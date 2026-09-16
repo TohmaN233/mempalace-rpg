@@ -18,6 +18,7 @@ def _dialogs(count: int = 10):
 
 def test_original_product_pin_matches_the_formal_primary_comparator() -> None:
     assert runner.ORIGINAL_PIN == aerp8.ORIGINAL_COMMIT == "87e6f38377b4bee0666374b05df6e14ffd154245"
+    assert runner.ORIGINAL_TREE == aerp8.ORIGINAL_TREE == "639b2a849816fd4853072920405822824464e9c6"
 
 
 def test_load_original_product_keeps_protocol_current_and_product_modules_original(
@@ -213,11 +214,21 @@ def test_labels_accessed_only_after_all_rankings_are_complete():
 
 def test_original_pin_dirty_and_external_output_fail(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        runner, "git_state", lambda root: {"git_dirty": True, "git_head": runner.ORIGINAL_PIN}
+        runner,
+        "original_source_state",
+        lambda root: {
+            "git_dirty": True,
+            "git_head": runner.ORIGINAL_PIN,
+            "git_tree": runner.ORIGINAL_TREE,
+        },
     )
     with pytest.raises(ValueError, match="clean"):
         runner.require_clean_pinned_original(tmp_path)
-    monkeypatch.setattr(runner, "git_state", lambda root: {"git_dirty": False, "git_head": "bad"})
+    monkeypatch.setattr(
+        runner,
+        "original_source_state",
+        lambda root: {"git_dirty": False, "git_head": "bad", "git_tree": "bad"},
+    )
     with pytest.raises(ValueError, match="pinned"):
         runner.require_clean_pinned_original(tmp_path)
     with pytest.raises(ValueError, match="outside"):

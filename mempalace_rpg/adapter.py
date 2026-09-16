@@ -121,10 +121,10 @@ class RecordingEpisodeAdapter:
 class MempalaceEpisodeAdapter:
     """Adapter that writes RPG scene transcripts to MemPalace drawers.
 
-    This adapter is optional and imported lazily so projects can use the SQLite
-    kernel without opening a ChromaDB collection.  It uses MemPalace's standard
-    collection API and stores RPG-specific fields as drawer metadata, allowing
-    later search to remain wing/room scoped.
+    The bundled MemPalace implementation is imported lazily so projects can use
+    the SQLite kernel without opening a ChromaDB collection.  The adapter uses
+    MemPalace's standard collection API and stores RPG-specific fields as drawer
+    metadata, allowing later search to remain wing/room scoped.
     """
 
     def __init__(self, palace_path: str, collection_name: str | None = None) -> None:

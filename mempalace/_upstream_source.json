@@ -1,0 +1,11 @@
+{
+  "bytes": 2465537,
+  "commit": "87e6f38377b4bee0666374b05df6e14ffd154245",
+  "file_count": 103,
+  "license_file": "LICENSE.upstream",
+  "package_tree_sha256": "90f4f54b782fa213ebc231fa78af0c42fde89d24b1742c5773b3624e0e1f0dc7",
+  "repository": "https://github.com/MemPalace/mempalace",
+  "schema": "mempalace-rpg-vendored-upstream-v1",
+  "tree": "639b2a849816fd4853072920405822824464e9c6",
+  "version": "3.8.0"
+}

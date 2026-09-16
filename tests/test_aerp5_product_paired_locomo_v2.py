@@ -190,6 +190,8 @@ def test_manifest_freezes_public_known_inputs_and_rejects_tunable_surface():
     manifest = runner.load_manifest()
     assert manifest["dataset"]["sha256"] == "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
     assert manifest["original"]["commit"] == runner.v1.ORIGINAL_PIN
+    assert manifest["original"]["tree"] == runner.v1.ORIGINAL_TREE
+    assert manifest["original"]["repo"] == "."
     assert manifest["run"]["repeats_by_arm"] == runner.REPEATS_BY_ARM and manifest["run"]["top_k"] == 10
     with pytest.raises(ValueError, match="tau/router"):
         runner.main(["--tau", "0.1"])
@@ -552,7 +554,7 @@ def test_original_identity_namespace_requires_exact_fixed_dialog_count():
 def test_direct_index_audit_never_loads_product_and_rejects_persisted_byte_mutation(monkeypatch, tmp_path):
     expected = _expected_identity_namespace(); ids = [row["physical_id"] for row in expected["rows"]]
     closed = []
-    schema = {"keys": {"#embedding": {"float_list": {"vector_index": {"config": {"space": "cosine", "hnsw": {"ef_construction": 100, "ef_search": 100, "max_neighbors": 16, "num_threads": 1, "batch_size": 2, "sync_threshold": 2, "resize_factor": 1.2}}}}}}}
+    schema = {"keys": {"#embedding": {"float_list": {"vector_index": {"config": {"space": "cosine", "hnsw": {"ef_construction": 100, "ef_search": 100, "max_neighbors": 16, "num_threads": 1, "batch_size": 100, "sync_threshold": 1000, "resize_factor": 1.2}}}}}}}
     database = tmp_path / "chroma.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE collections (name TEXT, schema_str TEXT)")

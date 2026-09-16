@@ -4,7 +4,11 @@
 
 RPG-focused long-term memory kernel and MCP server adapted from [MemPalace](https://github.com/MemPalace/mempalace).
 
-This project is a focused extraction/fork of the RPG memory work built on top of MemPalace. Thanks to the upstream MemPalace author and contributors for the palace/drawer storage idea, Chroma backend integration, and the broader project-memory foundation.
+This project is an RPG-focused fork that directly vendors the official MemPalace
+v3.8.0 Python package. Thanks to the upstream MemPalace author and contributors
+for the palace/drawer implementation, Chroma integration, and broader
+project-memory foundation. The exact upstream commit and source-tree receipt are
+recorded in `mempalace/_upstream_source.json`.
 
 ## What this is
 
@@ -95,6 +99,13 @@ merely because an actor participated in a mixed-visibility scene. Callers must p
 ```bash
 pip install -e /path/to/mempalace-rpg
 ```
+
+No separate MemPalace checkout or PyPI installation is required. The official
+v3.8.0 `mempalace` source used by the drawer backend and the Original benchmark
+comparator ships in this repository and in the built wheel. Installing this
+project also provides the upstream `mempalace` and `mempalace-mcp` commands
+alongside the RPG-specific commands. The exact upstream commit, tree, and
+package-byte digest are recorded in `mempalace/_upstream_source.json`.
 
 For pi integration:
 
@@ -334,15 +345,21 @@ six-view stream must reproduce rank-for-rank before the two raw-dense arms are
 reported.
 
 ```powershell
+$HistoricalMemPalace = 'C:\path\to\mempalace-3.6.0'
 python -m benchmarks.aerp2_historical_export `
   --artifact E:\MemPalaceWorkspace\artifacts\benchmark-runs\locomo_story_dense_v2_full_run1.json `
   --dataset E:\MemPalaceWorkspace\data\benchmark-data\locomo\main\locomo10.json `
   --model-dir E:\MemPalaceWorkspace\artifacts\benchmark-runs\models\bge-small-en-v1.5\onnx `
-  --source-repo E:\MemPalaceWorkspace\repos\mempalace `
+  --source-repo $HistoricalMemPalace `
   --selection-freeze E:\MemPalaceWorkspace\artifacts\benchmark-runs\locomo_story_dense_v2_selection_freeze.json `
   --manifest tests\fixtures\aerp2_six_view_replay_manifest.json `
   --output C:\outside-repo\aerp2-six-view-export.json
 ```
+
+`--source-repo` above is only an input to the byte-pinned historical AERP-2
+replay. It intentionally points at the older source snapshot frozen by that
+historical manifest; it is not a runtime dependency of this package. Current
+drawer functionality and Original comparisons use the bundled v3.8.0 source.
 
 The completed 1,986-question / 603-hard-question, official-exact Recall@10
 result is: raw BM25 0.563496 overall / 0.449526 hard; raw dense 0.510819 /
@@ -401,11 +418,12 @@ is written atomically outside both repositories and binds the input, scorer,
 corpus, model, runtime, source, Git, ranking-stream, trace, and mapping receipts.
 
 ```powershell
+$HistoricalMemPalace = 'C:\path\to\mempalace-3.6.0'
 python -m benchmarks.aerp2_product_six_view_locomo `
   --artifact E:\MemPalaceWorkspace\artifacts\benchmark-runs\locomo_story_dense_v2_full_run1.json `
   --dataset E:\MemPalaceWorkspace\data\benchmark-data\locomo\main\locomo10.json `
   --model-dir E:\MemPalaceWorkspace\artifacts\benchmark-runs\models\bge-small-en-v1.5\onnx `
-  --source-repo E:\MemPalaceWorkspace\repos\mempalace `
+  --source-repo $HistoricalMemPalace `
   --output C:\outside-repo\aerp2-product-six-view-locomo.json
 ```
 
@@ -425,4 +443,5 @@ ruff check .
 
 ## License and attribution
 
-MIT, following upstream MemPalace licensing. This repository is adapted from MemPalace.
+MIT. The vendored MemPalace v3.8.0 source remains under its upstream MIT license;
+see `mempalace/LICENSE.upstream` and `THIRD_PARTY_NOTICES.md`.

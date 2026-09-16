@@ -28,10 +28,15 @@ from typing import Any, Callable, Iterable, Sequence
 from benchmarks import aerp1_locomo_three_way as aerp1
 from benchmarks import aerp2_product_six_view_locomo as aerp2
 from mempalace_rpg import RawAnchoredP5Policy, RpgMemoryKernel, SixViewRanker
+from mempalace_rpg.vendored_mempalace import (
+    UPSTREAM_TREE,
+    vendored_source_state,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ORIGINAL_PIN = "87e6f38377b4bee0666374b05df6e14ffd154245"
+ORIGINAL_TREE = UPSTREAM_TREE
 FROZEN_PROTOCOL_PATH = ROOT / "benchmarks" / "locomo_story_protocol.py"
 FROZEN_PROTOCOL_SOURCE = {
     "repository": "local historical MemPalace evaluation protocol",
@@ -91,9 +96,22 @@ def _same_state(before: dict[str, Any], after: dict[str, Any]) -> bool:
     return before == after
 
 
+def original_source_state(root: Path) -> dict[str, Any]:
+    """Receipt either the bundled official source or a legacy external checkout."""
+
+    resolved = root.resolve()
+    if (resolved / "mempalace" / "_upstream_source.json").is_file():
+        return vendored_source_state(resolved)
+    return git_state(resolved)
+
+
 def require_clean_pinned_original(root: Path) -> dict[str, Any]:
-    state = git_state(root)
-    if state["git_dirty"] or state["git_head"] != ORIGINAL_PIN:
+    state = original_source_state(root)
+    if (
+        state["git_dirty"]
+        or state["git_head"] != ORIGINAL_PIN
+        or state["git_tree"] != ORIGINAL_TREE
+    ):
         raise ValueError("original MemPalace root must be clean at exact pinned commit")
     return state
 
@@ -851,7 +869,7 @@ def run(
     aggregate, question_rows = score_after_freeze(
         scorer=scorer, retrieval=retrieval, rankings=rankings
     )
-    current_after, original_after = git_state(ROOT), git_state(original_root)
+    current_after, original_after = git_state(ROOT), original_source_state(original_root)
     if not _same_state(current_before, current_after) or not _same_state(
         original_before, original_after
     ):
