@@ -407,13 +407,13 @@ P5 在此研究中同时提高 Recall@10、MRR@10 与 NDCG@10。Six-View 虽提�
 
 ## 附录 A：终局证据定位
 
-下列定位用于复核，不以路径本身替代 receipt、manifest 和 artifact 的内容验证。
+下列 SHA-256 用于复核外部保存的 receipt、manifest 与 artifact；原始机器路径不在公开文档中保留。
 
 | 研究 | 终局证据 |
 | --- | --- |
-| LoCoMo | `E:\\MemPalaceWorkspace\\repos\\benchmark-artifacts\\aerp5-v2-real-c7d737e-retry7-work\\custodian-score.json`（文件 SHA-256 `abb9eee3729709ebd244aa29ffc21ad8782f75aae679d31632f15fb2cd425c77`） |
-| ConvoMem | `E:\\MemPalaceWorkspace\\experiments\\convomem\\seeded\\934d4b1\\run-20260827T022759Z-62f72939f187603a\\final.json`（文件 SHA-256 `0f65cba0342482a146296c3652aa960fc8aaf7a18f49278af2e2f40a2ee75247`；并由最终 score/receipt 约束） |
-| MemBench | `E:\\MemPalaceWorkspace\\experiments\\membench\\same-scale\\20260902T235146Z-seed20260902\\execution\\finalization\\final.json`（文件 SHA-256 `84fd20f780dc416d67d41d5544368bbe02c79fb02ac92eea7990a75aa7e9e9fa`；语义 `final_sha256=6a564ee0be8f9a61b552b00f2657424a320e19857c1654cbb317e4aad32b9e48`） |
+| LoCoMo | 外部 `custodian-score.json`（文件 SHA-256 `abb9eee3729709ebd244aa29ffc21ad8782f75aae679d31632f15fb2cd425c77`） |
+| ConvoMem | 外部 `final.json`（文件 SHA-256 `0f65cba0342482a146296c3652aa960fc8aaf7a18f49278af2e2f40a2ee75247`；并由最终 score/receipt 约束） |
+| MemBench | 外部 `final.json`（文件 SHA-256 `84fd20f780dc416d67d41d5544368bbe02c79fb02ac92eea7990a75aa7e9e9fa`；语义 `final_sha256=6a564ee0be8f9a61b552b00f2657424a320e19857c1654cbb317e4aad32b9e48`） |
 
 **可复现性声明。** 本报告仅概括已保存的终局工件与其 receipt/score 所限定的数值。任何后续再运行都应重新核对输入身份、代码提交、候选投影、artifact 哈希与 `formal_evidence_eligible`，而不能仅凭相同目录名称视为同一研究。
 

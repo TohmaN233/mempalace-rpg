@@ -1,0 +1,877 @@
+{
+  "schemaVersion": "play-memory-v1",
+  "canonicalHashRule": "SHA-256 of UTF-8 JSON with recursively sorted keys, no insignificant whitespace, literal Unicode; batch excludes payloadHash; receipt excludes receiptHash",
+  "batch": {
+    "schemaVersion": "play-memory-v1",
+    "campaignId": "camp",
+    "batchId": "batch:1",
+    "branchId": "main",
+    "epoch": 1,
+    "worldRevision": 1,
+    "predecessorBatchId": null,
+    "records": [
+      {
+        "kind": "source",
+        "id": "source:1",
+        "order": 0,
+        "sourceId": "src",
+        "version": "1",
+        "text": "密谈：钥匙在南井。B向C说：钥匙可能在北边。",
+        "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+      },
+      {
+        "kind": "scene",
+        "id": "scene:1",
+        "order": 1,
+        "text": "well scene",
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "event",
+        "id": "secret",
+        "order": 1,
+        "sceneId": "scene:1",
+        "text": "钥匙在南井",
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "event",
+        "id": "retelling",
+        "order": 2,
+        "sceneId": "scene:1",
+        "text": "B claims north",
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 27,
+            "endByte": 62,
+            "sha256": "3b96cd79e79dd47a67a87b1f5a4c86ef550d376f85d2470e5c2fa9cb024d821b"
+          }
+        ]
+      },
+      {
+        "kind": "link",
+        "id": "presence",
+        "order": 1,
+        "actorId": "D",
+        "eventIds": [
+          "secret"
+        ],
+        "relation": "present",
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "acquisition",
+        "id": "a:1",
+        "order": 1,
+        "actorId": "A",
+        "text": "钥匙在南井",
+        "eventIds": [
+          "secret"
+        ],
+        "claimId": "key-position",
+        "beliefKind": "fact",
+        "method": "witness",
+        "basisIds": [
+          "secret"
+        ],
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "acquisition",
+        "id": "c:1",
+        "order": 2,
+        "actorId": "C",
+        "text": "B声称钥匙可能在北边",
+        "eventIds": [
+          "secret",
+          "retelling"
+        ],
+        "claimId": "b-north-claim",
+        "beliefKind": "hearsay",
+        "method": "retelling",
+        "basisIds": [
+          "retelling"
+        ],
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 27,
+            "endByte": 62,
+            "sha256": "3b96cd79e79dd47a67a87b1f5a4c86ef550d376f85d2470e5c2fa9cb024d821b"
+          }
+        ]
+      },
+      {
+        "kind": "profile",
+        "id": "c:profile",
+        "order": 0,
+        "actorId": "C",
+        "field": "values",
+        "text": "cautious",
+        "knownBy": [
+          "C"
+        ],
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "state",
+        "id": "c:state",
+        "order": 1,
+        "actorId": "C",
+        "field": "goal",
+        "text": "find key",
+        "knownBy": [
+          "C"
+        ],
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "relationship",
+        "id": "a-to-c",
+        "order": 1,
+        "fromActorId": "A",
+        "toActorId": "C",
+        "text": "A distrusts C",
+        "knownBy": [
+          "A"
+        ],
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "background",
+        "id": "public-rule",
+        "order": 0,
+        "text": "festival custom",
+        "appliesTo": [
+          "A",
+          "C",
+          "D"
+        ],
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      },
+      {
+        "kind": "date",
+        "id": "anniversary",
+        "order": 1,
+        "text": "C remembers anniversary",
+        "calendarId": "host-calendar",
+        "dateRule": {
+          "month": 2,
+          "day": null
+        },
+        "knownBy": [
+          "C"
+        ],
+        "sourceSpans": [
+          {
+            "sourceId": "src",
+            "version": "1",
+            "startByte": 0,
+            "endByte": 62,
+            "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+          }
+        ]
+      }
+    ],
+    "payloadHash": "90a42ce80045f73e0a0f18f21674a7becc66c1d485afaee7768cd2ba99891cc0",
+    "previousWorldRevision": 0
+  },
+  "binding": {
+    "campaignId": "camp",
+    "branchId": "main",
+    "epoch": 1,
+    "worldRevision": 1,
+    "storyOrder": 10,
+    "checkpointId": "world:1",
+    "materialRevision": "author:1",
+    "configHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "purpose": "director-plot",
+    "actorIds": [
+      "A",
+      "C",
+      "D"
+    ],
+    "grants": [
+      "secret",
+      "retelling",
+      "public-rule",
+      "anniversary"
+    ],
+    "lineage": [
+      {
+        "branchId": "main",
+        "throughRevision": 1
+      }
+    ],
+    "maxReadBytes": 20000,
+    "maxReadCalls": 100,
+    "requiredBatchId": "batch:1"
+  },
+  "receipt": {
+    "schemaVersion": "play-memory-v1",
+    "campaignId": "camp",
+    "batchId": "batch:1",
+    "payloadHash": "90a42ce80045f73e0a0f18f21674a7becc66c1d485afaee7768cd2ba99891cc0",
+    "branchId": "main",
+    "epoch": 1,
+    "worldRevision": 1,
+    "predecessorBatchId": null,
+    "readableWatermark": {
+      "main": 1
+    },
+    "indexedWatermark": {
+      "main": -1
+    },
+    "vectorMode": "none",
+    "indexedAvailability": "not-applicable-live-ranking",
+    "characterLibrary": {
+      "schemaVersion": "play-memory-character-library-v1",
+      "actors": []
+    },
+    "receiptHash": "35e6d060e61946709d1326a086b00d836a6791d3f9e2416baf0d50a8eb2041e3"
+  },
+  "requests": {
+    "apply_batch": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "apply_batch",
+      "params": {
+        "hostToken": "HOST_CAPABILITY",
+        "batch": {
+          "schemaVersion": "play-memory-v1",
+          "campaignId": "camp",
+          "batchId": "batch:1",
+          "branchId": "main",
+          "epoch": 1,
+          "worldRevision": 1,
+          "predecessorBatchId": null,
+          "records": [
+            {
+              "kind": "source",
+              "id": "source:1",
+              "order": 0,
+              "sourceId": "src",
+              "version": "1",
+              "text": "密谈：钥匙在南井。B向C说：钥匙可能在北边。",
+              "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+            },
+            {
+              "kind": "scene",
+              "id": "scene:1",
+              "order": 1,
+              "text": "well scene",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "event",
+              "id": "secret",
+              "order": 1,
+              "sceneId": "scene:1",
+              "text": "钥匙在南井",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "event",
+              "id": "retelling",
+              "order": 2,
+              "sceneId": "scene:1",
+              "text": "B claims north",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 27,
+                  "endByte": 62,
+                  "sha256": "3b96cd79e79dd47a67a87b1f5a4c86ef550d376f85d2470e5c2fa9cb024d821b"
+                }
+              ]
+            },
+            {
+              "kind": "link",
+              "id": "presence",
+              "order": 1,
+              "actorId": "D",
+              "eventIds": [
+                "secret"
+              ],
+              "relation": "present",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "acquisition",
+              "id": "a:1",
+              "order": 1,
+              "actorId": "A",
+              "text": "钥匙在南井",
+              "eventIds": [
+                "secret"
+              ],
+              "claimId": "key-position",
+              "beliefKind": "fact",
+              "method": "witness",
+              "basisIds": [
+                "secret"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "acquisition",
+              "id": "c:1",
+              "order": 2,
+              "actorId": "C",
+              "text": "B声称钥匙可能在北边",
+              "eventIds": [
+                "secret",
+                "retelling"
+              ],
+              "claimId": "b-north-claim",
+              "beliefKind": "hearsay",
+              "method": "retelling",
+              "basisIds": [
+                "retelling"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 27,
+                  "endByte": 62,
+                  "sha256": "3b96cd79e79dd47a67a87b1f5a4c86ef550d376f85d2470e5c2fa9cb024d821b"
+                }
+              ]
+            },
+            {
+              "kind": "profile",
+              "id": "c:profile",
+              "order": 0,
+              "actorId": "C",
+              "field": "values",
+              "text": "cautious",
+              "knownBy": [
+                "C"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "state",
+              "id": "c:state",
+              "order": 1,
+              "actorId": "C",
+              "field": "goal",
+              "text": "find key",
+              "knownBy": [
+                "C"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "relationship",
+              "id": "a-to-c",
+              "order": 1,
+              "fromActorId": "A",
+              "toActorId": "C",
+              "text": "A distrusts C",
+              "knownBy": [
+                "A"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "background",
+              "id": "public-rule",
+              "order": 0,
+              "text": "festival custom",
+              "appliesTo": [
+                "A",
+                "C",
+                "D"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "date",
+              "id": "anniversary",
+              "order": 1,
+              "text": "C remembers anniversary",
+              "calendarId": "host-calendar",
+              "dateRule": {
+                "month": 2,
+                "day": null
+              },
+              "knownBy": [
+                "C"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            }
+          ],
+          "payloadHash": "90a42ce80045f73e0a0f18f21674a7becc66c1d485afaee7768cd2ba99891cc0",
+          "previousWorldRevision": 0
+        }
+      }
+    },
+    "open_scope": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "open_scope",
+      "params": {
+        "hostToken": "HOST_CAPABILITY",
+        "binding": {
+          "campaignId": "camp",
+          "branchId": "main",
+          "epoch": 1,
+          "worldRevision": 1,
+          "storyOrder": 10,
+          "checkpointId": "world:1",
+          "materialRevision": "author:1",
+          "configHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "purpose": "director-plot",
+          "actorIds": [
+            "A",
+            "C",
+            "D"
+          ],
+          "grants": [
+            "secret",
+            "retelling",
+            "public-rule",
+            "anniversary"
+          ],
+          "lineage": [
+            {
+              "branchId": "main",
+              "throughRevision": 1
+            }
+          ],
+          "maxReadBytes": 20000,
+          "maxReadCalls": 100,
+          "requiredBatchId": "batch:1"
+        }
+      }
+    },
+    "search": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "method": "search",
+      "params": {
+        "scopeHandle": "ISSUED_OPAQUE_SCOPE",
+        "query": "钥匙",
+        "limit": 10
+      }
+    },
+    "read": {
+      "jsonrpc": "2.0",
+      "id": 4,
+      "method": "read",
+      "params": {
+        "scopeHandle": "ISSUED_OPAQUE_SCOPE",
+        "handle": "ISSUED_OPAQUE_READ_HANDLE",
+        "representation": "original"
+      }
+    },
+    "validate_batch": {
+      "jsonrpc": "2.0",
+      "id": 5,
+      "method": "validate_batch",
+      "params": {
+        "hostToken": "HOST_CAPABILITY",
+        "batch": {
+          "schemaVersion": "play-memory-v1",
+          "campaignId": "camp",
+          "batchId": "batch:1",
+          "branchId": "main",
+          "epoch": 1,
+          "worldRevision": 1,
+          "predecessorBatchId": null,
+          "records": [
+            {
+              "kind": "source",
+              "id": "source:1",
+              "order": 0,
+              "sourceId": "src",
+              "version": "1",
+              "text": "密谈：钥匙在南井。B向C说：钥匙可能在北边。",
+              "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+            },
+            {
+              "kind": "scene",
+              "id": "scene:1",
+              "order": 1,
+              "text": "well scene",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "event",
+              "id": "secret",
+              "order": 1,
+              "sceneId": "scene:1",
+              "text": "钥匙在南井",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "event",
+              "id": "retelling",
+              "order": 2,
+              "sceneId": "scene:1",
+              "text": "B claims north",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 27,
+                  "endByte": 62,
+                  "sha256": "3b96cd79e79dd47a67a87b1f5a4c86ef550d376f85d2470e5c2fa9cb024d821b"
+                }
+              ]
+            },
+            {
+              "kind": "link",
+              "id": "presence",
+              "order": 1,
+              "actorId": "D",
+              "eventIds": [
+                "secret"
+              ],
+              "relation": "present",
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "acquisition",
+              "id": "a:1",
+              "order": 1,
+              "actorId": "A",
+              "text": "钥匙在南井",
+              "eventIds": [
+                "secret"
+              ],
+              "claimId": "key-position",
+              "beliefKind": "fact",
+              "method": "witness",
+              "basisIds": [
+                "secret"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "acquisition",
+              "id": "c:1",
+              "order": 2,
+              "actorId": "C",
+              "text": "B声称钥匙可能在北边",
+              "eventIds": [
+                "secret",
+                "retelling"
+              ],
+              "claimId": "b-north-claim",
+              "beliefKind": "hearsay",
+              "method": "retelling",
+              "basisIds": [
+                "retelling"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 27,
+                  "endByte": 62,
+                  "sha256": "3b96cd79e79dd47a67a87b1f5a4c86ef550d376f85d2470e5c2fa9cb024d821b"
+                }
+              ]
+            },
+            {
+              "kind": "profile",
+              "id": "c:profile",
+              "order": 0,
+              "actorId": "C",
+              "field": "values",
+              "text": "cautious",
+              "knownBy": [
+                "C"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "state",
+              "id": "c:state",
+              "order": 1,
+              "actorId": "C",
+              "field": "goal",
+              "text": "find key",
+              "knownBy": [
+                "C"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "relationship",
+              "id": "a-to-c",
+              "order": 1,
+              "fromActorId": "A",
+              "toActorId": "C",
+              "text": "A distrusts C",
+              "knownBy": [
+                "A"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "background",
+              "id": "public-rule",
+              "order": 0,
+              "text": "festival custom",
+              "appliesTo": [
+                "A",
+                "C",
+                "D"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            },
+            {
+              "kind": "date",
+              "id": "anniversary",
+              "order": 1,
+              "text": "C remembers anniversary",
+              "calendarId": "host-calendar",
+              "dateRule": {
+                "month": 2,
+                "day": null
+              },
+              "knownBy": [
+                "C"
+              ],
+              "sourceSpans": [
+                {
+                  "sourceId": "src",
+                  "version": "1",
+                  "startByte": 0,
+                  "endByte": 62,
+                  "sha256": "fc7c75a84ddde34e79bebb5357882c9074485e8d0c309d6146930df42c3648b3"
+                }
+              ]
+            }
+          ],
+          "payloadHash": "90a42ce80045f73e0a0f18f21674a7becc66c1d485afaee7768cd2ba99891cc0",
+          "previousWorldRevision": 0
+        }
+      }
+    }
+  },
+  "implementationNotes": [
+    "Record order is a Host-mapped comparable story order, inclusive at scope.storyOrder, separate from actual game time. worldRevision is a Host transaction endpoint scoped to its origin branch; globally allocated World event sequences may leave numeric gaps between different branch writes.",
+    "Every batch after the first declares previousWorldRevision equal to the accepted branch head and worldRevision equal to the World transaction end. An accepted scene may cover several World event revisions atomically. Missing previousWorldRevision permits only legacy +1 transitions. Scopes open only on completed transaction endpoints; child fork marker0 is supported.",
+    "Source records are immutable by sourceId+version; original reads return only the approved record sourceSpans, never its whole source document.",
+    "Profile/state/relationship/background/date knownBy or appliesTo is explicit Host-accepted actor applicability; presence links confer no acquisition.",
+    "No persistent dense index exists in this V1 profile: vectorMode=none for mechanical BM25 or live-authorized-ranking for a dense ranker. Every query evaluates all readable authorized records; bounded candidate vectors only accelerate queries. indexedWatermark=-1 is compatibility only, indexedAvailability=not-applicable-live-ranking, and trusted acknowledgement is disabled. A future asynchronous persistent index needs its own durable representations, manifests and worker before it may claim a watermark.",
+    "Scopes and read handles are transient, branch-epoch bound, opaque capabilities; reopen issues new handles.",
+    "The default explicit profile reuses existing BM25. Optional Qwen is a distinct explicit profile with verified local files and no download. Frozen Qwen artifacts and historical scores remain separate.",
+    "Foundation legacy Story views remain on the legacy path. New play-memory consumes this core; migrating old saved Story material requires a separately wired DTO mapper with explicit author point/version/cutoff.",
+    "Trusted validate_batch runs the same shape/hash/head/lineage/byte/reference acceptance planner as apply in a read-only SQLite transaction. It writes no memory/epoch/receipt and invokes no ranker or fault hook. Host awaits it before committing World; apply repeats validation under its write lock, so preflight is not a reservation or authority to ignore a changed predecessor."
+  ],
+  "validateBatchResult": {
+    "valid": true,
+    "batchId": "batch:1",
+    "payloadHash": "90a42ce80045f73e0a0f18f21674a7becc66c1d485afaee7768cd2ba99891cc0"
+  }
+}

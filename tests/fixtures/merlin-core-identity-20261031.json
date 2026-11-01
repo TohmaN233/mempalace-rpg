@@ -1,0 +1,150 @@
+{
+  "note": "Exact accepted identity/name rows from read-only SQLite backup; no narrative source text or credentials.",
+  "rows": [
+    {
+      "branch": "main",
+      "revision": 1,
+      "order": 1,
+      "record": {
+        "actorId": "actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73",
+        "field": "name",
+        "id": "material:c1d700e4989c3e07b03f5195262eccc898fa1bb03b67e8d1afde1e1a899924f2:actor-name:actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73",
+        "kind": "profile",
+        "knownBy": [
+          "actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73"
+        ],
+        "metadata": {
+          "actorDirectory": {
+            "aliases": [
+              "梅林·安布罗修斯"
+            ],
+            "channel": "mental",
+            "coreBinding": {
+              "coreId": "fated-launch-core-uid-415",
+              "definitionHash": "c1d700e4989c3e07b03f5195262eccc898fa1bb03b67e8d1afde1e1a899924f2",
+              "kind": "fated-selected-core-v1",
+              "ownerActorId": "fated-player-dcb8ab1d-b4bb-4010-b7a2-1a29926e1edc",
+              "selectionHash": "81c043bdda8604333e8a67e29d99956ca1be5eb54f573a83494b2947d0a185c4",
+              "source": {
+                "payloadSha256": "371e4c666d3c16963fd2fe7f9ec282cc08dd432a2040d5a3edab5e9d12ae8e01",
+                "pointer": "/worldBooks/12/entries/12",
+                "recordId": "fated-31fb66a7fc2336d0ce18b1f3",
+                "sourceSha256": "f0a2784b089bed0530ca52b2d8c8d794750bd1ab3c85c3493d6081309a00632c"
+              }
+            },
+            "role": "critical"
+          }
+        },
+        "order": 1,
+        "sourceSpans": [
+          {
+            "endByte": 6,
+            "sha256": "e9194e2ee786d1cbf80289216f520a868198eb14ea65fff96567a92aff7c6c28",
+            "sourceId": "material:c1d700e4989c3e07b03f5195262eccc898fa1bb03b67e8d1afde1e1a899924f2:actor-name:actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73",
+            "startByte": 0,
+            "version": "e9194e2ee786d1cbf80289216f520a868198eb14ea65fff96567a92aff7c6c28"
+          }
+        ],
+        "text": "梅林"
+      }
+    },
+    {
+      "branch": "main",
+      "revision": 1,
+      "order": 1,
+      "record": {
+        "actorId": "fated-player-dcb8ab1d-b4bb-4010-b7a2-1a29926e1edc",
+        "field": "memory.role",
+        "id": "material:c1d700e4989c3e07b03f5195262eccc898fa1bb03b67e8d1afde1e1a899924f2:role:fated-player-dcb8ab1d-b4bb-4010-b7a2-1a29926e1edc",
+        "kind": "profile",
+        "knownBy": [
+          "fated-player-dcb8ab1d-b4bb-4010-b7a2-1a29926e1edc"
+        ],
+        "order": 1,
+        "sourceSpans": [
+          {
+            "endByte": 6,
+            "sha256": "cdb59355f3ba293977fc0945fb85f11822d412c45c7520c7121bd2234f6c1f48",
+            "sourceId": "material:c1d700e4989c3e07b03f5195262eccc898fa1bb03b67e8d1afde1e1a899924f2:role:fated-player-dcb8ab1d-b4bb-4010-b7a2-1a29926e1edc",
+            "startByte": 0,
+            "version": "cdb59355f3ba293977fc0945fb85f11822d412c45c7520c7121bd2234f6c1f48"
+          }
+        ],
+        "text": "player"
+      }
+    },
+    {
+      "branch": "main",
+      "revision": 35,
+      "order": 18,
+      "record": {
+        "actorId": "actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73",
+        "field": "name",
+        "id": "world:e79845cb-84f8-44d0-a9d2-8a0bac5c80d5:main:toma-live25-17-91444a41-82e5-4478-a261-2dcfdf8e495e:prose:actor:cef63e54a79de3ee6aaa8eeeb47c7581be55a07bfb9406fdbb39976550ab2216:name",
+        "kind": "profile",
+        "knownBy": [
+          "actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73"
+        ],
+        "metadata": {
+          "actorDirectory": {
+            "aliases": [
+              "梅林",
+              "花之魔术师",
+              "梅林·安布罗修斯"
+            ],
+            "channel": "mental",
+            "role": "companion"
+          }
+        },
+        "order": 18,
+        "sourceSpans": [
+          {
+            "endByte": 2527,
+            "sha256": "e9194e2ee786d1cbf80289216f520a868198eb14ea65fff96567a92aff7c6c28",
+            "sourceId": "world:e79845cb-84f8-44d0-a9d2-8a0bac5c80d5:main:toma-live25-17-91444a41-82e5-4478-a261-2dcfdf8e495e:prose",
+            "startByte": 2521,
+            "version": "f5fa94acf11fd5158ff06fce931b72ef0dba0603fbfdd4cacb0ed3a16ccf1a22"
+          }
+        ],
+        "text": "梅林"
+      }
+    },
+    {
+      "branch": "branch-6b70f3d3821a",
+      "revision": 162,
+      "order": 62,
+      "record": {
+        "actorId": "actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73",
+        "field": "name",
+        "id": "world:e79845cb-84f8-44d0-a9d2-8a0bac5c80d5:branch-6b70f3d3821a:branch-6b70f3d3821a:toma-memory150-61-587e5117-846d-4aa6-9f15-6959e2af53b5:prose:actor:dcd58922dc9d8f9deea8348eb37fe7a44c0c96bc4ceee96f42481a971b7082a4:name",
+        "kind": "profile",
+        "knownBy": [
+          "actor:cc02c97c89623dfa86623e126058ff6e5d0412f7a791133de486f30716c54a73"
+        ],
+        "metadata": {
+          "actorDirectory": {
+            "aliases": [
+              "梅林",
+              "花之魔术师",
+              "梅林·安布罗修斯",
+              "命定之灵"
+            ],
+            "channel": "mental",
+            "role": "companion"
+          }
+        },
+        "order": 62,
+        "sourceSpans": [
+          {
+            "endByte": 573,
+            "sha256": "e9194e2ee786d1cbf80289216f520a868198eb14ea65fff96567a92aff7c6c28",
+            "sourceId": "world:e79845cb-84f8-44d0-a9d2-8a0bac5c80d5:branch-6b70f3d3821a:toma-memory150-61-587e5117-846d-4aa6-9f15-6959e2af53b5:prose",
+            "startByte": 567,
+            "version": "04bc02c60dffc387ecf4885ed0ada7de4e30a5593ca6f72786bb943d0967b285"
+          }
+        ],
+        "text": "梅林"
+      }
+    }
+  ]
+}

@@ -13,3 +13,7 @@ rpg-palace/
 state/
 .DS_Store
 .env
+.artifacts/
+.benchmark-artifacts/
+.chatgpt-review/
+.tmp-*/

@@ -149,14 +149,13 @@ and a different pinned-tree file substituted as `mempalace` import origin. The
 freeze/formal-public/release chain fails before an acceptable release can exist;
 the custodian neither stats nor reads custody and never invokes scoring.
 
-Independent root verification on 2026-08-23 used fresh E-drive basetemps with
-`-p no:cacheprovider`. `python -m pytest tests/test_aerp8_membench.py -q
---basetemp E:\MemPalaceWorkspace\repos\.pytest-root-aerp8-pro6-3c71
--p no:cacheprovider` returned `48 passed in 276.81s (0:04:36)`. `python -m
-pytest -q --basetemp E:\MemPalaceWorkspace\repos\.pytest-root-aerp8-pro6-full-73d2
--p no:cacheprovider` returned `716 passed, 4 skipped in 433.42s (0:07:13)`.
-`py_compile` and `git diff --check` also passed. This remains pre-formal-checkpoint
-implementation evidence, not a MemBench or ConvoMem result.
+Independent root verification on 2026-08-23 used fresh external basetemp
+directories with `-p no:cacheprovider`. The recorded results were `48 passed in
+276.81s (0:04:36)` for the focused MemBench implementation tests and `716 passed,
+4 skipped in 433.42s (0:07:13)` for the full test suite. Machine-specific
+`--basetemp` paths and exact invocations are omitted from this public copy.
+`py_compile` and `git diff --check` also passed. This remains
+pre-formal-checkpoint implementation evidence, not a MemBench or ConvoMem result.
 
 ## Required review and execution order
 

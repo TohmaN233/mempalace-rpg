@@ -1,7 +1,7 @@
 """ACL-after-authorization product retrieval; no model runtime starts here."""
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 import hashlib
 import json
@@ -138,6 +138,7 @@ SIX_VIEW_WEIGHTS = {
     "raw_bm25": 2.0, "observation_bm25": 0.5, "raw_dense": 1.0,
     "observation_dense": 2.0, "checkpoint_dense": 2.0, "combo_dense": 1.0,
 }
+PASSAGE_MATRIX_CACHE_CAPACITY = 4
 RAW_EXPERT_WEIGHTS = {
     "raw_bm25": 2.0, "observation_bm25": 0.0, "raw_dense": 1.0,
     "observation_dense": 0.0, "checkpoint_dense": 0.0, "combo_dense": 0.0,
@@ -481,7 +482,9 @@ class SixViewRanker:
         self.encoder = encoder
         self.diagnostic_ledger = diagnostic_ledger
         self.routing_policy = routing_policy
-        self._passage_cache: dict[tuple[str, str, str], tuple[tuple[float, ...], ...]] = {}
+        self._passage_cache: OrderedDict[
+            tuple[str, str, str], tuple[tuple[float, ...], ...]
+        ] = OrderedDict()
 
     def _encoder_identity(self) -> str:
         identity = getattr(self.encoder, "identity")
@@ -497,6 +500,10 @@ class SixViewRanker:
             values = _validated_vectors(self.encoder.encode_passages(texts), len(texts), view)
             cached = tuple(tuple(vector) for vector in values)
             self._passage_cache[cache_key] = cached
+            while len(self._passage_cache) > PASSAGE_MATRIX_CACHE_CAPACITY:
+                self._passage_cache.popitem(last=False)
+        else:
+            self._passage_cache.move_to_end(cache_key)
         return [list(vector) for vector in cached]
 
     @staticmethod

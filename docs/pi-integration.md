@@ -1,69 +1,19 @@
-# pi Integration
+# pi integration: legacy RPG kernel MCP
 
-Install the package and `pi-mcp-extension`, then expose the MCP server from your game package.
+This page covers the legacy `mempalace-rpg-mcp` server. It is a separate contract from the current play-memory v1 stdio JSON-RPC service; see the [current interface reference](reference/PLAY_MEMORY_V1.zh-CN.md) and [RP Host guide](guides/RP_INTEGRATION.zh-CN.md).
+
+Install the existing pi MCP extension if it is not already available:
 
 ```bash
-pip install -e /path/to/mempalace-rpg
 pi install npm:pi-mcp-extension
 ```
 
-## `.pi/mcp.json`
-
-```json
-{
-  "settings": {
-    "toolPrefix": "mcp",
-    "requestTimeoutMs": 30000,
-    "maxRetries": 5
-  },
-  "mcpServers": {
-    "rpg": {
-      "transport": "stdio",
-      "command": "bash",
-      "args": ["scripts/run-rpg-mcp.sh"],
-      "lifecycle": "eager"
-    }
-  }
-}
-```
-
-With `toolPrefix: "mcp"` and server name `rpg`, short aliases become:
-
-- `mcp_rpg_status`
-- `mcp_rpg_recall`
-- `mcp_rpg_commit_scene`
-- `mcp_rpg_deep_recall`
-- `mcp_rpg_get_scene`
-- `mcp_rpg_upsert_profile`
-- `mcp_rpg_import_taverndb`
-
-## Launcher script
-
-See `examples/dest-poet/run-rpg-mcp.sh`. Minimal form:
+Configure the pi MCP client to launch the installed command `mempalace-rpg-mcp` over stdio. The server accepts `--db`, optional `--memo-setting`, and optional `--palace`; for example:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-exec mempalace-rpg-mcp \
-  --db "${MEMPALACE_RPG_DB:-state/rpg-memory.sqlite3}" \
-  --memo-setting "${MEMPALACE_RPG_MEMO_SETTING:-memo_setting.json}" \
-  --palace "${MEMPALACE_RPG_PALACE:-state/rpg-palace}"
+mempalace-rpg-mcp --db state/rpg-memory.sqlite3
 ```
 
-Omit `--palace` or set `MEMPALACE_RPG_PALACE=off` if you only want SQLite.
+The server's actual tools include `mempalace_rpg_status`, `mempalace_rpg_recall`, `mempalace_rpg_commit_scene`, `mempalace_rpg_deep_recall`, and `mempalace_rpg_get_scene`. Their argument names and behavior belong to the legacy kernel MCP schema. They should not be renamed or treated as aliases for play-memory v1 methods.
 
-## GM prompt rule
-
-Use `examples/templates/gm-memory-rules.template.md`. The critical rule is: first decide which domains are host-owned, then tell the GM how to use memory without overriding them.
-
-## Automatic transcript commit
-
-A host extension can automatically commit visible in-world turns. `examples/dest-poet/auto-commit.ts` shows one deterministic approach:
-
-1. Exclude engineering/meta/tool-debug conversations.
-2. Build a transcript from the player and GM visible text.
-3. Collect current participants and mentioned known entities.
-4. Call `mempalace-rpg commit-scene` with a conservative `scene_transcript` event.
-5. Let the GM additionally commit high-value structured events.
-
-This pattern keeps raw history complete while preserving explicit structure for promises, secrets, faction shifts, and other durable facts.
+For roleplay integrations, decide which system owns each game domain before exposing tools. The generic domain-policy template is [`examples/templates/memo_setting.template.json`](../examples/templates/memo_setting.template.json); use it only with the legacy kernel. The Host remains responsible for model calls, semantic decisions, director behavior, and accepted world updates.

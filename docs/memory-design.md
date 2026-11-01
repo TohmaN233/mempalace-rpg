@@ -1,5 +1,7 @@
 # RPG Memory Design
 
+> Legacy compatibility note: this page describes the older `RpgMemoryKernel` record model. It is not the `play-memory-v1` schema or its stdio JSON-RPC contract. For current behavior, see the [play-memory v1 architecture](architecture/PLAY_MEMORY_MODEL.zh-CN.md) and [protocol reference](reference/PLAY_MEMORY_V1.zh-CN.md).
+
 `mempalace-rpg` is a host-agnostic RPG memory layer. It can store narrative memory, subjective NPC knowledge, world facts, and—when a host chooses to enable it—mechanical state snapshots or history. The central rule is not “never store mechanics”; it is “do not compete with the host game's authoritative truth source.”
 
 ## Core model
@@ -41,7 +43,7 @@ Stable ids for players, NPCs, factions, locations, quests, items, events, and co
 
 Recall starts by filtering what the actor is allowed to know. Ranking happens after filtering. This prevents the GM’s hidden truth or another NPC’s private belief from leaking into a character prompt.
 
-Actors should only act on the returned `MemoryPack`. If the host gives an NPC omniscient context elsewhere, that host prompt can still break isolation; the GM rules must require `mcp_rpg_recall` for long-term NPCs.
+Actors should only act on the returned `MemoryPack`. If the host gives an NPC omniscient context elsewhere, that host prompt can still break isolation; the legacy kernel MCP tool is `mempalace_rpg_recall`.
 
 ## Domain conflict controls
 

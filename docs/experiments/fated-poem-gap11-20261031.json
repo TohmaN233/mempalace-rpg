@@ -1,0 +1,146 @@
+{
+  "id": "fated-poem-gap11-decision-v6-20261031",
+  "acceptedOn": "2026-10-31",
+  "status": "user-accepted-example-result",
+  "conclusion": "在命定之诗F150/r433的冻结11题真实上下文缺口测试中，我们的Qwen双路召回＋Decision v6控制方法达到11/11题材料完整、15/15必要事实完整，在该指标上优于已测baseline、pi-rp与原作Agent；原语言控制器旧结果为10/11。",
+  "metric": "source-backed retrieved material sufficiency; final-answer consumption is scored separately",
+  "materialResult": {
+    "full": 11,
+    "partial": 0,
+    "missing": 0,
+    "fullFactUnits": 15,
+    "partialFactUnits": 0,
+    "missingFactUnits": 0
+  },
+  "finalAnswerResult": {
+    "full": 10,
+    "partial": 1,
+    "missing": 0,
+    "fullFactUnits": 13,
+    "partialFactUnits": 2,
+    "missingFactUnits": 0
+  },
+  "comparators": {
+    "baseline": {
+      "fullCases": 0,
+      "partialCases": 0,
+      "missingCases": 11,
+      "caseCount": 11,
+      "fullFactUnits": 0,
+      "partialFactUnits": 0,
+      "missingFactUnits": 15,
+      "factUnitCount": 15
+    },
+    "pi-rp": {
+      "fullCases": 6,
+      "partialCases": 2,
+      "missingCases": 3,
+      "caseCount": 11,
+      "fullFactUnits": 9,
+      "partialFactUnits": 2,
+      "missingFactUnits": 4,
+      "factUnitCount": 15
+    },
+    "original-agent": {
+      "fullCases": 7,
+      "partialCases": 3,
+      "missingCases": 1,
+      "caseCount": 11,
+      "fullFactUnits": 10,
+      "partialFactUnits": 4,
+      "missingFactUnits": 1,
+      "factUnitCount": 15
+    },
+    "ours-original-language-controller": {
+      "fullCases": 10,
+      "partialCases": 0,
+      "missingCases": 1,
+      "caseCount": 11,
+      "fullFactUnits": 14,
+      "partialFactUnits": 0,
+      "missingFactUnits": 1,
+      "factUnitCount": 15
+    }
+  },
+  "performance": {
+    "decisionCalls": 40,
+    "decisionInputTokens": 475513,
+    "decisionProviderWaitMs": 11113.270900000032,
+    "decisionUsd": null,
+    "readerCalls": 20,
+    "readerPiReportedUsd": "0.1540116000000000135",
+    "originalReadOccurrences": 15
+  },
+  "limitations": [
+    "仅本例11题材料召回指标领先，不外推到所有游戏/世界书/角色隔离或统计显著性。",
+    "最终回答10题完整/1题部分；F115漏用已找到材料，不得改称正文11/11。",
+    "该配置是独立Decision v6方法，不能追认原SG冻结成绩或静默覆盖游玩默认配置。",
+    "Decision金额仍未知，Pi报告费用不等于提供方已结算总额。"
+  ],
+  "scope": {
+    "game": "命定之诗",
+    "floor": 150,
+    "worldRevision": 433,
+    "questionCount": 11,
+    "necessaryFacts": 15,
+    "sameActualWriterB": true,
+    "answerFactsAbsentFromCommonInput": true,
+    "newStoryFloors": 0,
+    "oldCompetitorsReused": true
+  },
+  "method": {
+    "retrieval": {
+      "strategy": "sg-source-tags-qwen-17-decision-v1",
+      "model": {
+        "provider": "rp-openai-decisions-gpt-6-luna",
+        "modelId": "gpt-6-luna",
+        "thinking": "off"
+      }
+    },
+    "controllerPromptVersion": "decision-recall17-v6",
+    "embedding": {
+      "model": "Qwen3-Embedding-0.6B",
+      "dimensions": 768,
+      "modelTreeSha256": "9e286da7e2feff7d76b832dd93c11dab3e8f03ef74c28ec3663d5762688addd3",
+      "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    },
+    "questionGeneration": {
+      "selection": {
+        "modelId": "gpt-6-luna",
+        "provider": "openai-codex",
+        "thinking": "high"
+      },
+      "cachedRows": 11,
+      "newDispatches": 0
+    },
+    "reader": {
+      "provider": "openai-codex",
+      "modelId": "gpt-6-luna",
+      "thinking": "high"
+    }
+  },
+  "reproducibility": {
+    "publicQuestionSetSha256": "45384d57341a48a14987498db7a6fa9a5b676c862b27152f802fd1ef7e16e1d2",
+    "hostOnlyGoldSha256": "9bb89dee0233c1f2869dd19e28ac4889cf2c326816ef38090421255715f0a339",
+    "softwareFilesSha256": {
+      "apps/rp-server/src/decision-recall17-model.ts": "3558d12d01407360ca5cb89b3d4a4b4144ef73c8044cba5f6f5781d72d02a310",
+      "apps/rp-server/src/decision-recall17-context.ts": "da71d5e1008553f875f78f8d22fb3f217fa5dc5fa44ed5d15d277d67c977a8a0",
+      "apps/rp-server/src/decision-recall17-facets.ts": "d369c83474f3c1659ee2943f121201e0c9c11ea0d3d3b153b1b945fd43ec0640",
+      "apps/rp-server/src/openai-decision-classifier.ts": "9b24648b8743cfcd15909c6c152a188db0bc34715b9c3bd586f812b59aff755a",
+      "apps/rp-server/src/pi-memory-judgment.ts": "c848f722124b2b099c54e72afde7adbd819a176293dacc2086b8e08f3379ddf2",
+      "apps/rp-server/src/decision-recall17-view.ts": "1f75d7358aebc09ba362cef83259179e326722c10ab31c7986930fa3277557f1",
+      "apps/rp-server/src/play-memory-service.ts": "abc3d1ac13bba0487861779ad34ee97a03862f8ffaf3ea0126f00c2633256d62",
+      "apps/rp-server/src/play-memory-background.ts": "74e51c2db882b0ea353f65107543b514dfe37ac15cac6a55c1011c170541e58c",
+      "apps/rp-server/src/play-memory-caw.ts": "9b6957c637a8de17ad6d47f7f362d25636e3159970017e2e22f97e86f91db67a",
+      "apps/rp-server/src/play-memory-model-context.ts": "792226885ffe63fd4d3828b1fe823b3bfba8162099d747bff937eaa19623facb",
+      "apps/rp-server/src/sg-recall17-runtime.ts": "b107b3deadb3d536ed636733220d1a06cc5f8353e5ffc849e797e9901f0f6fe5",
+      "experiments/reference-memory/model.ts": "85c1ab88e107e9e0578bbdd6f8e528a5fd83a14cbc598ac2b8bee416634fa3ce",
+      "vendor/sg-recall17/decision-runtime.mjs": "09360367c894af5f18e1bc26eb59b92a238b52d85f381f4fc8c31e3cc24b0568",
+      "vendor/sg-recall17/DECISION-RUNTIME-BUILD-PIN.json": "6afeafd805d37100cfbb2d431033e50814e255e938fb4b1e3251d29712206444",
+      "vendor/sg-recall17/runtime.mjs": "8687e59e8e1ca4043f850f96397e7ba0a8a37f83b8b5fd6a973ac9643cbb6b24"
+    },
+    "privateNarrationAndLocalRuntimeFilesIncluded": false,
+    "fullLocalEvidenceRetainedByMaintainer": true
+  },
+  "comparatorMetric": "retrieved material completeness from earlier completed runs, not the current Decision v6 final-answer consumption"
+}
