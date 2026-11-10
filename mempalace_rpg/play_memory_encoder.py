@@ -170,6 +170,8 @@ class LocalQwenEncoder:
             raise RuntimeError("Qwen encoder is closed")
         if self._model is not None:
             return
+        load_started = time.perf_counter()
+        logger.info("Qwen model load started profile=%s device=%s", self.identity, self.config.device)
         # Recheck immediately before loading to reject edits after factory creation.
         if model_tree_hash(self.model_directory) != self.config.model_tree_sha256:
             raise ValueError("Qwen model tree changed before model loading")
@@ -186,34 +188,82 @@ class LocalQwenEncoder:
         if model.config.max_position_embeddings != MAX_TOKENS or model.config.model_type != "qwen3":
             raise ValueError("Selected local Qwen model architecture/context differs from profile")
         self._tokenizer, self._model, self._torch = tokenizer, model, torch
-        logger.info("Qwen model loaded profile=%s device=%s", self.identity, self.config.device)
+        logger.info("Qwen model loaded profile=%s device=%s loadSeconds=%.6f",
+                    self.identity, self.config.device, time.perf_counter() - load_started)
 
     def _encode(self, texts, *, query):
         with self._lock:
-            started = time.perf_counter()
+            request_started = time.perf_counter()
+            load_started = time.perf_counter()
             self._load()
+            load_seconds = time.perf_counter() - load_started
+            encode_started = time.perf_counter()
             try:
                 result = self._encode_loaded(texts, query=query)
             except Exception as encode_error:
+                encode_seconds = time.perf_counter() - encode_started
                 try:
-                    self._release_cuda_cache(started)
+                    release_seconds = self._release_cuda_cache(
+                        request_started=request_started, load_seconds=load_seconds,
+                        encode_seconds=encode_seconds)
                 except Exception as cleanup_error:
                     # Both failures remain visible; the original inference failure
                     # stays primary rather than being replaced by allocator cleanup.
                     raise encode_error from cleanup_error
+                logger.info("Qwen encode request profile=%s role=%s rows=%d outcome=error "
+                            "loadSeconds=%.6f encodeSeconds=%.6f allocatorReleaseSeconds=%.6f "
+                            "totalSeconds=%.6f", self.identity, "query" if query else "passage",
+                            len(texts), load_seconds, encode_seconds, release_seconds,
+                            time.perf_counter() - request_started)
                 raise
-            self._release_cuda_cache(started)
+            encode_seconds = time.perf_counter() - encode_started
+            release_seconds = self._release_cuda_cache(
+                request_started=request_started, load_seconds=load_seconds,
+                encode_seconds=encode_seconds)
+            logger.info("Qwen encode request profile=%s role=%s rows=%d outcome=success "
+                        "loadSeconds=%.6f encodeSeconds=%.6f allocatorReleaseSeconds=%.6f "
+                        "totalSeconds=%.6f", self.identity, "query" if query else "passage",
+                        len(texts), load_seconds, encode_seconds, release_seconds,
+                        time.perf_counter() - request_started)
             return result
 
-    def _release_cuda_cache(self, started):
+    def _release_cuda_cache(self, *, request_started, load_seconds, encode_seconds):
         # Successful returns drop the helper's batch/hidden views. On an exception,
         # traceback-owned tensors remain live. Only unused blocks are released.
         if self.config.device.startswith("cuda") and self.config.cuda_cache_policy == "release-after-encode":
-            before = self._cuda_memory()
-            self._torch.cuda.synchronize(self.config.device)
-            self._torch.cuda.empty_cache()
-            logger.info("Qwen allocator release device=%s before=%s after=%s totalSeconds=%.6f",
-                        self.config.device, before, self._cuda_memory(), time.perf_counter() - started)
+            release_started = time.perf_counter()
+            memory_before_seconds = sync_seconds = empty_cache_seconds = memory_after_seconds = None
+            release_seconds = None
+            before = after = None
+            outcome = "success"
+            try:
+                memory_before_started = time.perf_counter()
+                before = self._cuda_memory()
+                memory_before_seconds = time.perf_counter() - memory_before_started
+                sync_started = time.perf_counter()
+                self._torch.cuda.synchronize(self.config.device)
+                sync_seconds = time.perf_counter() - sync_started
+                empty_cache_started = time.perf_counter()
+                self._torch.cuda.empty_cache()
+                empty_cache_seconds = time.perf_counter() - empty_cache_started
+                memory_after_started = time.perf_counter()
+                after = self._cuda_memory()
+                memory_after_seconds = time.perf_counter() - memory_after_started
+            except Exception:
+                outcome = "error"
+                raise
+            finally:
+                release_seconds = time.perf_counter() - release_started
+                logger.info("Qwen allocator release device=%s outcome=%s before=%s after=%s "
+                            "loadSeconds=%.6f encodeSeconds=%.6f memoryBeforeSeconds=%s "
+                            "synchronizeSeconds=%s emptyCacheSeconds=%s memoryAfterSeconds=%s "
+                            "releaseSeconds=%.6f requestSeconds=%.6f",
+                            self.config.device, outcome, before, after, load_seconds,
+                            encode_seconds, memory_before_seconds, sync_seconds, empty_cache_seconds,
+                            memory_after_seconds, release_seconds,
+                            time.perf_counter() - request_started)
+            return release_seconds
+        return 0.0
 
     def _cuda_memory(self):
         if not self.config.device.startswith("cuda"):
@@ -257,7 +307,7 @@ class LocalQwenEncoder:
                 forward_seconds = time.perf_counter() - forward_started
                 normalize_started = time.perf_counter()
                 values = normalized_prefix(hidden, self._torch).cpu().tolist()
-            logger.info("Qwen batch completed role=%s rows=%d forwardSeconds=%.6f normalizeCopySeconds=%.6f totalSeconds=%.6f memory=%s",
+            logger.info("Qwen batch completed role=%s rows=%d forwardSeconds=%.6f normalizeCopySeconds=%.6f batchTotalSeconds=%.6f memory=%s",
                         "query" if query else "passage", len(indices), forward_seconds,
                         time.perf_counter() - normalize_started, time.perf_counter() - batch_started, self._cuda_memory())
             for index, vector in zip(indices, values):

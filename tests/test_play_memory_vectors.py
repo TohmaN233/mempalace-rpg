@@ -245,7 +245,15 @@ def test_play_memory_server_passes_vector_cache_option_to_qwen_config(monkeypatc
 
     captured = {}
 
+    class FakeEncoder:
+        def encode_query(self, query):
+            captured["prewarmed"] = True
+            return [0.0]
+
     class ClosedRanker:
+        def __init__(self):
+            self.encoder = FakeEncoder()
+
         def close(self):
             captured["closed"] = True
 
@@ -269,4 +277,5 @@ def test_play_memory_server_passes_vector_cache_option_to_qwen_config(monkeypatc
 
     assert result == 0
     assert Path(captured["config"].vector_cache_path) == cache_path
+    assert captured["prewarmed"] is True
     assert captured["closed"] is True

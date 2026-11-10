@@ -148,3 +148,102 @@ def detail_records(dossier, references):
         return [r for r in all_records if r["kind"] == "state" or r["id"] in refs
                 or (r["kind"] == "profile" and r["field"] in ("name", "identity", "appearance"))]
     return [r for r in dossier["profile"] if r["field"] in ("name", "identity", "appearance")]
+
+
+def memory_hierarchy(records, actor, graph, *, include_source_excerpts=True):
+    """Actor-owned expandable event views, including retained folded originals.
+
+    Event edges organize evidence. They never confer another actor's knowledge.
+    Every excerpt is an exact granted byte range from an accepted source.
+    """
+    import hashlib
+    aliases = graph["aliases"]
+    events = {row["id"]: row for row in records if row["kind"] == "event"}
+    sources = {row["sourceId"]: row for row in records if row["kind"] == "source"}
+    acquisitions = [row for row in records if row["kind"] == "acquisition"
+                    and row["actorId"] == actor]
+    overrides = {}
+    for row in sorted(records, key=lambda value: (value["order"], value["id"])):
+        if (row["kind"] != "state" or row["actorId"] != actor
+                or not row["field"].startswith("memory.significance:")):
+            continue
+        event_id = row["field"][len("memory.significance:"):]
+        try:
+            score = json.loads(row["text"])
+        except (ValueError, TypeError):
+            fail("memory significance must be structured JSON", "record-conflict", -32009)
+        if (not isinstance(score, dict) or set(score) != {"hearts", "locked"}
+                or type(score["hearts"]) is not int or score["hearts"] not in (1, 2, 3)
+                or type(score["locked"]) is not bool or event_id not in events):
+            fail("memory significance has invalid score or event", "record-conflict", -32009)
+        overrides[aliases.get(event_id, event_id)] = (score, row["order"])
+    by_event, family_knowledge = {}, {}
+    for row in acquisitions:
+        score = row.get("metadata", {}).get("memorySignificance", {"hearts": 1, "locked": False})
+        if (not isinstance(score, dict) or type(score.get("hearts")) is not int
+                or score["hearts"] not in (1, 2, 3) or type(score.get("locked")) is not bool):
+            fail("acquisition memory significance is invalid", "record-conflict", -32009)
+        for event_id in row.get("eventIds", []):
+            if event_id in events:
+                by_event.setdefault(event_id, []).append(row)
+        for family in {aliases.get(identifier, identifier) for identifier in row.get("eventIds", [])}:
+            family_knowledge.setdefault(family, []).append(row)
+    acquisition_by_id = {row["id"]: row for row in acquisitions}
+    superseding_parents = {}
+    for row in acquisitions:
+        targets = [aliases.get(identifier, identifier) for identifier in row.get("eventIds", [])]
+        for old_id in row.get("metadata", {}).get("memorySupersedes", []):
+            old = acquisition_by_id.get(old_id)
+            if old is None:
+                continue
+            for identifier in old.get("eventIds", []):
+                target = next((item for item in targets if item != aliases.get(identifier, identifier)), None)
+                if target:
+                    superseding_parents[identifier] = target
+    active = set(graph["activeRecordIds"])
+    nodes = []
+    for event_id, known in by_event.items():
+        event = events[event_id]
+        lifecycle = event.get("metadata", {}).get("memoryLifecycle", {})
+        canonical = aliases.get(event_id, event_id)
+        override = overrides.get(canonical)
+        score = dict(override[0]) if override else {"hearts": 1, "locked": False}
+        if not score["locked"]:
+            family_known = [row for row in family_knowledge.get(canonical, [])
+                            if override is None or row["order"] > override[1]]
+            score["hearts"] = max([score["hearts"], *[row.get("metadata", {}).get(
+                "memorySignificance", {"hearts": 1})["hearts"] for row in family_known]])
+        spans, excerpts = {}, {}
+        for row in known:
+            for span in row.get("sourceSpans", []):
+                source = sources.get(span["sourceId"])
+                if source is None or source["version"] != span["version"]:
+                    fail("memory hierarchy source is unavailable", "source-integrity", -32009)
+                raw = source["text"].encode("utf-8")[span["startByte"]:span["endByte"]]
+                if hashlib.sha256(raw).hexdigest() != span["sha256"]:
+                    fail("memory hierarchy source range hash differs", "source-integrity", -32009)
+                key = json.dumps(span, sort_keys=True)
+                spans[key] = dict(span)
+                if include_source_excerpts:
+                    excerpts[key] = {**span, "text": raw.decode("utf-8", errors="strict")}
+        parent = canonical if canonical != event_id else lifecycle.get("parentEventId", superseding_parents.get(event_id))
+        if parent:
+            parent = aliases.get(parent, parent)
+        visible = [row for row in known if row["id"] in active]
+        summary_rows = visible or known
+        node = {"eventId": event_id, "phase": lifecycle.get("phase", "active"),
+                "summary": "\n".join(dict.fromkeys(row["text"] for row in summary_rows)),
+                "hearts": score["hearts"], "locked": score["locked"],
+                "folded": event_id not in active or not visible,
+                "layer": "detail" if canonical != event_id or not visible else "unlayered",
+                "recordIds": [row["id"] for row in known], "children": [],
+                "sourceSpans": list(spans.values()), "sourceExcerpts": list(excerpts.values())}
+        if parent and parent != event_id and parent in by_event:
+            node["parentEventId"] = parent
+        nodes.append(node)
+    by_id = {node["eventId"]: node for node in nodes}
+    for node in nodes:
+        parent = by_id.get(node.get("parentEventId"))
+        if parent:
+            parent["children"].append(node["eventId"])
+    return sorted(nodes, key=lambda node: (events[node["eventId"]]["order"], node["eventId"]))

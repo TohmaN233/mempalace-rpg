@@ -53,7 +53,7 @@ def actor_directory(scope, policy):
         for identity in identities.values():
             identity["present"] = False
         for actor in roster:
-            if (not isinstance(actor, dict) or set(actor) != {"actorId", "present", "channel"}
+            if (not isinstance(actor, dict) or not {"actorId", "present", "channel"}.issubset(actor)
                     or not isinstance(actor["actorId"], str) or not actor["actorId"]
                     or type(actor["present"]) is not bool
                     or actor["channel"] not in ("physical", "mental")
@@ -64,6 +64,9 @@ def actor_directory(scope, policy):
                 identities[actor["actorId"]].update(present=actor["present"], channel=actor["channel"])
     blocked = blocked_memory_actors(records)
     identities = {actor_id: row for actor_id, row in identities.items() if actor_id not in blocked}
+    for actor_id, entry in seen_identities(identity_records).items():
+        if actor_id in identities:
+            identities[actor_id].update(displayName=entry["canonicalName"], aliases=list(entry["aliases"]))
     if scope["binding"]["purpose"] == "actor-knowledge":
         identities = {key: value for key, value in identities.items()
                       if key in scope["binding"]["actorIds"]}
@@ -146,6 +149,7 @@ def resolve_actors(scope, params, policy):
     def final_registry_entry(entry, *, bind_to_current_panel=False):
         result = {key: entry[key] for key in
                   ("actorId", "canonicalName", "aliases", "introduction", "firstAppearance")}
+        result["aliases"] = list(dict.fromkeys([*entry.get("_registryAliases", []), *entry["aliases"]]))
         if bind_to_current_panel:
             result["firstAppearance"] = {**request_receipt, "basis": "panel"}
         return result
@@ -166,6 +170,9 @@ def resolve_actors(scope, params, policy):
         )
         matches = [] if skip_global_name_lookup else resolve_identity_name(
             proposal["displayName"], lookup, exclude_confirmed_unnamed=lifecycle)
+        if len(matches) > 1:
+            fail(f"Actor display name is ambiguous across saved identities: {proposal['displayName']}; use its canonical name",
+                 "ambiguous-actor-identity", -32009)
         if actor_id is None:
             if len(matches) > 1:
                 fail(f"Actor display name is ambiguous across saved identities: {proposal['displayName']}",
@@ -245,6 +252,12 @@ def resolve_actors(scope, params, policy):
             alias = normalized_name(raw_alias)
             if alias == canonical or alias in aliases:
                 continue
+            owners = resolve_identity_name(alias, lookup, exclude_confirmed_unnamed=lifecycle)
+            if owners and owners != [actor_id]:
+                logging.getLogger(__name__).warning(
+                    "actor_alias_rejected actor=%s alias=%s candidates=%s origin=%s reason=conflicting-identity",
+                    actor_id, alias, owners, origin)
+                continue
             if not lifecycle or alias in text:
                 aliases.append(alias)
         if registered is not None and not registered.get("legacy"):
@@ -304,12 +317,13 @@ def resolve_actors(scope, params, policy):
                 registry_entries.append(final_registry_entry(registered))
             resolved.append(resolved_actor)
             continue
+        anchor_names = [name for name in dict.fromkeys([canonical, *aliases, proposal["displayName"]])
+                        if resolve_identity_name(name, lookup, exclude_confirmed_unnamed=lifecycle) in ([], [actor_id])]
         quote = proposal.get("quote", proposal["displayName"])
         offset = text.find(quote)
         context_only = False
         if offset < 0:
-            names = [proposal["displayName"], *proposal["aliases"], canonical,
-                     *known.get(actor_id, {}).get("aliases", [])]
+            names = anchor_names
             literal = next((name for name in names if name and name in text), None)
             if literal is None:
                 if not proposal["present"]:
@@ -331,8 +345,7 @@ def resolve_actors(scope, params, policy):
                     "actor identity quote rebound ref=%s source=%s basis=exact-literal-name", ref, source["sourceId"])
         # Identity/presence cards authorize only a literal name/label mention,
         # never the surrounding paragraph (which may contain somebody's secret).
-        mentions = [name for name in [proposal["displayName"], *proposal["aliases"],
-                                     canonical, *known.get(actor_id, {}).get("aliases", [])]
+        mentions = [name for name in anchor_names
                     if name and name in quote]
         if not mentions:
             context_only = True

@@ -33,6 +33,8 @@ The service uses JSON-RPC 2.0 JSON Lines, with one request line per response lin
 
 The schema's `$defs` contains the exact field constraints for common `sourceSpan`, batch, binding, and each RPC. A binding includes at least `campaignId`, `branchId`, `epoch`, `worldRevision`, `storyOrder`, `checkpointId`, `materialRevision`, `configHash`, purpose, actorIds, grants, and lineage. See the [architecture page](../architecture/PLAY_MEMORY_MODEL.md) for record types and the meaning of `knownBy`, `appliesTo`, and `fromActorId`/`toActorId`.
 
+The next batch names the current semantic head in `predecessorBatchId`. Mechanical Host edits can advance World without writing memory. For an existing branch, `previousWorldRevision` may lie between the semantic head revision and the new `worldRevision`, with the latter strictly greater. These gaps need no empty batches. A different predecessor or backwards revision remains invalid.
+
 ### Qwen profile parameters
 
 The service defaults to `--profile mechanical-bm25-v1`. The Qwen profile uses:
@@ -65,3 +67,5 @@ The MCP protocol exposes the following main tool names through `initialize`, `to
 Legacy recall requires `campaign_id`, `actor_id`, and `query`; scene, actor, and visibility fields use their own snake_case JSON contract. `mempalace_rpg_list_memories`, `mempalace_rpg_list_world_facts`, and `mempalace_rpg_list_actor_beliefs` are listed in the server but are disabled local-admin surfaces and are rejected over MCP.
 
 The legacy kernel CLI also provides maintenance commands such as `backup`, `restore`, `delete-after`, `delete-scenes`, and `sync-branch`. These are not play-memory v1 stdio methods. See [pi-integration.md](../pi-integration.md) for the legacy Pi example and [taverndb-import.md](../taverndb-import.md) for import material.
+
+Actor dossiers also return `memoryHierarchy` with actor-owned event edges, summaries, heart significance, locks, folding state and source ranges. `actor_dossiers` accepts `includeSourceExcerpts=false` to omit original bodies. Archive age no longer causes deletion. Legacy `expiresAfterFloor` remains a compatibility field.

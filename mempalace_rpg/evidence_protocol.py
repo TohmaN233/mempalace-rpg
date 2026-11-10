@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 from datetime import datetime
+from dataclasses import dataclass
+from functools import total_ordering
 from typing import Any
 
 PROTOCOL_VERSION = "memory-evidence-v1"
@@ -83,7 +85,31 @@ def sha256(value: Any, label: str) -> str:
     return value
 
 
-def timestamp(value: Any, label: str) -> datetime:
+@total_ordering
+@dataclass(frozen=True)
+class StoryInstant:
+    """Calendar-tagged ordering only; wall-clock diagnostics keep datetime."""
+    calendar_id: str
+    seconds: int | float
+
+    def __lt__(self, other):
+        if not isinstance(other, StoryInstant):
+            return NotImplemented
+        if self.calendar_id != other.calendar_id:
+            raise invalid("story clocks require Host source-bound legacy normalization")
+        return self.seconds < other.seconds
+
+    def timestamp(self):
+        # Existing evidence rankers consume a numeric chronological key.
+        return self.seconds
+
+
+def timestamp(value: Any, label: str) -> StoryInstant:
+    if isinstance(value, str) and value.startswith("game:"):
+        match = re.fullmatch(r"game:fated-488:(0|-?[1-9]\d*)", value)
+        if not match or abs(int(match[1])) > 9007199254740991:
+            raise invalid(f"{label} must be a canonical safe game-minute instant")
+        return StoryInstant("fated-488", int(match[1]) * 60)
     if not isinstance(value, str) or not re.fullmatch(
         r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value
     ):
@@ -91,7 +117,7 @@ def timestamp(value: Any, label: str) -> datetime:
     if value[-1] != "Z" and (int(value[-5:-3]) > 23 or int(value[-2:]) > 59):
         raise invalid(f"{label} has an invalid timezone offset")
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return StoryInstant("legacy-iso", datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except ValueError as exc:
         raise invalid(f"{label} has an invalid date or time") from exc
 

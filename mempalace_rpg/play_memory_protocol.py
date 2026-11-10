@@ -158,7 +158,8 @@ RPC_PARAMS = {
                         "retrievalPolicy": {"enum": ["scene-summaries-v1"]}},
                        ["hostToken", "binding"]),
     "actor_cues": obj({"hostToken": STR, "scopeHandle": STR, "actors": STRINGS}),
-    "actor_dossiers": obj({"hostToken": STR, "scopeHandle": STR, "actors": STRINGS}),
+    "actor_dossiers": obj({"hostToken": STR, "scopeHandle": STR, "actors": STRINGS,
+                           "includeSourceExcerpts": {"type": "boolean"}}, ["hostToken", "scopeHandle", "actors"]),
     "actor_directory": obj({"hostToken": STR, "scopeHandle": STR}),
     "resolve_actors": obj({"hostToken": STR, "scopeHandle": STR, "originId": STR,
         "firstAppearance": FIRST_APPEARANCE,
@@ -246,7 +247,8 @@ SCHEMA["$defs"]["memoryGraphResult"] = obj({
     "archiveMarkers": {"type": "array", "items": obj({
         "eventId": STR, "rootId": STR, "archivedFloor": INT, "expiresAfterFloor": INT,
         "relatedEventIds": STRINGS, "available": {"type": "boolean"},
-    })},
+        "folded": {"const": True}, "retentionPolicy": {"const": "hierarchical-folded-v1"},
+    }, ["eventId", "rootId", "archivedFloor", "expiresAfterFloor", "relatedEventIds", "available"])},
 }, ["acceptedFloor", "activeRecordIds", "aliases", "nodes", "archiveMarkers"])
 SCHEMA["$defs"]["memoryArchiveResult"] = obj({
     "operation": {"enum": ["read", "restore"]},
@@ -306,12 +308,23 @@ SCHEMA["$defs"]["resolveActorsResult"] = obj({
         ["actorId", "displayName", "aliases", "present", "channel", "localRef", "isNew"])},
     "records": RECORD_ARRAY,
     "characterRegistry": {"type": "array", "items": REGISTRY_ENTRY}}, ["actors", "records"])
+MEMORY_HIERARCHY_NODE = obj({
+    "eventId": STR, "parentEventId": STR, "editableSignificance": {"type": "boolean"},
+    "phase": {"enum": ["draft", "active", "resolved"]}, "summary": STR,
+    "hearts": {"type": "integer", "enum": [1, 2, 3]}, "locked": {"type": "boolean"},
+    "folded": {"type": "boolean"}, "layer": {"enum": ["unlayered", "summary", "detail"]},
+    "recordIds": STRINGS, "children": STRINGS,
+    "sourceSpans": {"type": "array", "items": SPAN},
+    "sourceExcerpts": {"type": "array", "items": obj({**SPAN["properties"], "text": TEXT})},
+}, ["eventId", "phase", "summary", "hearts", "locked", "folded", "layer", "recordIds", "children", "sourceSpans", "sourceExcerpts"])
+SCHEMA["$defs"]["memoryHierarchyNode"] = MEMORY_HIERARCHY_NODE
 SCHEMA["$defs"]["actorDossiersResult"] = obj({"actors": {"type": "array", "items": obj({
     "actorId": STR, "profile": RECORD_ARRAY, "state": RECORD_ARRAY, "relationships": RECORD_ARRAY,
     "acquisitions": {"type": "array", "items": obj({"record": WIRE_RECORD,
         "attitude": {"enum": ["unstated", "disbelieve", "doubtful", "believe"]}})},
     "attitudes": RECORD_ARRAY, "dates": RECORD_ARRAY, "backgrounds": RECORD_ARRAY, "exceptions": RECORD_ARRAY,
     "eventReferences": STRINGS, "importance": IMPORTANCE,
+    "memoryHierarchy": {"type": "array", "items": MEMORY_HIERARCHY_NODE},
     "provenance": {"type": "array", "items": obj({"id": STR, "branchId": STR, "worldRevision": INT})},
     "coverage": DETAIL_COVERAGE})}, "coverage": COVERAGE})
 SCHEMA["$defs"]["actorPacksResult"] = obj({"actors": {"type": "array", "items": obj({

@@ -23,11 +23,12 @@ from .play_memory_protocol import (BATCH, BINDING, MAX_NAVIGATION_SUMMARIES,
                                    MAX_NAVIGATION_CARD_BUDGET_BYTES, RPC_PARAMS,
                                    VERSION, batch_hash, fail, validate)
 from .retrieval import AuthorizedRetrievalCandidate, RankingResult, _bm25
-from .play_memory_characters import CharacterImportancePolicy, DETAIL_POLICY, detail_records
+from .play_memory_characters import CharacterImportancePolicy, DETAIL_POLICY, detail_records, memory_hierarchy
 from .play_memory_directory import actor_directory, resolve_actors
 from .play_memory_library import (LIBRARY_POLICY, blocked_memory_actors,
                                   character_library_projection, seen_identities,
                                   validate_library_records)
+from .play_memory_shared_knowledge import hydrate_shared_knowledge
 from . import play_memory_lifecycle as episodic_lifecycle
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ def _key(record):
     if kind in ("profile", "state"):
         return kind, record["actorId"], record["field"]
     if kind == "relationship":
-        return kind, record["fromActorId"], record["toActorId"]
+        return kind, record["fromActorId"], record["toActorId"], record.get("metadata", {}).get("relationshipType", "relationship"), tuple(sorted(record["knownBy"]))
     if kind == "attitude":
         return kind, record["actorId"], record["acquisitionId"]
     if kind == "exception":
@@ -63,6 +64,8 @@ def effective_records(records, story_order):
     for record in records:
         if record["order"] > story_order:
             continue
+        if record["kind"] == "attitude" and record["attitude"] == "unstated":
+            continue
         key = _key(record)
         old = latest.get(key)
         if old is not None and old["order"] == record["order"] and old["id"] != record["id"]:
@@ -75,13 +78,17 @@ def effective_records(records, story_order):
 def project_attitudes(records, actor):
     """Explicit claim identity carries stance across hearing the same claim again.
 
-    A missing claimId deliberately keeps acquisition identities separate; text
-    similarity never merges propositions or invents the belief in their negation.
+    Factual acquisitions default to belief in the acquired proposition. Explicit
+    stances override that default. Hearsay and inference do not become facts.
+    A missing claimId keeps acquisition identities separate; text similarity
+    never merges propositions or invents the belief in their negation.
     """
     acquisitions = {r["id"]: r for r in records if r["kind"] == "acquisition" and r["actorId"] == actor}
     latest = {}
     for record in records:
         if record["kind"] != "attitude" or record["actorId"] != actor:
+            continue
+        if record["attitude"] == "unstated":
             continue
         target = acquisitions.get(record["acquisitionId"])
         if target is None:
@@ -95,7 +102,8 @@ def project_attitudes(records, actor):
     result = {}
     for identifier, acquisition in acquisitions.items():
         key = ("claim", acquisition["claimId"]) if "claimId" in acquisition else ("acquisition", identifier)
-        result[identifier] = latest[key]["attitude"] if key in latest else "unstated"
+        default = "believe" if acquisition.get("beliefKind") == "fact" else "unstated"
+        result[identifier] = latest[key]["attitude"] if key in latest else default
     return result
 
 
@@ -252,6 +260,26 @@ class PlayMemoryStore:
                  marker["eventId"], marker["rootId"])).fetchone()
             if row is not None:
                 return row
+        # Old versions discarded the compressed cache after 100 adopted floors.
+        # Rebuild only from the exact retained accepted record identities. Missing
+        # originals remain unavailable and are never inferred from a summary.
+        identifiers = set(marker.get("relatedRecordIds", []))
+        if identifiers:
+            retained = {row["id"]: row for row in self._records(campaign, lineage)
+                        if row["id"] in identifiers
+                        and row["order"] <= marker["storyOrder"]}
+            if identifiers == set(retained):
+                logger.info("play folded archive rehydrated campaign=%s branch=%s event=%s records=%d",
+                            campaign, next(iter(lineage)), marker["eventId"], len(retained))
+                payload = episodic_lifecycle.encode_payload(
+                    [retained[identifier] for identifier in sorted(retained)])
+                storage_branch, revision = next(iter(lineage.items()))
+                self.db.execute("INSERT OR IGNORE INTO play_lifecycle_archive_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                    (campaign, storage_branch, revision, marker["branchId"], marker["revision"],
+                     marker["eventId"], marker["rootId"], payload[0], payload[1]))
+                return payload
+            logger.warning("play folded archive unavailable campaign=%s event=%s missing_records=%d",
+                           campaign, marker["eventId"], len(identifiers - set(retained)))
         return None
 
     def _lifecycle_markers(self, campaign, lineage, story_order):
@@ -336,27 +364,6 @@ class PlayMemoryStore:
                     scope["binding"]["campaignId"], scope["lineage"], marker) is not None
         projected = episodic_lifecycle.project(scope["records"], scope["baseEffective"],
             scope["lifecycleMarkers"], scope["lifecycleAccesses"], scope["acceptedFloor"])
-        if purge:
-            expired = [marker for marker in projected["archiveMarkers"]
-                       if scope["acceptedFloor"] >= marker["expiresAfterFloor"]]
-            for public_marker in expired:
-                internal = projected["latestMarkers"][public_marker["rootId"]]
-                deleted = self.db.execute(
-                    "DELETE FROM play_lifecycle_archive_cache WHERE campaign=? AND branch=? "
-                    "AND marker_branch=? AND marker_revision=? AND event_id=? AND root_id=?",
-                    (scope["binding"]["campaignId"], scope["binding"]["branchId"],
-                     internal["branchId"], internal["revision"], internal["eventId"],
-                     internal["rootId"])).rowcount
-                if deleted:
-                    logger.info("play archive cache purged campaign=%s branch=%s event=%s floor=%s",
-                        scope["binding"]["campaignId"], scope["binding"]["branchId"],
-                        internal["eventId"], scope["acceptedFloor"])
-            if expired:
-                for marker in scope["lifecycleMarkers"]:
-                    marker["payloadAvailable"] = self._lifecycle_cache_row(
-                        scope["binding"]["campaignId"], scope["lineage"], marker) is not None
-                projected = episodic_lifecycle.project(scope["records"], scope["baseEffective"],
-                    scope["lifecycleMarkers"], scope["lifecycleAccesses"], scope["acceptedFloor"])
         active_ids = set(projected["activeRecordIds"])
         scope["effective"] = [record for record in scope["baseEffective"] if record["id"] in active_ids]
         scope["activeRecordIds"] = active_ids
@@ -374,23 +381,16 @@ class PlayMemoryStore:
                 "branchId": branch, "revision": revision}
             combined_records = {row["id"]: row for row in spec["records"]}
             previous = self._latest_lifecycle_markers(campaign, lineage, spec["storyOrder"]).get(spec["rootId"])
-            floor = spec["archivedFloor"]
             if previous is not None and previous["payloadAvailable"]:
-                accesses = self._lifecycle_accesses(campaign, lineage, spec["storyOrder"], floor)
-                renewals = [row["expiresAfterFloor"] for row in accesses
-                    if row["operation"] == "read" and row["rootId"] == spec["rootId"]
-                    and row["markerBranch"] == previous["branchId"]
-                    and row["markerRevision"] == previous["revision"]
-                    and row["eventId"] == previous["eventId"]]
-                if floor < max([previous["expiresAfterFloor"], *renewals]):
-                    cached = self._lifecycle_cache_row(campaign, lineage, previous)
-                    if cached is not None:
-                        for row in episodic_lifecycle.decode_payload(cached[0], cached[1]):
-                            combined_records.setdefault(row["id"], row)
-                        spec["relatedRecordIds"] = sorted(set(spec["relatedRecordIds"])
-                                                           | set(previous["relatedRecordIds"]))
-                        spec["relatedEventIds"] = sorted(set(spec["relatedEventIds"])
-                                                          | set(previous["relatedEventIds"]))
+                cached = self._lifecycle_cache_row(campaign, lineage, previous)
+                if cached is None:
+                    fail("folded archive payload disappeared after its availability projection", "record-integrity", -32009)
+                for row in episodic_lifecycle.decode_payload(cached[0], cached[1]):
+                    combined_records.setdefault(row["id"], row)
+                spec["relatedRecordIds"] = sorted(set(spec["relatedRecordIds"])
+                                                   | set(previous["relatedRecordIds"]))
+                spec["relatedEventIds"] = sorted(set(spec["relatedEventIds"])
+                                                  | set(previous["relatedEventIds"]))
             payload, payload_hash = episodic_lifecycle.encode_payload(
                 [combined_records[key] for key in sorted(combined_records)])
             self.db.execute("INSERT INTO play_lifecycle_archive_markers VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -426,23 +426,10 @@ class PlayMemoryStore:
                 floor = episodic_lifecycle.accepted_floor(records, row["order"])
                 spec = new_roots.get(root)
                 if spec is not None:
-                    if floor >= spec["expiresAfterFloor"]:
-                        fail("archive restoration is past its accepted-floor expiry",
-                             "archive-expired", -32009)
                     continue
                 marker = self._latest_lifecycle_markers(campaign, lineage, row["order"]).get(root)
                 if marker is None or not marker["payloadAvailable"]:
                     fail("archive restoration has no retained derived payload",
-                         "archive-expired", -32009)
-                expiry = marker["expiresAfterFloor"]
-                accesses = self._lifecycle_accesses(campaign, lineage, row["order"], floor)
-                reads = [access["expiresAfterFloor"] for access in accesses
-                    if access["operation"] == "read" and access["rootId"] == root
-                    and access["markerBranch"] == marker["branchId"]
-                    and access["markerRevision"] == marker["revision"]
-                    and access["eventId"] == marker["eventId"]]
-                if floor >= max([expiry, *reads]):
-                    fail("archive restoration is past its accepted-floor expiry",
                          "archive-expired", -32009)
 
     def _apply_lifecycle_metadata_restores(self, campaign, branch, revision, epoch, lineage,
@@ -461,16 +448,6 @@ class PlayMemoryStore:
                 if marker is None or not marker["payloadAvailable"]:
                     fail("archive restoration has no retained derived payload",
                          "archive-expired", -32009)
-                accesses = self._lifecycle_accesses(campaign, lineage, row["order"], floor,
-                    current_branch=branch, epoch=epoch)
-                reads = [access["expiresAfterFloor"] for access in accesses
-                    if access["operation"] == "read" and access["rootId"] == root
-                    and access["markerBranch"] == marker["branchId"]
-                    and access["markerRevision"] == marker["revision"]
-                    and access["eventId"] == marker["eventId"]]
-                if floor >= max([marker["expiresAfterFloor"], *reads]):
-                    fail("archive restoration is past its accepted-floor expiry",
-                         "archive-expired", -32009)
                 cache = self._lifecycle_cache_row(campaign, lineage, marker)
                 payload = episodic_lifecycle.decode_payload(cache[0], cache[1])
                 restored_ids = [record["id"] for record in payload]
@@ -479,30 +456,6 @@ class PlayMemoryStore:
                     operation="restore", expires_after_floor=marker["expiresAfterFloor"],
                     restored_record_ids=restored_ids)
                 access["_branchRank"] = 0
-
-    def _purge_current_branch_expired_archives(self, campaign, branch, lineage, records):
-        # An accepted batch has no scope story-order cutoff. Consider every
-        # committed access row visible at this branch/revision when deciding
-        # whether physical cache deletion is safe; each later scope still
-        # applies its own story-order cutoff before it can use that access.
-        story_order = 9007199254740991
-        floor = episodic_lifecycle.accepted_floor(records)
-        markers = self._lifecycle_markers(campaign, lineage, story_order)
-        accesses = self._lifecycle_accesses(campaign, lineage, story_order, floor)
-        projected = episodic_lifecycle.project(records, effective_records(records, story_order),
-                                               markers, accesses, floor)
-        for public_marker in projected["archiveMarkers"]:
-            if floor < public_marker["expiresAfterFloor"]:
-                continue
-            marker = projected["latestMarkers"][public_marker["rootId"]]
-            deleted = self.db.execute(
-                "DELETE FROM play_lifecycle_archive_cache WHERE campaign=? AND branch=? "
-                "AND marker_branch=? AND marker_revision=? AND event_id=? AND root_id=?",
-                (campaign, branch, marker["branchId"], marker["revision"],
-                 marker["eventId"], marker["rootId"])).rowcount
-            if deleted:
-                logger.info("play archive cache purged campaign=%s branch=%s event=%s floor=%s",
-                    campaign, branch, marker["eventId"], floor)
 
     def _records(self, campaign, lineage):
         records = []
@@ -514,7 +467,7 @@ class PlayMemoryStore:
                 record = strict_json_loads(row["body"])
                 record["_branch"], record["_revision"] = branch, row["revision"]
                 records.append(record)
-        return records
+        return hydrate_shared_knowledge(records)
 
     def _validate_records(self, campaign, records, existing, lifecycle_policy=None):
         combined = {r["id"]: r for r in existing}
@@ -571,6 +524,18 @@ class PlayMemoryStore:
                 if _hash_bytes(raw[start:end]) != span["sha256"]:
                     fail("source span hash mismatch", "source-integrity", -32009)
             refs = [(identifier, "event") for identifier in record.get("eventIds", [])]
+            if record["kind"] == "relationship":
+                metadata = record.get("metadata", {})
+                relation_type = metadata.get("relationshipType", "relationship")
+                if not isinstance(relation_type, str) or not relation_type.strip():
+                    fail("relationship type must be nonempty", "reference-integrity", -32009)
+                if metadata.get("relationshipStatus", "active") not in ("active", "ended", "retracted"):
+                    fail("unsupported directed relationship status", "reference-integrity", -32009)
+                event_ids = metadata.get("eventIds", [])
+                if (not isinstance(event_ids, list) or any(not isinstance(value, str) or not value for value in event_ids)
+                        or len(event_ids) != len(set(event_ids))):
+                    fail("invalid relationship event references", "reference-integrity", -32009)
+                refs += [(identifier, "event") for identifier in event_ids]
             refs += [(identifier, None) for identifier in record.get("basisIds", [])]
             for field, expected in (("sceneId", "scene"), ("acquisitionId", "acquisition"), ("backgroundId", "background")):
                 if field in record:
@@ -585,6 +550,7 @@ class PlayMemoryStore:
                 fail("cognitive change requires explicit basis")
         for actor in {r["actorId"] for r in combined.values() if r["kind"] == "attitude"}:
             project_attitudes(list(combined.values()), actor)
+        hydrate_shared_knowledge(list(combined.values()))
         episodic_lifecycle.validate_lifecycle(list(combined.values()))
         validate_library_records(records, existing, lifecycle_policy)
 
@@ -612,8 +578,8 @@ class PlayMemoryStore:
         parent = batch.get("parent")
         if current:
             previous_revision = batch.get("previousWorldRevision", revision - 1)
-            if parent is not None or batch["predecessorBatchId"] != current["head_batch"] or previous_revision != current["head_revision"] or revision <= current["head_revision"]:
-                fail("batch predecessor or contiguous revision mismatch", "predecessor-conflict", -32009)
+            if parent is not None or batch["predecessorBatchId"] != current["head_batch"] or not current["head_revision"] <= previous_revision < revision:
+                fail("batch predecessor or World revision ordering mismatch", "predecessor-conflict", -32009)
             lineage = self._lineage(campaign, branch, current["head_revision"])
         elif parent:
             parent_receipt = self.db.execute("SELECT branch,revision FROM play_batches WHERE campaign=? AND batch=?", (campaign, parent["batchId"])).fetchone()
@@ -681,7 +647,6 @@ class PlayMemoryStore:
                 episodic_lifecycle.archive_specs(accepted_records, batch["records"]))
             self._apply_lifecycle_metadata_restores(campaign, branch, revision, batch["epoch"],
                 readable, accepted_records, batch["records"])
-            self._purge_current_branch_expired_archives(campaign, branch, readable, accepted_records)
             receipt = {"schemaVersion": VERSION, "campaignId": campaign, "batchId": identifier,
                        "payloadHash": batch["payloadHash"], "branchId": branch, "epoch": batch["epoch"],
                        "worldRevision": revision, "predecessorBatchId": batch["predecessorBatchId"],
@@ -699,7 +664,10 @@ class PlayMemoryStore:
             if self.fault_hook:
                 self.fault_hook("before-commit", batch)
             self.db.execute("COMMIT")
-            logger.info("play memory applied campaign=%s branch=%s batch=%s revision=%s payload=%s", campaign, branch, identifier, revision, batch["payloadHash"])
+            logger.info("play memory applied campaign=%s branch=%s batch=%s revision=%s payload=%s shared_units=%s pooled_acquisitions=%s relationships=%s", campaign, branch, identifier, revision, batch["payloadHash"],
+                        sum(len(row.get("metadata", {}).get("knowledgeUnits", [])) for row in batch["records"] if row["kind"] == "event"),
+                        sum("knowledgeUnitRef" in row.get("metadata", {}) for row in batch["records"] if row["kind"] == "acquisition"),
+                        sum(row["kind"] == "relationship" for row in batch["records"]))
             if self.fault_hook:
                 self.fault_hook("after-commit", batch)
             return receipt
@@ -869,7 +837,20 @@ class PlayMemoryStore:
                 allowed = exception is None or exception["status"] == "acquired"
             if allowed:
                 result.append(record)
-        return result
+        # Relationship truth updates do not teach their private audience's news
+        # to past observers. Select the reader's newest authorized version only.
+        relationships = {}
+        for record in result:
+            if record["kind"] != "relationship":
+                continue
+            key = (record["fromActorId"], record["toActorId"],
+                   record.get("metadata", {}).get("relationshipType", "relationship"))
+            previous = relationships.get(key)
+            if previous is None or record["order"] > previous["order"]:
+                relationships[key] = record
+        current_ids = {record["id"] for record in relationships.values()}
+        return [record for record in result
+                if record["kind"] != "relationship" or record["id"] in current_ids]
 
     @staticmethod
     def _canonical_event_reference(scope, event_id):
@@ -1228,7 +1209,7 @@ class PlayMemoryStore:
         self._charge(scope, len(_json(response).encode("utf-8")))
         return response
 
-    def _character_dossier(self, scope, actor):
+    def _character_dossier(self, scope, actor, *, include_source_excerpts=True):
         legal = self._actor_records(scope, actor)
         attitudes = self._attitudes(scope, actor)
         groups = {"profile": [], "state": [], "relationships": [], "acquisitions": [],
@@ -1278,7 +1259,18 @@ class PlayMemoryStore:
                 previous = point["tier"]
         importance["transitions"] = transitions
         identifiers = sorted(r["id"] for r in selected)
+        hierarchy = memory_hierarchy(scope["records"], actor, scope["lifecycleGraph"],
+                                     include_source_excerpts=include_source_excerpts)
+        retained_ids = {identifier for node in hierarchy for identifier in node["recordIds"]}
+        existing_ids = {row["record"]["id"] for row in groups["acquisitions"]}
+        for row in scope["records"]:
+            if row["id"] in retained_ids - existing_ids:
+                groups["acquisitions"].append({"record": self._public(row),
+                    "attitude": self._attitudes({**scope, "effective": scope["records"]}, actor).get(row["id"], "unstated")})
+                selected.append(row)
+        identifiers = sorted({row["id"] for row in selected})
         return {"actorId": actor, **groups, "importance": importance,
+                "memoryHierarchy": hierarchy,
                 "eventReferences": sorted({scope["lifecycleProjection"]["aliases"].get(event, event)
                                            for row in groups["acquisitions"]
                                            for event in row["record"].get("eventIds", [])}),
@@ -1290,7 +1282,8 @@ class PlayMemoryStore:
         self._host(params)
         scope = self._scope(params["scopeHandle"])
         self._actors(scope, params["actors"])
-        response = {"actors": [self._character_dossier(scope, actor) for actor in params["actors"]],
+        response = {"actors": [self._character_dossier(scope, actor,
+                    include_source_excerpts=params.get("includeSourceExcerpts", True)) for actor in params["actors"]],
                     "coverage": self._coverage(scope)}
         self._charge(scope, len(_json(response).encode("utf-8")))
         logger.info("play actor dossiers binding=%s actors=%d records=%d policy=%s",
@@ -1462,7 +1455,7 @@ class PlayMemoryStore:
             seen.add(root)
             expiry = self._archive_expiry(scope, marker)
             cache = self._lifecycle_cache_row(campaign, scope["lineage"], marker)
-            if scope["acceptedFloor"] >= expiry or cache is None:
+            if cache is None:
                 expired.append(requested_id)
                 continue
             records = episodic_lifecycle.decode_payload(cache[0], cache[1])
@@ -1475,7 +1468,7 @@ class PlayMemoryStore:
                            "records": [self._public(row) for row in authorized]})
             if params["operation"] == "read":
                 pending_accesses.append((marker, cache, "read", authorized_ids,
-                    scope["acceptedFloor"] + episodic_lifecycle.ARCHIVE_FLOORS))
+                    episodic_lifecycle.ARCHIVE_FLOORS))
                 renewed += 1
             else:
                 pending_accesses.append((marker, cache, "restore", authorized_ids, expiry))

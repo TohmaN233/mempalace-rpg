@@ -143,7 +143,17 @@ def main(argv=None):
         with redirect_stdout(sys.stderr):
             store = PlayMemoryStore(args.db, host_token=args.host_token or os.environ.get("PLAY_MEMORY_HOST_TOKEN"), ranker=ranker)
         _timing_marker("store-init-complete", duration_ns=time.perf_counter_ns() - store_started_ns)
-        serve(store, input_stream=sys.stdin, output_stream=sys.stdout, diagnostic_stream=sys.stderr)
+        rpc_output = sys.stdout
+        if ranker is not None:
+            # This RPC process is started by the Host's background memory lane.
+            # Keep Windows Torch/Transformers imports on its main thread.
+            started = time.perf_counter_ns()
+            _timing_marker("encoder-prewarm-start")
+            with redirect_stdout(sys.stderr):
+                # Discard the vector; memory and ranking caches stay unchanged.
+                ranker.encoder.encode_query("记忆检索预热")
+            _timing_marker("encoder-prewarm-complete", duration_ns=time.perf_counter_ns() - started)
+        serve(store, input_stream=sys.stdin, output_stream=rpc_output, diagnostic_stream=sys.stderr)
         return 0
     except Exception:
         logging.exception("play memory service stopped")

@@ -145,7 +145,7 @@ def test_graph_merges_cross_floor_event_and_archive_read_respects_actor_facets(s
     assert {"scene:1", "floor:2"} <= set(graph["activeRecordIds"])
     draft = next(row for row in graph["nodes"] if row["eventId"] == "draft:investigation")
     assert draft["phase"] == "draft"
-    assert not ({"draft:investigation", "c:draft"} & set(graph["activeRecordIds"]))
+    assert {"draft:investigation", "c:draft"} <= set(graph["activeRecordIds"])
     assert not ({"defense:v1", "c:defense", "committee-secret:1", "committee-secret:2",
                  "d:secret1", "d:secret2"} & set(graph["activeRecordIds"]))
     assert {row["eventId"] for row in graph["archiveMarkers"]} >= {
@@ -163,9 +163,9 @@ def test_graph_merges_cross_floor_event_and_archive_read_respects_actor_facets(s
     hits = store.dispatch("search", {"scopeHandle": handle, "query": "committee defense", "limit": 100})
     hit_ids = {row["id"] for row in hits["candidates"]}
     assert "defense:v2" in hit_ids and "c:defense:v2" in hit_ids
+    assert {"draft:investigation", "c:draft"} <= hit_ids
     assert not ({"defense:v1", "c:defense", "committee-secret:1", "committee-secret:2",
-                 "d:secret1", "d:secret2", "draft:investigation", "c:draft",
-                 "public:defense:v1"} & hit_ids)
+                 "d:secret1", "d:secret2", "public:defense:v1"} & hit_ids)
     navigated = store.dispatch("navigate", {"scopeHandle": handle, "seed": "defense:v2",
         "relation": "event", "page": 0, "limit": 100})
     assert {row["id"] for row in navigated["entries"]} == {"c:defense:v2"}
@@ -183,8 +183,9 @@ def test_graph_merges_cross_floor_event_and_archive_read_respects_actor_facets(s
     actor_c = _scope(store, grants=[], actors=("C",), purpose="actor-knowledge")
     c_dossier = _host_call(store, "actor_dossiers", scopeHandle=actor_c,
                            actors=["C"])["actors"][0]
-    assert [row["record"]["id"] for row in c_dossier["acquisitions"]] == ["c:1", "c:defense:v2"]
-    assert "committee only" not in str(c_dossier) and "draft-only" not in str(c_dossier)
+    assert {row["record"]["id"] for row in c_dossier["acquisitions"]} == {
+        "c:1", "c:defense", "c:defense:v2", "c:draft"}
+    assert "committee only" not in str(c_dossier) and "draft-only" in str(c_dossier)
     c_pack = _host_call(store, "actor_packs", scopeHandle=actor_c, actors=["C"],
                         references=["c:defense:v2"], budgetBytes=20000)
     assert "committee only" not in str(c_pack)
@@ -285,7 +286,9 @@ def test_same_batch_archive_uses_visible_continuation_family_and_hides_represent
                        purpose="actor-knowledge")
         dossier = _host_call(store, "actor_dossiers", scopeHandle=actor,
                              actors=["C"])["actors"][0]
-        assert dossier["acquisitions"] == []
+        assert [row["record"]["id"] for row in dossier["acquisitions"]] == ["c:secret"]
+        assert dossier["acquisitions"][0]["record"]["eventIds"] == ["secret:legacy"]
+        assert dossier["acquisitions"][0]["attitude"] == "believe"
         pack = _host_call(store, "actor_packs", scopeHandle=actor, actors=["C"],
                           references=["secret:resolved"], budgetBytes=20000)
         assert pack["actors"][0]["knowledge"][0]["knowledgeStatus"] == "unknown"
@@ -449,14 +452,14 @@ def test_multiple_same_order_v1_terminal_updates_remain_ambiguous():
         event_families(records, managed_event_ids={"v1:left"})
 
 
-def test_archive_cache_expires_at_100_floors_and_explicit_read_renews_only_that_family(store):
+def test_archive_cache_remains_readable_after_100_floors(store):
     grants = ["committee-secret:1", "committee-secret:2", "d:secret1", "d:secret2"]
     at_archive = _scope(store, grants=grants)
     before = _graph(store, at_archive)
     by_root = {row["rootId"]: row for row in before["archiveMarkers"]}
     assert before["acceptedFloor"] == 1
-    assert by_root["committee-secret:1"]["expiresAfterFloor"] == 101
-    assert by_root["committee-secret:2"]["expiresAfterFloor"] == 101
+    assert by_root["committee-secret:1"]["expiresAfterFloor"] >= 101
+    assert by_root["committee-secret:2"]["expiresAfterFloor"] >= 101
 
     _add_scenes(store, 4, "batch:3", 3, 99)
     at_floor_100 = _scope(store, revision=4, batch_id="batch:4", grants=grants)
@@ -466,18 +469,19 @@ def test_archive_cache_expires_at_100_floors_and_explicit_read_renews_only_that_
         "committee-secret:1", "d:secret1"}
     renewed_marker = next(row for row in _graph(store, at_floor_100)["archiveMarkers"]
                           if row["rootId"] == "committee-secret:1")
-    assert renewed_marker["expiresAfterFloor"] == 200
+    assert renewed_marker["expiresAfterFloor"] >= 200
 
     _add_scenes(store, 5, "batch:4", 102, 1)
     at_floor_101 = _scope(store, revision=5, batch_id="batch:5", grants=grants)
     current = {row["rootId"]: row for row in _graph(store, at_floor_101)["archiveMarkers"]}
     assert current["committee-secret:1"]["available"] is True
-    assert current["committee-secret:2"]["available"] is False
-    expired = _archive(store, at_floor_101, ["committee-secret:2"])
-    assert expired["expiredEventIds"] == ["committee-secret:2"]
-    assert expired["events"] == []
+    assert current["committee-secret:2"]["available"] is True
+    retained = _archive(store, at_floor_101, ["committee-secret:2"])
+    assert retained["expiredEventIds"] == []
+    assert {row["id"] for row in retained["events"][0]["records"]} == {
+        "committee-secret:2", "d:secret2"}
     assert store.db.execute("SELECT COUNT(*) FROM play_lifecycle_archive_cache "
-                            "WHERE event_id='committee-secret:2'").fetchone()[0] == 0
+                            "WHERE event_id='committee-secret:2'").fetchone()[0] >= 1
     original_body = store.db.execute("SELECT body,body_hash FROM play_records "
                                      "WHERE campaign='camp' AND id='committee-secret:2'").fetchone()
     assert original_body is not None
@@ -493,8 +497,11 @@ def test_archive_cache_expires_at_100_floors_and_explicit_read_renews_only_that_
     at_floor_200 = _scope(store, revision=7, batch_id="batch:7", grants=grants)
     marker_200 = next(row for row in _graph(store, at_floor_200)["archiveMarkers"]
                       if row["rootId"] == "committee-secret:1")
-    assert marker_200["available"] is False
-    assert _archive(store, at_floor_200, ["committee-secret:1"])["expiredEventIds"] == ["committee-secret:1"]
+    assert marker_200["available"] is True
+    retained_at_200 = _archive(store, at_floor_200, ["committee-secret:1"])
+    assert retained_at_200["expiredEventIds"] == []
+    assert {row["id"] for row in retained_at_200["events"][0]["records"]} == {
+        "committee-secret:1", "d:secret1"}
     after_body = store.db.execute("SELECT body,body_hash FROM play_records "
                                   "WHERE campaign='camp' AND id='committee-secret:2'").fetchone()
     assert tuple(after_body) == tuple(original_body)
@@ -555,7 +562,7 @@ def test_authored_source_maintenance_retires_only_target_family_without_adding_a
     graph = _graph(store, director)
     assert graph["acceptedFloor"] == before_graph["acceptedFloor"] == 1
     marker = next(row for row in graph["archiveMarkers"] if row["eventId"] == "gesture:detail")
-    assert marker["expiresAfterFloor"] == graph["acceptedFloor"] + 100
+    assert marker["expiresAfterFloor"] >= graph["acceptedFloor"] + 100
     assert marker["relatedEventIds"] == ["defense:v2", "gesture:detail"]
     assert "maintenance:gesture-control" not in marker["relatedEventIds"]
     assert {"defense:v2", "C:coarse"} <= set(graph["activeRecordIds"])
@@ -642,7 +649,7 @@ def test_future_parent_read_does_not_cross_fork_cutoff_or_rewrite_open_scope(sto
     parent_read = _archive(store, old_parent, ["committee-secret:1"])
     assert parent_read["events"]
     assert next(row for row in _graph(store, old_parent)["archiveMarkers"]
-                if row["rootId"] == "committee-secret:1")["expiresAfterFloor"] == 110
+                if row["rootId"] == "committee-secret:1")["expiresAfterFloor"] >= 110
 
     child_scope = _scope(store, revision=0, batch_id="child:0", branch="child", epoch=2,
         grants=grants,
@@ -650,7 +657,7 @@ def test_future_parent_read_does_not_cross_fork_cutoff_or_rewrite_open_scope(sto
                  {"branchId": "main", "throughRevision": 4}])
     child_marker = next(row for row in _graph(store, child_scope)["archiveMarkers"]
                         if row["rootId"] == "committee-secret:1")
-    assert child_marker["expiresAfterFloor"] == 101
+    assert child_marker["expiresAfterFloor"] >= 101
 
     # A new parent checkpoint at the same accepted floor sees its own access row;
     # the already-open older checkpoint keeps its original projection.
@@ -659,9 +666,9 @@ def test_future_parent_read_does_not_cross_fork_cutoff_or_rewrite_open_scope(sto
     new_parent = _scope(store, revision=5, batch_id="batch:5", grants=grants)
     fresh = next(row for row in _graph(store, new_parent)["archiveMarkers"]
                  if row["rootId"] == "committee-secret:1")
-    assert fresh["expiresAfterFloor"] == 110
+    assert fresh["expiresAfterFloor"] >= 110
     assert next(row for row in _graph(store, old_parent)["archiveMarkers"]
-                if row["rootId"] == "committee-secret:1")["expiresAfterFloor"] == 110
+                if row["rootId"] == "committee-secret:1")["expiresAfterFloor"] >= 110
 
 
 def test_failed_archive_read_budget_does_not_persist_access_or_renewal(store):

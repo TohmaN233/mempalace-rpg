@@ -31,6 +31,7 @@ Host 以不可变身份提交 `play-memory-v1` 批次。批次带有 `campaignId
 - `profile`、`state` 和 `relationship` 可以使用 `knownBy` 明确哪些 actor 知道该内容。
 - `acquisition.beliefKind` 区分 `fact`、`hearsay`、`inference` 和 `mistaken-belief`；`method`、`basisIds`、`sourceSpans` 保留获知方式与证据。
 - `attitude` 对某个 acquisition 记录 `believe`、`doubtful` 或 `disbelieve`，不会把态度转成世界事实。
+- `beliefKind=fact` 的已取得命题在缺少明确态度时默认 `believe`，明确态度优先。听见某句话只默认相信该发言发生，不默认采信发言内容。传闻、推断等缺省为 `unstated`。该规则同样适用于旧记录的读取，不额外保存默认态度行。
 - `link` 连接 actor 与 event；关系边是有向的，不会隐式变成反向关系。
 
 这些记录使 Host 能将“发生了什么”“某人知道什么”“某人相信什么”分开提供；最终说话者仍由 Host 选择，并须使用正确的 actor ID 和 scope。
@@ -55,11 +56,15 @@ Host 通过 `open_scope` 提交读取 binding。binding 包含 `campaignId`、`b
 
 本地 Qwen encoder 要求操作方预先安装 `torch`、`transformers`，并提供本地模型目录、精确树哈希与 revision；加载通过本地文件完成。可选 SQLite vector cache 持久化 passage vectors，不构成异步索引、候选发现或授权机制。
 
-## 事件归档与 100-floor 到期
+Qwen 会在首次遇到向量缓存未命中时加载模型。`warm_scope` 调用 ranker 的 `prepare` 路径，只编码尚未缓存的授权 passage 摘要；如果向量缓存已完整预热，就不需要加载模型。encoder timing 日志会分别记录模型加载、编码工作、CUDA 同步、allocator cache 释放和整次请求耗时。`release-after-encode` 策略仍会同步并释放未使用的 allocator 内存块，同时让模型权重保持驻留。实现指纹属于 profile/cache namespace；源码变化会创建新 namespace，并重新编码 passage 向量，旧 namespace 的行仍会保留。
 
-生命周期只是对显式纳入生命周期控制的事件派生 archive 投影。被接受的 source/event 记录继续作为 append-only history；归档载荷可按 `memory_archive` 读取或恢复，且在过期后可能被清除，不能据 archive payload 过期推断来源记录已经删除。
+## 分层折叠与旧归档迁移
 
-这里的 floor 是当前 lineage 中可见不同 scene 的零起始序号，不是游戏地图楼层。初始归档有效期为归档 floor 之后 100 个 floor；读取记录可能延长可读期限。具体 archive/restore、有效事件集合和到期边界由 [`play_memory_lifecycle.py`](../../mempalace_rpg/play_memory_lifecycle.py) 与 [`play-memory-v1.schema.json`](../../schemas/play-memory-v1.schema.json) 定义。
+生命周期派生投影保留全部已采用 source/event 原始记录。新事件和角色知情分面在语义整理前即可读取，未结束的经历也保持可读。Host 按共享事件结构维护各角色自己的概括，portable 后端只机械投影原有知情范围。
+
+`memory_archive` 继续读取或恢复折叠细节。年龄不再触发压缩载荷删除，旧 `expiresAfterFloor` 仅兼容历史回执。若旧版本已经清除压缩载荷，仅当当前 lineage 和 cutoff 内仍保留其完整 `relatedRecordIds` 时重建派生缓存，缺失原记录会记录诊断并维持不可用。
+
+角色资料的 `memoryHierarchy` 提供可展开事件入口、个人心级、锁定状态、来源范围及授权原文摘录。Host 导航可用 `actor_dossiers` 的 `includeSourceExcerpts=false` 避免默认传输原文。每个角色单独评定 1 至 3 心，用户 `memory.significance:<eventId>` 编辑随 continuation 继承。锁定值不被自动整理改写，既有三心经历保持原细度，直到用户明确修改。来源字节、版本、哈希和角色授权继续按原规则核对。
 
 ## 支持范围
 

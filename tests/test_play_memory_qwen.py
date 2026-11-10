@@ -256,6 +256,7 @@ def test_backend_last_token_pooling_restore_order_and_left_padding(tmp_path):
             [length, 1] + [0] * 767] for length in batch["lengths"]]))
     encoder = object.__new__(LocalQwenEncoder)
     encoder.config = config(tmp_path, device="cpu", batch_size=1)
+    encoder.identity = "test-qwen-profile"
     encoder._closed = False
     import threading
     encoder._lock = threading.RLock()
@@ -273,6 +274,7 @@ def test_explicit_cuda_cache_release_after_cpu_result_and_on_failure():
     calls = []
     encoder = object.__new__(LocalQwenEncoder)
     encoder.config = SimpleNamespace(device="cuda", cuda_cache_policy="release-after-encode")
+    encoder.identity = "test-qwen-profile"
     encoder._lock = threading.RLock()
     encoder._load = lambda: None
     encoder._torch = SimpleNamespace(cuda=SimpleNamespace(

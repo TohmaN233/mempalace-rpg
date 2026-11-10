@@ -177,7 +177,6 @@ function findMempalaceCli(): string | null {
     "mempalace-rpg",
     join(projectRoot, "..", "mempalace-rpg", ".venv", "bin", "mempalace-rpg"),
     join(projectRoot, "..", "mempalace", ".venv", "bin", "mempalace-rpg"),
-    "/home/tgy23/PI_workingspace/mempalace/.venv/bin/mempalace-rpg",
   ].filter(Boolean) as string[];
 
   for (const candidate of candidates) {

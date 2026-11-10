@@ -766,9 +766,10 @@ def test_readable_records_are_always_searched_without_fabricated_index_readiness
     assert after["coverage"]["recentDelta"] == []
 
 
-def test_predecessor_gaps_stale_and_missing_required_watermark_are_errors(store):
-    with pytest.raises(EvidenceError, match="contiguous"):
-        call(store, "apply_batch", batch=batch("batch:3", 3, [], "batch:1"))
+def test_stale_predecessor_and_missing_required_watermark_are_errors(store):
+    with pytest.raises(EvidenceError, match="predecessor"):
+        call(store, "apply_batch", batch=batch("batch:3", 3, [], "stale:batch",
+                                                previousWorldRevision=2))
     with pytest.raises(EvidenceError, match="required batch"):
         scope(store, requiredBatchId="absent")
     with pytest.raises(EvidenceError, match="revision unavailable"):
@@ -777,14 +778,15 @@ def test_predecessor_gaps_stale_and_missing_required_watermark_are_errors(store)
         store.dispatch("apply_batch", {"hostToken": "model", "batch": batch("batch:2", 2, [], "batch:1")})
 
 
-def test_world_transaction_revision_interval_has_no_holes_or_intermediate_scopes(store):
+def test_world_revision_gaps_allow_mechanical_edits_without_intermediate_scopes(store):
     accepted = batch("multi-event", 3, [], "batch:1", previousWorldRevision=1)
     assert call(store, "apply_batch", batch=accepted)["worldRevision"] == 3
     with pytest.raises(EvidenceError, match="transaction boundary"):
         scope(store, worldRevision=2, lineage=[{"branchId": "main", "throughRevision": 2}], requiredBatchId="batch:1")
-    with pytest.raises(EvidenceError, match="contiguous"):
-        call(store, "apply_batch", batch=batch("hole", 6, [], "multi-event", previousWorldRevision=4))
-    assert call(store, "apply_batch", batch=batch("next", 6, [], "multi-event", previousWorldRevision=3))["worldRevision"] == 6
+    assert call(store, "apply_batch", batch=batch("hole", 6, [], "multi-event",
+                                                    previousWorldRevision=4))["worldRevision"] == 6
+    assert call(store, "apply_batch", batch=batch("next", 9, [], "hole",
+                                                    previousWorldRevision=6))["worldRevision"] == 9
 
 
 def test_child_initial_marker_can_advance_to_global_world_sequence_without_fake_holes(store):
@@ -869,7 +871,7 @@ def test_validate_batch_is_readonly_without_hooks_ranking_epoch_or_scope_side_ef
     assert not store.db.in_transaction
 
 
-@pytest.mark.parametrize("damage", ["empty-exception-basis", "conflicting-state", "wrong-attitude-owner", "bad-payload-hash", "future-source", "revision-hole", "stale-epoch", "bad-span"])
+@pytest.mark.parametrize("damage", ["empty-exception-basis", "conflicting-state", "wrong-attitude-owner", "bad-payload-hash", "future-source", "stale-epoch", "bad-span"])
 def test_validate_and_apply_share_every_acceptance_rule_without_poisoning_state(store, damage):
     changes = []
     if damage == "empty-exception-basis":
@@ -882,7 +884,7 @@ def test_validate_and_apply_share_every_acceptance_rule_without_poisoning_state(
         changes = [{"kind": "source", "id": "future", "order": 99, "sourceId": "future", "version": "1", "text": TEXT, "sha256": sha(TEXT)}, {"kind": "event", "id": "bad", "order": 3, "text": "future source", "sourceSpans": [{**span(), "sourceId": "future"}]}]
     elif damage == "bad-span":
         changes = [{"kind": "event", "id": "bad", "order": 3, "text": "bad span", "sourceSpans": [{**span(), "startByte": 1}]}]
-    accepted = batch("candidate", 3 if damage == "revision-hole" else 2, changes, "batch:1")
+    accepted = batch("candidate", 2, changes, "batch:1")
     if damage == "stale-epoch":
         accepted["epoch"] = 0
         accepted["payloadHash"] = batch_hash(accepted)

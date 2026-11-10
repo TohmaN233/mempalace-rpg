@@ -2,7 +2,8 @@
 
 The accepted play-memory rows remain the authoritative append-only history.
 This module projects current event versions and stores only derived archive
-payloads; expiry never falls back to the accepted record text.
+payloads. Folded details are retained indefinitely and can be reconstructed
+from their exact accepted record identities when a legacy cache was discarded.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from .play_memory_protocol import fail
 
 POLICY = "episodic-memory-v1"
 MAINTENANCE_POLICY = "episodic-maintenance-v1"
-ARCHIVE_FLOORS = 100
+ARCHIVE_FLOORS = 9007199254740991  # Legacy receipt field. Folding has no expiry.
 
 
 def _metadata(record):
@@ -265,6 +266,12 @@ def validate_lifecycle(records):
                              "reference-integrity", -32009)
                     managed_event_ids.add(event_id)
         elif row["kind"] == "acquisition":
+            significance = metadata.get("memorySignificance")
+            if significance is not None and (not isinstance(significance, dict)
+                    or set(significance) != {"hearts", "locked"}
+                    or type(significance["hearts"]) is not int or significance["hearts"] not in (1, 2, 3)
+                    or type(significance["locked"]) is not bool):
+                fail("invalid personal memory significance", "record-conflict", -32009)
             supersedes = metadata.get("memorySupersedes", [])
             if (not isinstance(supersedes, list)
                     or any(not isinstance(value, str) or not value for value in supersedes)
@@ -339,7 +346,7 @@ def archive_specs(records, new_records):
         key = (marker_event_id, root_id)
         floor = accepted_floor(records, story_order)
         spec = specs.setdefault(key, {"eventId": marker_event_id, "rootId": root_id,
-            "archivedFloor": floor, "expiresAfterFloor": floor + ARCHIVE_FLOORS,
+            "archivedFloor": floor, "expiresAfterFloor": ARCHIVE_FLOORS,
             "storyOrder": story_order,
             "relatedEventIds": set(), "relatedRecordIds": set(), "records": {}, "kind": kind})
         spec["relatedEventIds"].update(related_event_ids)
@@ -501,12 +508,10 @@ def project(records, effective, markers, accesses, floor):
         latest = events[representative]
         phase = _phase(latest)
         family_archived = representative in archived_event_ids
-        if ((not family_archived or representative in restored_record_ids)
-                and phase != "draft"):
+        if not family_archived or representative in restored_record_ids:
             active_ids.add(representative)
-        # This Host-only directory also exposes the current draft identity so
-        # the writer can continue it. Its body and linked acquisitions remain
-        # outside every ordinary active projection until the phase advances.
+        # Unfinished events and their actor-owned facets are immediately
+        # readable. Semantic classification runs independently in the Host.
         scene_ids = sorted({events[identifier].get("sceneId") for identifier in family_ids
                             if events[identifier].get("sceneId")})
         lifecycle = _lifecycle(latest)
@@ -525,11 +530,6 @@ def project(records, effective, markers, accesses, floor):
             continue
         if archived_event_ids.intersection(row.get("eventIds", [])) \
                 and row["id"] not in restored_record_ids:
-            continue
-        linked_roots = {graph["roots"][event_id] for event_id in row.get("eventIds", [])
-                        if event_id in graph["roots"]}
-        if any(_phase(events[graph["representatives"][root]]) == "draft"
-               for root in linked_roots):
             continue
         active_ids.add(row["id"])
         active_acquisition_ids.add(row["id"])
@@ -554,9 +554,10 @@ def project(records, effective, markers, accesses, floor):
         if visible_reads:
             latest_read = max(visible_reads, key=rank)
             expiry = max(expiry, latest_read["expiresAfterFloor"])
-        available = floor < expiry and marker.get("payloadAvailable", False)
+        available = marker.get("payloadAvailable", False)
         archive_markers.append({"eventId": marker["eventId"], "rootId": root,
             "archivedFloor": marker["archivedFloor"], "expiresAfterFloor": expiry,
+            "folded": True, "retentionPolicy": "hierarchical-folded-v1",
             "relatedEventIds": marker["relatedEventIds"], "available": available})
 
     return {"acceptedFloor": floor, "activeRecordIds": sorted(active_ids),

@@ -21,6 +21,10 @@ def normalized_name(value):
     return unicodedata.normalize("NFC", value.strip())
 
 
+def _lookup_name(value):
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value.strip())).lower()
+
+
 def introduction_eligible(introduction):
     return (introduction["entityKind"] == "character"
             and introduction["hasProperName"] is True
@@ -161,7 +165,40 @@ def seen_identities(records):
             *(alias for alias in legacy.get("aliases", []) if alias != entry["canonicalName"]),
             *(name for name in [legacy.get("canonicalName")] if name and name != entry["canonicalName"]),
         ]))
-        result[actor_id] = {**entry, "aliases": aliases, "legacy": False}
+        result[actor_id] = {**entry, "aliases": aliases, "legacy": False,
+                            "_registryAliases": list(entry["aliases"])}
+    # Original receipts remain immutable. Only explicit authored imports outrank
+    # model-learned names; equal-authority titles remain unresolved for lookup.
+    claims = {}
+    priorities = {actor_id: {} for actor_id in result}
+    def claim(name, actor_id, priority):
+        owners = claims.setdefault(_lookup_name(name), {})
+        owners[actor_id] = max(priority, owners.get(actor_id, 0))
+    for actor_id, entry in result.items():
+        claim(entry["canonicalName"], actor_id, 4)
+        for alias in entry["aliases"]:
+            claim(alias, actor_id, 1)
+    for record in records:
+        metadata = record.get("metadata", {})
+        if (record["kind"] != "source" or metadata.get("authored") is not True
+                or metadata.get("characterRegistryImport") is not True):
+            continue
+        for entry in metadata.get("characterRegistry", {}).get("entries", []):
+            if entry["actorId"] not in result:
+                continue
+            for alias in entry["aliases"]:
+                claim(alias, entry["actorId"], 2)
+                priorities[entry["actorId"]][_lookup_name(alias)] = 2
+    for actor_id, entry in result.items():
+        effective, rejected = [], []
+        for alias in entry["aliases"]:
+            owners = claims[_lookup_name(alias)]
+            maximum = max(owners.values())
+            winners = [owner for owner, priority in owners.items() if priority == maximum]
+            (effective if winners == [actor_id] else rejected).append(alias)
+        entry["aliases"] = effective
+        entry["aliasConflicts"] = rejected
+        entry["_aliasPriorities"] = priorities[actor_id]
     return result
 
 
@@ -185,18 +222,19 @@ def blocked_memory_actors(records):
 
 
 def resolve_identity_name(name, identities, *, exclude_confirmed_unnamed=False):
-    target = normalized_name(name)
-    matches = []
+    target = _lookup_name(name)
+    matches = {}
     for actor_id, entry in identities.items():
         introduction = entry.get("introduction")
         if (exclude_confirmed_unnamed and isinstance(introduction, dict)
                 and introduction.get("hasProperName") is False):
             continue
-        if (target == normalized_name(entry["canonicalName"])
-                or target in {normalized_name(alias) for alias in entry["aliases"]}):
-            matches.append(actor_id)
-    matches.sort()
-    return matches
+        if target == _lookup_name(entry["canonicalName"]):
+            matches[actor_id] = 4
+        elif target in {_lookup_name(alias) for alias in [*entry["aliases"], *entry.get("aliasConflicts", [])]}:
+            matches[actor_id] = entry.get("_aliasPriorities", {}).get(target, 1)
+    maximum = max(matches.values(), default=0)
+    return sorted(actor_id for actor_id, priority in matches.items() if priority == maximum)
 
 
 def validate_library_records(records, existing_records, lifecycle_policy=None):

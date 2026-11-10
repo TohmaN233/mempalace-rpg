@@ -33,6 +33,8 @@ python -m mempalace_rpg.play_memory_server --db state/play-memory.sqlite3
 
 通用 `sourceSpan`、batch、binding 和每种 RPC 的精确字段约束位于 schema 的 `$defs`。binding 至少携带 `campaignId`、`branchId`、`epoch`、`worldRevision`、`storyOrder`、`checkpointId`、`materialRevision`、`configHash`、purpose、actorIds、grants 和 lineage。记录类型与 `knownBy`、`appliesTo`、`fromActorId`/`toActorId` 语义见[架构页](../architecture/PLAY_MEMORY_MODEL.zh-CN.md)。
 
+下一批的 `predecessorBatchId` 指向当前语义记忆批次。Host 的机械编辑可以推进 World 版本而不写记忆。已有分支允许 `previousWorldRevision` 位于语义记忆头与新 `worldRevision` 之间，后者必须严格更大。这些间隔无需填充空批次，错误前驱或倒序版本仍会报错。
+
 ### Qwen profile 参数
 
 服务默认 `--profile mechanical-bm25-v1`。Qwen profile 使用：
@@ -65,3 +67,5 @@ MCP 协议通过 `initialize`、`tools/list`、`tools/call` 暴露以下主要�
 旧接口的 recall 需提供 `campaign_id`、`actor_id` 和 `query`；场景、角色与可见性字段采用其自己的 snake_case JSON contract。`mempalace_rpg_list_memories`、`mempalace_rpg_list_world_facts`、`mempalace_rpg_list_actor_beliefs` 虽在 server 中列出，但它们是禁用的本地管理员 surface，通过 MCP 会被拒绝。
 
 旧 kernel CLI 还提供 `backup`、`restore`、`delete-after`、`delete-scenes` 与 `sync-branch` 等维护命令。这些能力不是 play-memory v1 stdio 的方法。旧 Pi 示例和导入资料见 [`pi-integration.md`](../pi-integration.md) 与 [`taverndb-import.md`](../taverndb-import.md)。
+
+角色资料还返回按本人实际知情建立的 `memoryHierarchy`，其中含事件父子引用、概括、心级、锁定、折叠与来源范围。`actor_dossiers` 可传 `includeSourceExcerpts=false` 省略原文摘录。归档年龄不再导致删除，旧 `expiresAfterFloor` 为兼容字段。

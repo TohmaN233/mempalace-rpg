@@ -31,6 +31,7 @@ Actor cognition is represented through source-traceable records:
 - `profile`, `state`, and `relationship` can use `knownBy` to specify which actors know the content.
 - `acquisition.beliefKind` distinguishes `fact`, `hearsay`, `inference`, and `mistaken-belief`; `method`, `basisIds`, and `sourceSpans` retain how it was learned and its evidence.
 - `attitude` records `believe`, `doubtful`, or `disbelieve` for an acquisition; it does not turn an attitude into a world fact.
+- Acquired `fact` propositions default to `believe` when no explicit stance exists. Explicit stances take precedence. Hearing an utterance establishes that it was said, without implying belief in its quoted content. Hearsay and inference default to `unstated`. This read-time rule also applies to older records without storing default stance rows.
 - `link` connects an actor and an event. Relationship edges are directed and do not imply a reverse relation.
 
 These records let the Host distinguish “what happened,” “what someone knows,” and “what someone believes.” The Host still selects the final speaker and must use the correct actor ID and scope.
@@ -55,11 +56,15 @@ Player input, raw source text, and scene prose can therefore support lexical rec
 
 The operator must preinstall `torch` and `transformers` for the local Qwen encoder and provide a local model directory, exact tree hash, and revision; loading uses local files. An optional SQLite vector cache persists passage vectors but is not an asynchronous index, candidate-discovery mechanism, or authorization mechanism.
 
-## Event archives and 100-floor expiry
+Qwen loads its model on the first vector-cache miss. `warm_scope` calls the ranker's `prepare` path, which encodes only missing authorized passage summaries; a fully warm vector cache does not need to load the model. Encoder timing logs report model load, encode work, CUDA synchronization, allocator cache release, and whole-request durations separately. The `release-after-encode` policy still synchronizes and releases unused allocator blocks while keeping model weights resident. The implementation fingerprint is part of the profile/cache namespace, so a source change creates a new namespace and recomputes passage vectors; previous namespace rows remain stored.
 
-Lifecycle behavior creates archive projections from events explicitly included in lifecycle control. Accepted source/event records remain append-only history. Archive payloads can be read or restored through `memory_archive` and may be removed after expiry; expiry of an archive payload does not imply that its source record was deleted.
+## Hierarchical folding and legacy archive migration
 
-A floor is a zero-based sequence number for distinct scenes visible in the current lineage, not a floor in a game map. An archive initially remains valid for 100 floors after its archive floor; reads may extend its readable period. The exact archive/restore behavior, eligible event set, and expiry boundaries are defined by [play_memory_lifecycle.py](../../mempalace_rpg/play_memory_lifecycle.py) and [play-memory-v1.schema.json](../../schemas/play-memory-v1.schema.json).
+Lifecycle projections retain accepted source/event originals. New event and actor-owned facets are readable before semantic organization, including unfinished episodes. The Host maintains shared event structure and separate actor summaries. This portable backend mechanically projects existing knowledge grants.
+
+`memory_archive` continues to read or restore folded details. Age no longer deletes compressed payloads. The legacy `expiresAfterFloor` field remains receipt-compatible metadata. A previously discarded cache is reconstructed only when every exact `relatedRecordIds` entry remains in the current lineage and cutoff. Missing originals produce a diagnostic and remain unavailable.
+
+Dossier `memoryHierarchy` exposes expandable events, personal significance, lock state, source ranges and authorized original excerpts. Host navigation can use `actor_dossiers` with `includeSourceExcerpts=false` to omit source bodies. Each actor has an independent 1..3-heart score. Authored `memory.significance:<eventId>` edits follow continuations. Automatic organization preserves locked scores and existing three-heart fidelity until an explicit user edit. Source-byte, version, hash and actor-authorization checks still apply.
 
 ## Supported scope
 
