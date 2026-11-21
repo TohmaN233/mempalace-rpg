@@ -43,8 +43,8 @@ It accepts JSON-RPC requests over stdin/stdout; see the [RP Host guide](docs/gui
 - [RP Host integration guide](docs/guides/RP_INTEGRATION.md)
 - [play-memory v1 architecture](docs/architecture/PLAY_MEMORY_MODEL.md)
 - [play-memory v1 protocol reference](docs/reference/PLAY_MEMORY_V1.md)
-- [Legacy tools and research index](docs/README.md#compatibility-and-research)
+- [RP integration evaluation](docs/experiments/RP_INTEGRATION_GAP11.md)
 
 ## License and attribution
 
-`pyproject.toml` declares this project under the MIT license. Attribution to MemPalace v3.8.0 is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); a copy of its upstream license is at [docs/legal/MemPalace-LICENSE.txt](docs/legal/MemPalace-LICENSE.txt).
+This project is licensed under MIT. See the [third-party notice](THIRD_PARTY_NOTICES.md) for upstream attribution.

@@ -2,7 +2,7 @@
 
 [简体中文](PLAY_MEMORY_MODEL.zh-CN.md)
 
-This page describes the current `play-memory-v1` schema and `PlayMemoryStore`. These are separate contracts from the legacy `RpgMemoryKernel` tables, CLI, and MCP. See the [contract reference](../reference/PLAY_MEMORY_V1.md#legacy-rpg-kernel-mcp) for the legacy entry points.
+This page describes the `play-memory-v1` schema and `PlayMemoryStore`.
 
 ## Accepted sources, records, and event graph
 
@@ -42,8 +42,6 @@ The Host submits a read binding through `open_scope`. The binding includes `camp
 
 Save slots and worldlines are not entities the database identifies automatically. The Host must map saves to campaigns, branches, and epochs; decide when to open a new line; choose the ancestor and cutoff revision for a reroll; and keep the next submission and scope consistent. Scope grants authorize exact record identities only; actor neighbors, graph edges, or wildcard background do not confer access to additional records.
 
-The legacy kernel's `sync-branch` uses a scene ledger provided by the Host or pi extension to clean up legacy auto-committed scenes. It does not handle play-memory v1 save mapping, epoch generation, or worldline rerolls.
-
 ## Background knowledge and exceptions
 
 `background.appliesTo` can list explicit actor IDs, or use the literal `*` to mean that Host-accepted shared knowledge or public messages are available by default to characters who appear later. An actor can use an `exception` referring to that background to indicate that the knowledge is unknown or has been learned. This rule affects only the background-record projection; it is not wildcard authorization through scope grants.
@@ -73,7 +71,6 @@ A dossier selects the latest event version the character knows and folds older k
 | Area | Current meaning |
 | --- | --- |
 | play-memory v1 | Host-scoped contract defined by `schemas/play-memory-v1.schema.json`, the Python protocol, and the stdio service |
-| Legacy RPG kernel | Compatibility interface of `RpgMemoryKernel`, the legacy CLI, and `mempalace-rpg-mcp`; separate from the v1 schema |
 | Qwen profile | Configurable local summary-vector plus raw-text lexical navigation path; does not represent full Qwen17 or general semantic recall quality |
 | RP Foundation / LLM-Wiki | Integration-side workflows, semantic agents, director, and Host update process; not executed in this Python core |
 | Research records | Separately retained experimental protocols and historical research; not automatically a current product contract or performance guarantee |

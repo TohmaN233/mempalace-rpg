@@ -2,9 +2,9 @@
 
 ## Contracts
 
-- Keep `play-memory-v1` schema/RPC, the legacy `RpgMemoryKernel` CLI/MCP, and research-only implementations clearly separated. Do not rename one surface to imply compatibility with another.
+- Keep the play-memory v1 gameplay runtime and its tests as the repository's executable surface. Historical implementations and research tooling remain in Git history.
 - Treat the Host as authority for accepted content, game state, source mapping, save/worldline identity, model calls, semantic decisions, director behavior, and final updates. Keep memory operations mechanical, scoped, and traceable.
-- Evidence temporal comparisons accept Host-normalized `game:fated-488:<minute>` instants (488-01-01 epoch, twelve 30-day months) separately from retained legacy ISO sources. Mixed calendar values require Host source-bound normalization; Python never derives a game year from real dates. Play-memory ordering remains the accepted source `order`, with exact game time carried as Host metadata.
+- Play-memory ordering uses the accepted source `order`. Exact game time is Host metadata and must not be derived from wall-clock time.
 - Preserve source spans, batch identities, branch/epoch bindings, and useful diagnostics when changing memory behavior. Fail visibly on invalid or incomplete input; do not silently change profiles or providers.
 - Batch predecessors follow the actual semantic batch chain. Host mechanical edits may occupy World revisions without creating memory batches. Require the declared predecessor to match the semantic head and `head_revision <= previousWorldRevision < worldRevision`, allowing these mechanical gaps without filler batches.
 - Actor-directory reads project `actorId`, `present`, and `channel` from accepted scene rosters. Host metadata such as `role` may accompany these fields and must not invalidate a previously accepted roster.
@@ -61,7 +61,7 @@
 
 - Use [`docs/README.zh-CN.md`](docs/README.zh-CN.md) as the Chinese documentation entry point and keep its navigation and topic map current.
 - Source public API, command, version, and configuration claims from the current schema, implementation, tests, manifest, or shipped templates. Label legacy and research material by its actual scope.
-- Keep the Chinese primary documents and translated English documents aligned. See [`docs/archive/MAINTENANCE_HISTORY.zh-CN.md`](docs/archive/MAINTENANCE_HISTORY.zh-CN.md) for a redacted summary of older design notes.
+- Keep the Chinese and English documentation aligned.
 
 ## Changes
 

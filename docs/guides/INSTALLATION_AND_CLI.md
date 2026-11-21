@@ -2,7 +2,7 @@
 
 [简体中文](INSTALLATION_AND_CLI.zh-CN.md)
 
-`mempalace-rpg` currently includes two RPG memory services with different purposes and protocols. The `mempalace-rpg` CLI and `mempalace-rpg-mcp` MCP service access the legacy `RpgMemoryKernel`; `play_memory_server` is the Host/model-scoped JSON-RPC service for play-memory v1. They use different data contracts and tool names, so choose the one that matches the host implementation.
+Start play-memory v1 with `python -m mempalace_rpg.play_memory_server`. RP Host communicates over stdio JSON-RPC.
 
 ## Requirements
 
@@ -16,8 +16,6 @@ Run from the repository root:
 ```bash
 python -m pip install -e .
 ```
-
-`pyproject.toml` declares the installation dependencies and four command entry points. The current repository has no separate PyPI installation evidence.
 
 ## Configuration
 
@@ -39,29 +37,4 @@ $env:PLAY_MEMORY_HOST_TOKEN = python -c "import secrets; print(secrets.token_url
 python -m mempalace_rpg.play_memory_server --db state/play-memory.sqlite3
 ```
 
-stdout is reserved for protocol frames; diagnostics go to stderr. This is not the legacy MCP tool interface. The Host must implement the `play-memory-v1` contract, batch submission, and scope binding. See method names and parameters in the [reference](../reference/PLAY_MEMORY_V1.md#play-memory-v1-stdio-json-rpc).
-
-## Compatibility: legacy RPG kernel
-
-The legacy `mempalace-rpg` CLI uses an RPG SQLite file in the user's home directory by default, or a path supplied with `--db`. `mempalace-rpg-mcp` accepts `--db` and `--memo-setting`, and optionally `--palace`. See the legacy configuration template at [examples/templates/memo_setting.template.json](../../examples/templates/memo_setting.template.json).
-
-After installation, use the legacy CLI to create and inspect its database:
-
-```bash
-mempalace-rpg --db state/rpg-memory.sqlite3 init
-mempalace-rpg --db state/rpg-memory.sqlite3 status
-```
-
-### Legacy RPG kernel MCP
-
-An MCP client starts the service over stdio:
-
-```bash
-mempalace-rpg-mcp --db state/rpg-memory.sqlite3
-```
-
-`--memo-setting` and `--palace` may be omitted. This MCP service exposes legacy kernel tools such as `mempalace_rpg_recall`, `mempalace_rpg_commit_scene`, `mempalace_rpg_get_scene`, and `mempalace_rpg_deep_recall`. See the full list in the [contract reference](../reference/PLAY_MEMORY_V1.md#legacy-rpg-kernel-mcp).
-
-### Legacy kernel CLI
-
-Run `mempalace-rpg --help` to see CLI commands. The legacy CLI provides structured scene writes, character-memory queries, deep recall, backup, restore, and time-based rollback. `sync-branch` uses the caller-provided pi branch ledger to clean up legacy auto-committed scenes; it does not generate or map a general game-save worldline.
+The service writes protocol frames to stdout and diagnostics to stderr. The Host implements the `play-memory-v1` contract, batch submission, and scope binding. See method names and parameters in the [reference](../reference/PLAY_MEMORY_V1.md#play-memory-v1-stdio-json-rpc).

@@ -1,10 +1,7 @@
-# Third-party source
+# Upstream attribution
 
-This repository vendors the `mempalace` Python package from
-[MemPalace v3.8.0](https://github.com/MemPalace/mempalace/tree/87e6f38377b4bee0666374b05df6e14ffd154245),
-commit `87e6f38377b4bee0666374b05df6e14ffd154245`, under the MIT License.
-
-The preserved upstream license is distributed at
-`mempalace/LICENSE.upstream`. The source receipt in
-`mempalace/_upstream_source.json` binds the imported package bytes to the
-upstream commit and tree.
+MemPalace-RPG draws on [MemPalace](https://github.com/MemPalace/mempalace).
+The earlier [vendored snapshot](https://github.com/TohmaN233/mempalace-rpg/tree/1984b03eeb25755835592d8463ad061db41a4331/mempalace)
+used [MemPalace v3.8.0](https://github.com/MemPalace/mempalace/tree/87e6f38377b4bee0666374b05df6e14ffd154245),
+under the MIT License. The upstream license is retained in
+[docs/legal/MemPalace-LICENSE.txt](docs/legal/MemPalace-LICENSE.txt).

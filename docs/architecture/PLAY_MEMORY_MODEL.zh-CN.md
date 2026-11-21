@@ -2,7 +2,7 @@
 
 [English](PLAY_MEMORY_MODEL.md)
 
-此页描述当前 `play-memory-v1` schema 与 `PlayMemoryStore`。它和旧 `RpgMemoryKernel` 的表结构、CLI 与 MCP 是两种独立合同；旧入口见[合同参考](../reference/PLAY_MEMORY_V1.zh-CN.md#旧版-rpg-kernel-mcp)。
+此页描述 `play-memory-v1` schema 与 `PlayMemoryStore`。
 
 ## 已接受来源、记录与事件图
 
@@ -42,8 +42,6 @@ Host 通过 `open_scope` 提交读取 binding。binding 包含 `campaignId`、`b
 
 存档槽和 worldline 并非数据库自动识别的实体。Host 必须决定 save 与 campaign/branch/epoch 如何对应，何时开启新线，reroll 时应读取哪个 ancestor 及其截止 revision，并在下一次提交和 scope 中保持一致。scope grants 只授权精确记录身份；actor 邻居、图边或通配背景不会带来额外记录权限。
 
-旧 kernel 的 `sync-branch` 使用 Host 或 pi 扩展提供的 scene ledger 清理旧自动提交场景。它不负责 play-memory v1 的 save mapping、epoch 生成或 worldline reroll。
-
 ## 背景知识与例外
 
 `background.appliesTo` 可列出显式 actor ID，也可使用字面量 `*` 表示 Host 接受的共享常识或公共消息默认适用于后来出现的角色。某 actor 可通过指向该 background 的 `exception` 表明未知或已获知。这个规则只影响背景记录投影，不是 scope grants 的通配授权。
@@ -73,7 +71,6 @@ Host 通过 `open_scope` 提交读取 binding。binding 包含 `campaignId`、`b
 | 范围 | 当前含义 |
 | --- | --- |
 | play-memory v1 | `schemas/play-memory-v1.schema.json`、Python 协议和 stdio 服务定义的 Host 作用域合同 |
-| 旧 RPG kernel | `RpgMemoryKernel`、旧 CLI 与 `mempalace-rpg-mcp` 的兼容接口；不与 v1 schema 合并 |
 | Qwen profile | 可配置的本地摘要向量 + 原文 lexical 导航路径；不代表完整 Qwen17 或一般语义召回效果 |
 | RP Foundation / LLM-Wiki | 接入侧工作流、语义代理、导演和 Host 更新流程；不在此 Python core 执行 |
 | 研究记录 | 单独保留的实验协议与历史研究，不自动成为当前产品契约或效果保证 |

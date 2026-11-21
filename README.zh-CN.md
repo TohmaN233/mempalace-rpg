@@ -38,13 +38,13 @@ python -m mempalace_rpg.play_memory_server --db state/play-memory.sqlite3
 
 ## 文档
 
-- [文档导航与旧内容去向](docs/README.zh-CN.md)
+- [文档导航](docs/README.zh-CN.md)
 - [安装与 stdio 服务](docs/guides/INSTALLATION_AND_CLI.zh-CN.md)
 - [RP Host 接入指南](docs/guides/RP_INTEGRATION.zh-CN.md)
 - [play-memory v1 架构](docs/architecture/PLAY_MEMORY_MODEL.zh-CN.md)
 - [play-memory v1 协议参考](docs/reference/PLAY_MEMORY_V1.zh-CN.md)
-- [兼容工具与研究索引](docs/README.zh-CN.md#兼容与研究)
+- [RP 接入实验](docs/experiments/RP_INTEGRATION_GAP11.zh-CN.md)
 
 ## 许可与归属
 
-`pyproject.toml` 将本项目声明为 MIT 许可。仓库保留对 MemPalace v3.8.0 的归属信息于 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)，其上游许可文本副本位于 [`docs/legal/MemPalace-LICENSE.txt`](docs/legal/MemPalace-LICENSE.txt)。
+本项目采用 MIT 许可。上游归属见 [第三方声明](THIRD_PARTY_NOTICES.md)。

@@ -6,7 +6,7 @@ Integrate the memory service as a mechanical component managed by the Host. The 
 
 ## First decide who owns each fact
 
-List the authoritative system for each domain, such as time and maps, combat and HP, inventory, quest stages, NPC profiles, and past events. Do not treat old memories as authoritative for current values already managed by Host state/tools. You can still store their sources, witnesses, historical changes, promises, or what a character once believed. The legacy kernel's `memo_setting.json` controls domain policy for the old API; it does not replace v1 Host authorization or scope binding.
+List the authoritative system for each domain, such as time and maps, combat and HP, inventory, quest stages, NPC profiles, and past events. Do not treat old memories as authoritative for current values already managed by Host state/tools. You can still store their sources, witnesses, historical changes, promises, or what a character once believed.
 
 ## Write accepted data to the contract
 
@@ -21,8 +21,6 @@ See the [play-memory-v1 stdio JSON-RPC reference](../reference/PLAY_MEMORY_V1.md
 ## Save isolation and rerolls
 
 Save slots and story/worldlines are game concepts. The core does not infer them from filenames or save paths. The Host must decide which saves map to the same `campaignId`, how `branchId`, `epoch`, `worldRevision`, and lineage describe a fork, rollback, or restart, and submit the correct values in each scope binding. After a reroll onto another line, the Host selects the corresponding branch and ancestor revision cutoff; it must not use one line's current scope as the default permission for another. Bindings and accepted records remain stored according to the schema; the service does not submit or replay game world transactions for the host.
-
-The legacy kernel's `sync-branch` only uses a caller-provided pi scene ledger to clean up old scenes marked as auto-committed. It is not a save-slot, worldline, or reroll manager for play-memory v1. See the [architecture page](../architecture/PLAY_MEMORY_MODEL.md#scope-save-isolation-and-rerolls) for more on the two paths.
 
 ## Character knowledge and shared background
 

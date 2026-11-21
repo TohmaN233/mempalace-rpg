@@ -2,7 +2,7 @@
 
 [English](RP_FOUNDATION_INTEGRATION_BOUNDARY.md)
 
-本仓库提供 RPG 记忆存储、校验、作用域和机械检索合同。当前 play-memory v1 由 [`schemas/play-memory-v1.schema.json`](../schemas/play-memory-v1.schema.json)、[`play_memory_server.py`](../mempalace_rpg/play_memory_server.py) 和 [`play_memory.py`](../mempalace_rpg/play_memory.py) 实现；旧 `RpgMemoryKernel` MCP 是另一套兼容接口。
+本仓库提供 RPG 记忆存储、校验、作用域和机械检索合同。当前 play-memory v1 由 [`schemas/play-memory-v1.schema.json`](../schemas/play-memory-v1.schema.json)、[`play_memory_server.py`](../mempalace_rpg/play_memory_server.py) 和 [`play_memory.py`](../mempalace_rpg/play_memory.py) 实现。
 
 ## 职责表
 
@@ -15,13 +15,6 @@
 | 分支和存档 | 用 Host 提供的 campaign/branch/epoch/revision/lineage 隔离读取 | 维护 save 到 campaign/worldline 的映射，决定分叉、reroll 和回滚的正确绑定与提交顺序 |
 
 接入时，core 可以运行本地 embedding encoder 来完成配置的机械向量排序；这不等于它调用导演模型、执行语义代理或承担 RP Foundation 的模型工作流。LLM-Wiki 和具体语义代理作为宿主侧集成职责记录，不是此仓库的运行时依赖。
-
-## 两套服务合同
-
-- **play-memory v1**：Host 经 stdio JSON-RPC 提交已接受批次、绑定读取 scope、检索或读取获准表示。记录与字段由 v1 schema 定义。
-- **旧 RPG kernel MCP**：面向 `RpgMemoryKernel` 的旧 `mempalace-rpg-*` CLI/MCP 工具，使用其自己的 scene、profile、ACL 和 JSON 字段。
-
-两套接口不共享可互换的工具名、数据结构或存档管理。接入步骤见[RP Host 指南](guides/RP_INTEGRATION.zh-CN.md)，完整方法见[协议参考](reference/PLAY_MEMORY_V1.zh-CN.md)。
 
 ## 作用域与最终上下文
 

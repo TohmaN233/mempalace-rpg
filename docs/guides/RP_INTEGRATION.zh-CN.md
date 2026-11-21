@@ -6,7 +6,7 @@
 
 ## 先确定谁拥有事实
 
-列出每个域的当前权威系统：例如时间与地图、战斗和 HP、物品库存、任务阶段、NPC 人设与过往事件。对已由 Host state/tool 管理的当前数值，不要再把旧记忆当成权威；可以保存其来源、见证者、历史变化、承诺或角色曾经相信的内容。旧 kernel 的 `memo_setting.json` 仅控制旧接口的域策略，不能替代 v1 Host 的授权与范围绑定。
+列出每个域的当前权威系统：例如时间与地图、战斗和 HP、物品库存、任务阶段、NPC 人设与过往事件。对已由 Host state/tool 管理的当前数值，不要再把旧记忆当成权威；可以保存其来源、见证者、历史变化、承诺或角色曾经相信的内容。
 
 ## 将已接受数据写入合同
 
@@ -21,8 +21,6 @@
 ## 保存隔离与 reroll
 
 存档槽和 story/worldline 是游戏概念，core 不会从文件名或存档路径自动推导它们。Host 必须决定哪些 save 映射到同一个 `campaignId`，如何用 `branchId`、`epoch`、`worldRevision` 和 lineage 描述分叉、回滚或重开，并在每个 scope binding 中提交正确值。重 roll 到另一条线后，要由 Host 选择相应分支及祖先 revision 截止点；不要把一条线的当前 scope 当成另一条线的默认权限。绑定记录和已接受记录仍按 schema 保存，服务不会替游戏主持提交或重演 world transaction。
-
-旧 kernel 的 `sync-branch` 只根据调用方给的 pi scene ledger 清理标记为自动提交的旧场景；它不是 play-memory v1 的 save-slot、worldline 或 reroll 管理器。两套路径的更多区别见[架构页](../architecture/PLAY_MEMORY_MODEL.zh-CN.md#存档worldline-与-reroll)。
 
 ## 角色知识与公共背景
 
