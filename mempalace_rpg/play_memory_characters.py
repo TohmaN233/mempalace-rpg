@@ -177,7 +177,9 @@ def memory_hierarchy(records, actor, graph, *, include_source_excerpts=True):
                 or type(score["locked"]) is not bool or event_id not in events):
             fail("memory significance has invalid score or event", "record-conflict", -32009)
         overrides[aliases.get(event_id, event_id)] = (score, row["order"])
-    by_event, family_knowledge = {}, {}
+    by_event = {}
+    superseded = {identifier for row in acquisitions
+                  for identifier in row.get("metadata", {}).get("memorySupersedes", [])}
     for row in acquisitions:
         score = row.get("metadata", {}).get("memorySignificance", {"hearts": 1, "locked": False})
         if (not isinstance(score, dict) or type(score.get("hearts")) is not int
@@ -186,9 +188,12 @@ def memory_hierarchy(records, actor, graph, *, include_source_excerpts=True):
         for event_id in row.get("eventIds", []):
             if event_id in events:
                 by_event.setdefault(event_id, []).append(row)
-        for family in {aliases.get(identifier, identifier) for identifier in row.get("eventIds", [])}:
-            family_knowledge.setdefault(family, []).append(row)
     acquisition_by_id = {row["id"]: row for row in acquisitions}
+    active = set(graph["activeRecordIds"])
+    actor_heads = {}
+    for event_id, known in sorted(by_event.items(), key=lambda item: (
+            any(row["id"] in active for row in item[1]), events[item[0]]["order"])):
+        actor_heads[aliases.get(event_id, event_id)] = event_id
     superseding_parents = {}
     for row in acquisitions:
         targets = [aliases.get(identifier, identifier) for identifier in row.get("eventIds", [])]
@@ -197,22 +202,26 @@ def memory_hierarchy(records, actor, graph, *, include_source_excerpts=True):
             if old is None:
                 continue
             for identifier in old.get("eventIds", []):
-                target = next((item for item in targets if item != aliases.get(identifier, identifier)), None)
-                if target:
-                    superseding_parents[identifier] = target
-    active = set(graph["activeRecordIds"])
+                previous_family = aliases.get(identifier, identifier)
+                target = next((family for family in targets if family != previous_family), None)
+                if target in actor_heads:
+                    superseding_parents[identifier] = actor_heads[target]
     nodes = []
     for event_id, known in by_event.items():
         event = events[event_id]
         lifecycle = event.get("metadata", {}).get("memoryLifecycle", {})
-        canonical = aliases.get(event_id, event_id)
-        override = overrides.get(canonical)
+        family = aliases.get(event_id, event_id)
+        canonical = actor_heads[family]
+        override = overrides.get(family)
         score = dict(override[0]) if override else {"hearts": 1, "locked": False}
         if not score["locked"]:
-            family_known = [row for row in family_knowledge.get(canonical, [])
-                            if override is None or row["order"] > override[1]]
-            score["hearts"] = max([score["hearts"], *[row.get("metadata", {}).get(
-                "memorySignificance", {"hearts": 1})["hearts"] for row in family_known]])
+            current_known = [row for row in known if row["id"] not in superseded]
+            # Folded originals retain their own rating, never a later family member's rating.
+            eligible = [row for row in current_known or known
+                        if override is None or row["order"] > override[1]]
+            score["hearts"] = max((row.get("metadata", {}).get(
+                "memorySignificance", {"hearts": 1})["hearts"] for row in eligible),
+                default=score["hearts"])
         spans, excerpts = {}, {}
         for row in known:
             for span in row.get("sourceSpans", []):
@@ -228,13 +237,13 @@ def memory_hierarchy(records, actor, graph, *, include_source_excerpts=True):
                     excerpts[key] = {**span, "text": raw.decode("utf-8", errors="strict")}
         parent = canonical if canonical != event_id else lifecycle.get("parentEventId", superseding_parents.get(event_id))
         if parent:
-            parent = aliases.get(parent, parent)
+            parent = actor_heads.get(aliases.get(parent, parent), parent)
         visible = [row for row in known if row["id"] in active]
         summary_rows = visible or known
         node = {"eventId": event_id, "phase": lifecycle.get("phase", "active"),
                 "summary": "\n".join(dict.fromkeys(row["text"] for row in summary_rows)),
                 "hearts": score["hearts"], "locked": score["locked"],
-                "folded": event_id not in active or not visible,
+                "folded": canonical != event_id or not visible,
                 "layer": "detail" if canonical != event_id or not visible else "unlayered",
                 "recordIds": [row["id"] for row in known], "children": [],
                 "sourceSpans": list(spans.values()), "sourceExcerpts": list(excerpts.values())}

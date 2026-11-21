@@ -56,7 +56,7 @@ Player input, raw source text, and scene prose can therefore support lexical rec
 
 The operator must preinstall `torch` and `transformers` for the local Qwen encoder and provide a local model directory, exact tree hash, and revision; loading uses local files. An optional SQLite vector cache persists passage vectors but is not an asynchronous index, candidate-discovery mechanism, or authorization mechanism.
 
-Qwen loads its model on the first vector-cache miss. `warm_scope` calls the ranker's `prepare` path, which encodes only missing authorized passage summaries; a fully warm vector cache does not need to load the model. Encoder timing logs report model load, encode work, CUDA synchronization, allocator cache release, and whole-request durations separately. The `release-after-encode` policy still synchronizes and releases unused allocator blocks while keeping model weights resident. The implementation fingerprint is part of the profile/cache namespace, so a source change creates a new namespace and recomputes passage vectors; previous namespace rows remain stored.
+With the Qwen profile, the stdio process warms the encoder on its main thread before serving RPCs and discards that query vector. The RP Host starts this process in its background memory lane. Later `warm_scope` requests encode only missing authorized summaries. Timing logs separate model loading, encoding, CUDA synchronization, allocator cleanup, and request duration. Model and implementation fingerprints scope the vector cache namespace.
 
 ## Hierarchical folding and legacy archive migration
 
@@ -64,7 +64,9 @@ Lifecycle projections retain accepted source/event originals. New event and acto
 
 `memory_archive` continues to read or restore folded details. Age no longer deletes compressed payloads. The legacy `expiresAfterFloor` field remains receipt-compatible metadata. A previously discarded cache is reconstructed only when every exact `relatedRecordIds` entry remains in the current lineage and cutoff. Missing originals produce a diagnostic and remain unavailable.
 
-Dossier `memoryHierarchy` exposes expandable events, personal significance, lock state, source ranges and authorized original excerpts. Host navigation can use `actor_dossiers` with `includeSourceExcerpts=false` to omit source bodies. Each actor has an independent 1..3-heart score. Authored `memory.significance:<eventId>` edits follow continuations. Automatic organization preserves locked scores and existing three-heart fidelity until an explicit user edit. Source-byte, version, hash and actor-authorization checks still apply.
+Dossier `memoryHierarchy` exposes expandable events, personal significance, lock state, source ranges and authorized original excerpts. Host navigation can use `actor_dossiers` with `includeSourceExcerpts=false` to omit source bodies. Each actor-owned knowledge facet has an independent 1..3-heart score. Authored `memory.significance:<eventId>` edits follow continuations. User locks remain authoritative. Later semantic maintenance may reassess unlocked automatic ratings. A family's historical maximum never upgrades other facets or later summaries. Folded history retains its own rating and evidence, while duplicate three-heart accounts may consolidate into one current summary. Source-byte, version, hash and actor-authorization checks still apply.
+
+A dossier selects the latest event version the character knows and folds older known versions below it. A newer global event version does not update an actor's knowledge. Equivalent claims can share event text while each acquisition retains its actor, acquisition method, stance, and evidence spans.
 
 ## Supported scope
 

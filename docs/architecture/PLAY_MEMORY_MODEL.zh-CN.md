@@ -56,7 +56,7 @@ Host 通过 `open_scope` 提交读取 binding。binding 包含 `campaignId`、`b
 
 本地 Qwen encoder 要求操作方预先安装 `torch`、`transformers`，并提供本地模型目录、精确树哈希与 revision；加载通过本地文件完成。可选 SQLite vector cache 持久化 passage vectors，不构成异步索引、候选发现或授权机制。
 
-Qwen 会在首次遇到向量缓存未命中时加载模型。`warm_scope` 调用 ranker 的 `prepare` 路径，只编码尚未缓存的授权 passage 摘要；如果向量缓存已完整预热，就不需要加载模型。encoder timing 日志会分别记录模型加载、编码工作、CUDA 同步、allocator cache 释放和整次请求耗时。`release-after-encode` 策略仍会同步并释放未使用的 allocator 内存块，同时让模型权重保持驻留。实现指纹属于 profile/cache namespace；源码变化会创建新 namespace，并重新编码 passage 向量，旧 namespace 的行仍会保留。
+选择 Qwen profile 时，stdio 进程在开始接收 RPC 前先在主线程预热，并丢弃该查询向量。RP Host 在后台启动此进程。后续 `warm_scope` 只编码授权范围内尚未缓存的摘要。编码日志分别记录加载、编码、CUDA 同步、分配器清理和请求耗时。模型及实现指纹决定向量缓存 namespace。
 
 ## 分层折叠与旧归档迁移
 
@@ -64,7 +64,9 @@ Qwen 会在首次遇到向量缓存未命中时加载模型。`warm_scope` 调�
 
 `memory_archive` 继续读取或恢复折叠细节。年龄不再触发压缩载荷删除，旧 `expiresAfterFloor` 仅兼容历史回执。若旧版本已经清除压缩载荷，仅当当前 lineage 和 cutoff 内仍保留其完整 `relatedRecordIds` 时重建派生缓存，缺失原记录会记录诊断并维持不可用。
 
-角色资料的 `memoryHierarchy` 提供可展开事件入口、个人心级、锁定状态、来源范围及授权原文摘录。Host 导航可用 `actor_dossiers` 的 `includeSourceExcerpts=false` 避免默认传输原文。每个角色单独评定 1 至 3 心，用户 `memory.significance:<eventId>` 编辑随 continuation 继承。锁定值不被自动整理改写，既有三心经历保持原细度，直到用户明确修改。来源字节、版本、哈希和角色授权继续按原规则核对。
+角色资料的 `memoryHierarchy` 提供可展开事件入口、个人心级、锁定状态、来源范围及授权原文摘录。Host 导航可用 `actor_dossiers` 的 `includeSourceExcerpts=false` 避免默认传输原文。每个角色的知情分面独立评定 1 至 3 心，用户 `memory.significance:<eventId>` 编辑随 continuation 继承。锁定值由用户控制。未锁定自动评级可由后续语义整理重新评估；事件历史最高值不会抬高其他分面或后续概括的评级。折叠历史保留当时自己的评级与来源，重复三心经历同样可合并为一个当前概括。来源字节、版本、哈希和角色授权继续按原规则核对。
+
+角色档案选择该角色实际知道的最新事件版本，并将可折叠的已知旧版本挂在下方。即使全局事件有更新，角色也只保留自己获知的版本。相同认知可在事件层共用文本，每条获知记录保留自己的角色、获知方式、态度和证据范围。
 
 ## 支持范围
 

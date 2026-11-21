@@ -17,6 +17,9 @@
   Authenticate canonical SQLite bodies before resolving these units for read DTOs.
   Resolution must match actor, belief, method, event and exact evidence; missing or
   invalid references fail visibly. Hydrated text never changes batch/source hashes.
+  New shared units may use per-acquisition `grants` to pool identical event text
+  across different evidence spans. Verify the exact record ID, actor and spans
+  for each grant. Retained units with shared `sourceSpans` remain readable.
 - Directed relationships use pair plus `relationshipType` slots, with
   `active`/`ended`/`retracted` current states. Preserve audience snapshots before
   per-reader latest selection: a private update cannot teach another actor the
@@ -34,7 +37,11 @@
   knowledge. `includeSourceExcerpts=false` omits bodies for Host navigation.
   Per-actor 1..3-heart significance and authored `memory.significance:<eventId>`
   controls follow event continuations. Locked values survive automatic writes.
-  Existing three-heart significance persists until an explicit user change.
+  Automatic ratings follow the current semantic event snapshot and may be
+  reassessed downward. Each knowledge facet retains its own rating; one
+  three-heart facet never upgrades other facets or historical event versions.
+  Folded detail attaches to the actor's own latest known event version when a
+  newer global continuation is outside their knowledge.
   Semantic hierarchy/model calls remain owned by the Host.
 
 - Factual acquisitions default to `believe` in their exact acquired proposition.

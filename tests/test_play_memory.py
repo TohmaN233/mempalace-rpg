@@ -89,6 +89,47 @@ def packs(store, handle, actors=None, references=None, budget=20000):
                 references=["secret"] if references is None else references, budgetBytes=budget)
 
 
+@pytest.mark.parametrize("format", ["shared-span", "per-acquisition"])
+def test_pooled_knowledge_keeps_actor_evidence_and_authenticates_its_grant(store, format):
+    evidence = {
+        "A": [span(part="密谈：钥匙在南井。")],
+        "C": [span(part="B向C说：钥匙可能在北边。")],
+    }
+    if format == "shared-span":
+        evidence["C"] = evidence["A"]
+    event_id = "pooled:update"
+    unit = {"key": "group", "useEventSummary": True, "actorIds": ["A", "C"],
+            "beliefKind": "fact", "method": "witness"}
+    if format == "per-acquisition":
+        unit["grants"] = [{"recordId": f"grant:{actor}", "actorId": actor,
+                           "sourceSpans": spans} for actor, spans in evidence.items()]
+    else:
+        unit["sourceSpans"] = evidence["A"]
+    changes = [
+        {"kind": "event", "id": event_id, "order": 3, "text": "The gate was opened.",
+         "sceneId": "scene:1", "sourceSpans": [span()], "metadata": {"knowledgeUnits": [unit]}},
+        *({"kind": "acquisition", "id": f"grant:{actor}", "order": 3, "actorId": actor,
+           "text": "", "eventIds": [event_id], "beliefKind": "fact", "method": "witness",
+           "basisIds": [event_id], "sourceSpans": spans,
+           "metadata": {"knowledgeUnitRef": {"eventId": event_id, "key": "group"}}}
+          for actor, spans in evidence.items()),
+    ]
+    invalid = copy.deepcopy(changes)
+    invalid[1]["sourceSpans"] = [span()]
+    with pytest.raises(EvidenceError, match="actor, belief, event or evidence"):
+        call(store, "apply_batch", batch=batch("batch:2", 2, invalid, "batch:1"))
+    call(store, "apply_batch", batch=batch("batch:2", 2, changes, "batch:1"))
+    for actor, spans in evidence.items():
+        handle = scope(store, worldRevision=2, requiredBatchId="batch:2",
+                       lineage=[{"branchId": "main", "throughRevision": 2}],
+                       purpose="actor-knowledge", actorIds=[actor], grants=[])
+        result = packs(store, handle, actors=[actor], references=[event_id])
+        acquisition = result["actors"][0]["knowledge"][0]["record"]
+        assert acquisition["id"] == f"grant:{actor}"
+        assert acquisition["text"] == "The gate was opened."
+        assert acquisition["sourceSpans"] == spans
+
+
 def test_shared_schema_is_exact_and_fixture_valid():
     path = Path(__file__).resolve().parents[1] / "schemas" / "play-memory-v1.schema.json"
     assert json.loads(path.read_text(encoding="utf-8")) == SCHEMA

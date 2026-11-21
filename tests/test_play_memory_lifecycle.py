@@ -1,4 +1,4 @@
-"""Branch-scoped projection, archive access, and derived-cache expiry tests."""
+"""Branch-scoped projection, archive access, and derived-cache retention tests."""
 import copy
 
 import pytest
@@ -38,6 +38,7 @@ def _seed(store):
         {"kind": "acquisition", "id": "c:defense", "order": 4, "actorId": "C",
          "text": "B声称钥匙可能在北边", "eventIds": ["defense:v1"],
          "beliefKind": "hearsay", "method": "retelling", "basisIds": ["retelling"],
+         "metadata": {"memorySignificance": {"hearts": 3, "locked": False}},
          "sourceSpans": [span(part="B向C说：钥匙可能在北边。")]},
         {"kind": "acquisition", "id": "c:draft", "order": 4, "actorId": "C",
          "text": "draft-only acquisition detail", "eventIds": ["draft:investigation"],
@@ -185,6 +186,11 @@ def test_graph_merges_cross_floor_event_and_archive_read_respects_actor_facets(s
                            actors=["C"])["actors"][0]
     assert {row["record"]["id"] for row in c_dossier["acquisitions"]} == {
         "c:1", "c:defense", "c:defense:v2", "c:draft"}
+    c_nodes = {node["eventId"]: node for node in c_dossier["memoryHierarchy"]}
+    assert c_nodes["defense:v2"]["hearts"] == 1
+    assert c_nodes["defense:v1"]["hearts"] == 3
+    assert c_nodes["defense:v1"]["parentEventId"] == "defense:v2"
+    assert c_nodes["defense:v1"]["folded"] is True
     assert "committee only" not in str(c_dossier) and "draft-only" in str(c_dossier)
     c_pack = _host_call(store, "actor_packs", scopeHandle=actor_c, actors=["C"],
                         references=["c:defense:v2"], budgetBytes=20000)
@@ -212,6 +218,11 @@ def test_graph_merges_cross_floor_event_and_archive_read_respects_actor_facets(s
         detailPolicy="character-importance-v1")
     assert d_public_detail["actors"][0]["knowledge"][0]["record"]["id"] == "d:committee-facet"
     d_dossier = _host_call(store, "actor_dossiers", scopeHandle=actor_d, actors=["D"])["actors"][0]
+    d_nodes = {node["eventId"]: node for node in d_dossier["memoryHierarchy"]}
+    assert "public:defense:v2" not in d_nodes
+    assert d_nodes["public:defense:v1"]["folded"] is False
+    assert "parentEventId" not in d_nodes["public:defense:v1"]
+    assert d_nodes["public:defense:v1"]["summary"] == "Committee-only route detail remains separate."
     assert "public:defense:v2" in d_dossier["eventReferences"]
     assert "public:defense:v1" not in d_dossier["eventReferences"]
     # Only the navigational reference is current; the authorized source row is immutable.
